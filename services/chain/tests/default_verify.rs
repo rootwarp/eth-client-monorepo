@@ -61,8 +61,10 @@ fn strip_rust_comments(src: &str) -> String {
         }
         if in_str {
             out.push(c);
-            if c == '\\' && next.is_some() {
-                out.push(next.unwrap());
+            if c == '\\'
+                && let Some(n) = next
+            {
+                out.push(n);
                 i += 2;
                 continue;
             }

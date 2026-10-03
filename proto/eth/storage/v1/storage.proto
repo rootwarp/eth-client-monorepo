@@ -35,8 +35,7 @@ service StorageService {
   rpc GetHistoricalBlock(GetHistoricalBlockRequest) returns (GetHistoricalBlockResponse);
   rpc GetSnapshotState(GetSnapshotStateRequest) returns (stream StateChunk);
   // Additive within eth.storage.v1 (CC-4I): finalized-checkpoint history.
-  rpc GetFinalizedCheckpointHistory(GetFinalizedCheckpointHistoryRequest)
-      returns (GetFinalizedCheckpointHistoryResponse);
+  rpc GetFinalizedCheckpointHistory(GetFinalizedCheckpointHistoryRequest) returns (GetFinalizedCheckpointHistoryResponse);
 }
 
 message GetInfoRequest {}

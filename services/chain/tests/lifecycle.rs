@@ -99,6 +99,80 @@ fn minimal_config() -> ChainConfig {
     }
 }
 
+/// In-process engine required by checkpoint seed.
+///
+/// `EngineApi::from_parts` spawns the upcheck, which POSTs `eth_syncing`.
+/// The listener is bound to `127.0.0.1:0` and accepts without a JSON-RPC
+/// body, so that dial stays on a socket this test owns. Anchor re-import
+/// still returns before `newPayload`.
+async fn in_process_engine() -> Arc<cc_chain::DirectEngine> {
+    use cc_engine_api::EngineApi;
+    use cc_engine_api::capabilities::CapabilityCache;
+    use cc_engine_api::config::{TimeoutKnobs, TransportTimeouts};
+    use cc_engine_api::fastpath::FastpathLane;
+    use cc_engine_api::fastpath::filter::SubscriptionSet;
+    use cc_engine_api::state::EngineStateHandle;
+    use cc_engine_api::transport::EngineTransport;
+    use cc_engine_api::version::ElForkSchedule;
+    use tokio::runtime::Handle;
+
+    // Same accept-and-hold shape as `spawn_black_hole` in
+    // `engine_blackhole_liveness`. That helper is a sibling test binary, so
+    // this fixture binds its own listener.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _stream = stream;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let timeouts = TransportTimeouts::from_knobs(&TimeoutKnobs {
+        new_payload_ms: 50,
+        forkchoice_updated_ms: 50,
+        get_blobs_ms: 50,
+        exchange_capabilities_ms: 50,
+        eth_syncing_ms: 50,
+        multiplier: 1.0,
+    });
+    let transport = Arc::new(EngineTransport::from_secret_bytes(
+        format!("http://{addr}"),
+        [1u8; 32],
+        timeouts.clone(),
+        Duration::from_millis(50),
+        None,
+    ));
+    let schedule = ElForkSchedule {
+        osaka_time: 0,
+        bpo1_time: None,
+        bpo2_time: None,
+        amsterdam_time: None,
+    };
+    let state = EngineStateHandle::new(
+        Arc::new(CapabilityCache::new()),
+        None,
+        Duration::from_millis(50),
+    );
+    let bound = cc_engine_api::fastpath::fetch::BlobBound::from_chain_config(&minimal_config())
+        .expect("minimal blob schedule");
+    let lane = FastpathLane::new(
+        Arc::clone(&transport),
+        None,
+        bound,
+        None,
+        None,
+        SubscriptionSet::empty(),
+    );
+    let api = EngineApi::from_parts(transport, schedule, Handle::current(), None, state, lane);
+    Arc::new(cc_chain::DirectEngine::new(api, timeouts))
+}
+
 fn anchor_fixture() -> (BeaconState<Minimal>, SignedBeaconBlock<Minimal>, Root) {
     let mut state = BeaconState::<Minimal>::default();
     state.set_genesis_time(1_600_000_000);
@@ -718,13 +792,18 @@ async fn spawn_core_from_checkpoint_warms_caches_first_import_no_extra_cold() {
         provider: "test://fixture".into(),
     };
 
+    // Seed refuses a missing in-process engine. Anchor re-import returns
+    // before newPayload; the upcheck still dials the listener this test owns.
     let core = spawn_core_from_checkpoint(
         fetched,
         config.clone(),
         head.clone(),
         events.event_sender(),
         metrics.clone(),
-        CoreConfig::default(),
+        CoreConfig {
+            engine: Some(in_process_engine().await),
+            ..CoreConfig::default()
+        },
     )
     .expect("spawn from checkpoint");
 

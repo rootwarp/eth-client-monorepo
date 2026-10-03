@@ -860,14 +860,9 @@ fn column_sidecar_decode_lives_in_chain_core() {
         ingest_src.contains("DataColumnSidecar"),
         "chain-core ingest names the sidecar to populate ColumnBatch"
     );
-    assert!(
-        std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../crates/storage-core/src/write_behind.rs"
-        ))
-        .exists(),
-        "write_behind still exists (S2-A-09 deletes it, not S2-A-07)"
-    );
+    // Live writer boundary is ArchiveWrite::ingest_block, not a source file.
+    // S2R-A-02 re-points this onto commit_import / set_head.
+    duplicate_anchor_reaches_ingest_block();
     let fanout_src = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../crates/chain-core/src/events/fanout.rs"
@@ -876,4 +871,114 @@ fn column_sidecar_decode_lives_in_chain_core() {
         fanout_src.contains("try_send"),
         "event fan-out stays Policy B (try_send, drop the subscriber)"
     );
+}
+
+/// A fork-choice duplicate whose body is not durable must be handed to
+/// `ArchiveWrite::ingest_block`. S2R-A-02 re-points this onto `commit_import`
+/// / `set_head`.
+fn duplicate_anchor_reaches_ingest_block() {
+    use async_trait::async_trait;
+    use cc_chain::import::{ImportCounters, encode_signed_block, import_block_with_early};
+    use cc_chain::residency::Residency;
+    use cc_seam::{ArchiveWrite, IngestBlock, SeamError};
+    use cc_state_transition::BlockSignatureStrategy;
+    use std::sync::Mutex;
+    use tree_hash::TreeHash;
+
+    #[derive(Default)]
+    struct Recording {
+        blocks: Mutex<Vec<IngestBlock>>,
+    }
+
+    #[async_trait]
+    impl ArchiveWrite for Recording {
+        async fn ingest_columns(&self, _batch: cc_seam::ColumnBatch) -> Result<(), SeamError> {
+            Ok(())
+        }
+
+        async fn ingest_block(&self, block: IngestBlock) -> Result<(), SeamError> {
+            self.ingest_block_blocking(block)
+        }
+
+        fn ingest_block_blocking(&self, block: IngestBlock) -> Result<(), SeamError> {
+            self.blocks.lock().unwrap().push(block);
+            Ok(())
+        }
+    }
+
+    let mut state = state_with_validators(8, Slot::new(0));
+    let state_root = state.canonical_root();
+    let signed = cc_types::SignedBeaconBlock {
+        message: BeaconBlock {
+            slot: state.slot(),
+            proposer_index: ValidatorIndex::new(0),
+            parent_root: Root::ZERO,
+            state_root,
+            body: Default::default(),
+        },
+        signature: Default::default(),
+    };
+    let config = minimal_config();
+    let mut store = get_forkchoice_store(
+        state,
+        &signed.message,
+        Arc::new(AcceptEngine),
+        Arc::new(HarnessAvailability),
+        config.seconds_per_slot,
+    )
+    .unwrap();
+    let root = Root::from_hash256(TreeHash::tree_hash_root(&signed.message));
+    let ssz = encode_signed_block(&signed);
+    let archive_impl = Arc::new(Recording::default());
+    let archive: cc_chain::ArchiveWriteHandle = archive_impl.clone();
+    let mut registry = Registry::default();
+    let metrics = ChainMetrics::register(&mut registry);
+    let head = HeadSnapshotStore::new();
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+    let counters = ImportCounters::default();
+    let mut residency = Residency::<Minimal>::new(8, 4);
+    let mut snap_seq = 0u64;
+
+    let outcome = import_block_with_early(
+        &mut store,
+        &mut residency,
+        &config,
+        &head,
+        &event_tx,
+        &metrics,
+        &counters,
+        &mut snap_seq,
+        cc_proto::chain::ImportBlockRequest {
+            ssz,
+            fork: 0,
+            root: root.as_slice().to_vec(),
+            source: 0,
+        },
+        BlockSignatureStrategy::NoVerification,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&archive),
+    )
+    .expect("duplicate anchor import");
+
+    assert_eq!(
+        outcome.response.verdict,
+        cc_proto::chain::ImportBlockVerdict::Duplicate as i32
+    );
+    let got = archive_impl.blocks.lock().unwrap();
+    assert_eq!(
+        got.len(),
+        1,
+        "non-durable duplicate must reach the live writer"
+    );
+    let mut expected_root = [0u8; 32];
+    expected_root.copy_from_slice(root.as_slice());
+    assert_eq!(got[0].block_root, expected_root);
+    // Genesis parent is the block itself at this boundary.
+    assert_eq!(got[0].parent_root, expected_root);
+    assert_eq!(got[0].slot, signed.message.slot.as_u64());
 }

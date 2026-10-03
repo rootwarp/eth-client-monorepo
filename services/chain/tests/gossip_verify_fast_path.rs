@@ -846,6 +846,7 @@ fn seeded_store_for_gap() -> (
 ) {
     let config = minimal_config();
     let mut keys = Vec::with_capacity(8);
+    let mut validator_pubkeys = Vec::with_capacity(8);
     let mut state = BeaconState::<Minimal>::default();
     state.set_genesis_time(0);
     state.set_slot(Slot::new(0));
@@ -872,8 +873,20 @@ fn seeded_store_for_gap() -> (
         state.current_epoch_participation_push(0).unwrap();
         state.inactivity_scores_push(0).unwrap();
         keys.push(ski);
+        validator_pubkeys.push(pki);
     }
-    // S2-A-10: PubkeyIndexMap lives on TransitionContext; STF top-up fills it.
+    // process_sync_aggregate looks up every committee key and has no scan
+    // fallback. Default (zero) committee keys are not in the registry, so an
+    // empty TransitionContext map is CachePoisoned.
+    let committee_keys: Vec<BlsPublicKey> = (0..Minimal::SYNC_COMMITTEE_SIZE as usize)
+        .map(|i| validator_pubkeys[i % validator_pubkeys.len()])
+        .collect();
+    let committee = cc_types::containers::SyncCommittee {
+        pubkeys: ssz_types::FixedVector::new(committee_keys.clone()).expect("sync committee size"),
+        aggregate_pubkey: committee_keys[0],
+    };
+    state.set_current_sync_committee(committee.clone());
+    state.set_next_sync_committee(committee);
 
     for i in 0..state.proposer_lookahead_len() {
         state
@@ -966,6 +979,7 @@ fn valid_signed_gap_block(
     };
     let engine = AcceptEngine;
     let ctx = TransitionContext::new(config, &engine);
+    ctx.top_up_pubkey_cache(&st);
     process_block(&mut st, &message, &ctx, pre_root).expect("process_block for post-state root");
     message.state_root = st.canonical_root();
     let sk = keys
