@@ -1,0 +1,23 @@
+[package]
+name = "cc-node-key"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "cc_node_key"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+cc-types = { workspace = true }
+ethereum_hashing = { workspace = true }
+# secp256k1 secret file. Default build generates a key; not gated on cc-crypto's
+# `signing` feature (that feature is BLS keygen, and the verify path stays verify-only).
+k256 = { workspace = true }
+thiserror = { workspace = true }

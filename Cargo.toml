@@ -40,6 +40,8 @@ members = [
   "crates/beacon-inproc",
   # S2-A-14: import → durable test crate. Proto-free tree (no tonic / cc-proto).
   "crates/beacon-import",
+  # Shared secp256k1 node-key file. Not part of cc-crypto (verify path stays verify-only).
+  "crates/node-key",
 ]
 
 [workspace.package]
@@ -213,6 +215,10 @@ cc-beacon-inproc = { path = "crates/beacon-inproc" }
 cc-beacon-import = { path = "crates/beacon-import" }
 # S2-J-01: checkpoint_sync stays on cc-chain (HTTP grandfather).
 cc-chain = { path = "services/chain" }
+# Shared secp256k1 node-key file. Pin 0.14 (already resolved for libp2p-identity);
+# do not bump unrelated crates.
+k256 = "0.14"
+cc-node-key = { path = "crates/node-key" }
 
 [profile.release]
 opt-level = 3

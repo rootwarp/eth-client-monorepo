@@ -28,6 +28,8 @@ cc-libp2p = { workspace = true }
 cc-proto = { workspace = true }
 cc-seam = { workspace = true }
 cc-types = { workspace = true }
+# Shared node-key file. Appended; not re-sorted.
+cc-node-key = { workspace = true }
 alloy-primitives = { workspace = true }
 # Workspace pin from CC-2K; first consumer (CC-21a probe / EnrManager skeleton).
 discv5 = { workspace = true }

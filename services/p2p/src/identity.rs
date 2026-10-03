@@ -6,22 +6,19 @@
 //! makes `earliest_available_slot` a claim about columns we no longer hold.
 //!
 //! The same secret is the libp2p identity **and** the discv5 identity so `PeerId` and
-//! `NodeId` stay coupled.
+//! `NodeId` stay coupled. The file (mode, exclusive create, parent fsync) is
+//! `cc_node_key`. This module only turns those 32 bytes into libp2p and discv5 ids.
 
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::io;
+use std::path::{Path, PathBuf};
 
 use cc_libp2p::PeerId;
 use cc_libp2p::reexport::identity::{self, Keypair};
+use cc_node_key::NodeKeyError;
 use discv5::enr::{CombinedKey, Enr, NodeId};
 use thiserror::Error;
 
-/// Default relative path when config omits `node_key_path`.
-pub const DEFAULT_NODE_KEY_PATH: &str = "./data/node_key";
-
-/// Required Unix permission bits for an existing or newly created key file.
-pub const NODE_KEY_MODE: u32 = 0o600;
+pub use cc_node_key::{DEFAULT_NODE_KEY_PATH, NODE_KEY_MODE};
 
 /// Loaded (or newly created) node identity.
 ///
@@ -52,7 +49,7 @@ impl std::fmt::Debug for NodeIdentity {
 /// Errors from [`load_or_create`].
 #[derive(Debug, Error)]
 pub enum IdentityError {
-    /// Key file exists but mode is broader than [`NODE_KEY_MODE`] (refuse before bind).
+    /// Group or other permission bits are set (refuse before bind). `0400` is accepted.
     #[error(
         "node key permissions too broad at {}: mode {mode:#o} (require {required:#o})",
         path.display()
@@ -88,6 +85,9 @@ pub enum IdentityError {
     /// Path contains `..` (refused as path-escape under config control).
     #[error("node key path must not contain '..' components: {}", path.display())]
     PathEscape { path: PathBuf },
+    /// `cc-node-key` refused a non-unix host instead of skipping the mode check.
+    #[error("node key load/create is refused on non-unix platforms (mode bits cannot be enforced)")]
+    NonUnix,
 }
 
 impl NodeIdentity {
@@ -131,81 +131,43 @@ impl NodeIdentity {
 /// - refuses `..` components (config-controlled path escape)
 /// - normalises away `.` components
 pub fn validate_node_key_path(path: impl AsRef<Path>) -> Result<PathBuf, IdentityError> {
-    let path = path.as_ref();
-    if path.as_os_str().is_empty() {
-        return Err(IdentityError::EmptyPath);
-    }
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::Prefix(p) => out.push(p.as_os_str()),
-            Component::RootDir => out.push(Component::RootDir.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(IdentityError::PathEscape {
-                    path: path.to_path_buf(),
-                });
-            }
-            Component::Normal(s) => out.push(s),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        return Err(IdentityError::EmptyPath);
-    }
-    Ok(out)
+    cc_node_key::validate_node_key_path(path).map_err(identity_error)
 }
 
 /// Load a 32-byte secp256k1 secret from `path`, or create one at mode [`NODE_KEY_MODE`].
 ///
-/// **Refuses to start** if the file exists with permissions broader than `0600`.
-/// Loaded **before** any bind in `main` (CC-20/2 structural load order).
+/// **Refuses to start** if the file has group or other permission bits. Mode `0400`
+/// is accepted. Loaded **before** any bind in `main` (CC-20/2 structural load order).
+/// The bytes come from [`cc_node_key::load_or_create`].
 pub fn load_or_create(path: impl AsRef<Path>) -> Result<NodeIdentity, IdentityError> {
-    let path = validate_node_key_path(path)?;
-    if path.exists() {
-        load_existing(&path)
-    } else {
-        create_new(&path)
-    }
+    let key = cc_node_key::load_or_create(path).map_err(identity_error)?;
+    identity_from_secret(key.path(), key.to_bytes())
 }
 
-fn load_existing(path: &Path) -> Result<NodeIdentity, IdentityError> {
-    check_permissions(path)?;
-    let bytes = fs::read(path).map_err(|source| IdentityError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if bytes.len() != 32 {
-        return Err(IdentityError::InvalidLength {
-            path: path.to_path_buf(),
-            got: bytes.len(),
-        });
+fn identity_error(err: NodeKeyError) -> IdentityError {
+    match err {
+        NodeKeyError::PermissionsTooBroad {
+            path,
+            mode,
+            required,
+        } => IdentityError::PermissionsTooBroad {
+            path,
+            mode,
+            required,
+        },
+        NodeKeyError::InvalidLength { path, got } => IdentityError::InvalidLength { path, got },
+        NodeKeyError::InvalidSecret { path, source } => {
+            IdentityError::InvalidSecret { path, source }
+        }
+        NodeKeyError::Io { path, source } => IdentityError::Io { path, source },
+        NodeKeyError::EmptyPath => IdentityError::EmptyPath,
+        NodeKeyError::PathEscape { path } => IdentityError::PathEscape { path },
+        NodeKeyError::NonUnix => IdentityError::NonUnix,
+        NodeKeyError::Rng { path, message } => IdentityError::Io {
+            path,
+            source: io::Error::other(message),
+        },
     }
-    let mut secret = [0u8; 32];
-    secret.copy_from_slice(&bytes);
-    identity_from_secret(path, secret)
-}
-
-fn create_new(path: &Path) -> Result<NodeIdentity, IdentityError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).map_err(|source| IdentityError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    }
-
-    let keypair = Keypair::generate_secp256k1();
-    let secret =
-        secret_bytes_from_keypair(&keypair).map_err(|source| IdentityError::InvalidSecret {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-    write_secret_file(path, &secret)?;
-    // Re-check what landed on disk (mode must be 0600).
-    check_permissions(path)?;
-    identity_from_secret(path, secret)
 }
 
 fn identity_from_secret(path: &Path, secret: [u8; 32]) -> Result<NodeIdentity, IdentityError> {
@@ -247,89 +209,11 @@ fn node_id_from_secret(path: &Path, secret: [u8; 32]) -> Result<NodeId, Identity
     Ok(enr.node_id())
 }
 
-fn secret_bytes_from_keypair(
-    keypair: &Keypair,
-) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-    let secp = keypair
-        .clone()
-        .try_into_secp256k1()
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-    Ok(secp.secret().to_bytes())
-}
-
-fn check_permissions(path: &Path) -> Result<(), IdentityError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = fs::metadata(path).map_err(|source| IdentityError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let mode = meta.permissions().mode() & 0o777;
-        if mode != NODE_KEY_MODE {
-            return Err(IdentityError::PermissionsTooBroad {
-                path: path.to_path_buf(),
-                mode,
-                required: NODE_KEY_MODE,
-            });
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        // Non-Unix: no mode bits to enforce; file presence is enough.
-    }
-    Ok(())
-}
-
-fn write_secret_file(path: &Path, secret: &[u8; 32]) -> Result<(), IdentityError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(NODE_KEY_MODE)
-            .open(path)
-            .map_err(|source| IdentityError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        f.write_all(secret).map_err(|source| IdentityError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        f.sync_all().map_err(|source| IdentityError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let mut perms = f
-            .metadata()
-            .map_err(|source| IdentityError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .permissions();
-        perms.set_mode(NODE_KEY_MODE);
-        fs::set_permissions(path, perms).map_err(|source| IdentityError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, secret).map_err(|source| IdentityError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_path(name: &str) -> PathBuf {
@@ -397,6 +281,23 @@ mod tests {
             matches!(err, IdentityError::PermissionsTooBroad { .. }),
             "got {err:?}"
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stricter_0400_is_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("strict");
+        let _ = fs::remove_file(&path);
+        let mut bytes = [0u8; 32];
+        bytes[31] = 1;
+        fs::write(&path, bytes).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o400);
+        fs::set_permissions(&path, perms).unwrap();
+        let id = load_or_create(&path).expect("0400 is owner-read, not broader");
+        assert_eq!(id.path(), path.as_path());
         let _ = fs::remove_file(&path);
     }
 

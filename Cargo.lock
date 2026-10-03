@@ -1259,6 +1259,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc-node-key"
+version = "0.1.0"
+dependencies = [
+ "cc-types",
+ "ethereum_hashing",
+ "k256 0.14.0",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "cc-p2p"
 version = "0.1.0"
 dependencies = [
@@ -1269,6 +1279,7 @@ dependencies = [
  "cc-config",
  "cc-crypto",
  "cc-libp2p",
+ "cc-node-key",
  "cc-proto",
  "cc-seam",
  "cc-spec-tests",

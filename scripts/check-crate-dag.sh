@@ -361,6 +361,24 @@ for STORE_SRC in "$ROOT/crates/store/src" "$ROOT/crates/storage-core/src"; do
   fi
 done
 
+# Node-key leaf: a stranger crate must not name the rust crate. services/p2p
+# loads the file (this crate's caller). crates/storage-core/src/boot.rs is the
+# only storage-core file allowed to name it, for a later caller — it does not
+# name it yet. beacon-core keeps its own copy until that call site moves, so
+# it is not on the allow list. The leaf crate may name itself. Comment and doc
+# lines are skipped, same shape as the consensus-type grep above.
+while IFS= read -r hit; do
+  [[ -z "$hit" ]] && continue
+  case "$hit" in
+    */services/p2p/*) continue ;;
+    */crates/storage-core/src/boot.rs:*) continue ;;
+    */crates/node-key/*) continue ;;
+  esac
+  echo "error: only services/p2p and crates/storage-core/src/boot.rs may name cc_node_key ($hit)" >&2
+  EARLY_FAILED=1
+done < <(grep -rn "cc_node_key" "$ROOT/crates" "$ROOT/services" "$ROOT/bin" 2>/dev/null \
+  | grep -vE ':[0-9]+:[[:space:]]*//' || true)
+
 if [[ "$EARLY_FAILED" -ne 0 ]]; then
   exit 1
 fi
@@ -395,7 +413,8 @@ allowed_deps() {
     cc-chain)             echo "cc-bootstrap cc-config cc-proto cc-types cc-crypto cc-state-transition cc-fork-choice cc-scheduler cc-seam cc-engine-api cc-chain-core" ;;
     # Phase 2: services/p2p may take cc-libp2p (CC-2K / Architecture §1.2).
     # Custody-vector dev-dep (services/p2p/tests/custody_subset.rs). Append-only.
-    cc-p2p)               echo "cc-bootstrap cc-config cc-proto cc-types cc-crypto cc-libp2p cc-seam cc-spec-tests" ;;
+    # Node-key leaf appended (p2p loads the shared secret file). Not re-sorted.
+    cc-p2p)               echo "cc-bootstrap cc-config cc-proto cc-types cc-crypto cc-libp2p cc-seam cc-spec-tests cc-node-key" ;;
     cc-attestation)       echo "cc-bootstrap cc-config cc-proto" ;;
     # CC-32b: append cc-types (never re-sort). CC-37b: append cc-crypto (never re-sort).
     # S1-A-02: append cc-engine-api (transport + config move).
@@ -435,6 +454,8 @@ allowed_deps() {
     cc-beacon-inproc)     echo "cc-store cc-types" ;;
     # S2-A-14: proto-free import → durable test crate. Never proto / tonic / JWT.
     cc-beacon-import)     echo "cc-beacon-inproc cc-store cc-types cc-fork-choice cc-state-transition cc-storage-core cc-seam cc-crypto" ;;
+    # Node-key leaf. Echoes cc-types (fingerprint hash newtype). Not cc-crypto.
+    cc-node-key)          echo "cc-types" ;;
     *)
       echo "error: unknown workspace member: $1" >&2
       return 1
