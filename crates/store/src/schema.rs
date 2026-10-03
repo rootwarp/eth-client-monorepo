@@ -24,14 +24,17 @@ use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 use ssz_types::VariableList;
 use typenum::U256;
 
-use cc_types::{ChainConfig, Epoch, Root};
+use cc_types::{ChainConfig, Epoch, ExecutionAddress, ForkVersion, Root};
 
+use crate::blocks::TABLE_BLOCKS_HOT;
+use crate::canonical::TABLE_CANONICAL;
 use crate::engine::{Engine, EngineOptions, StoreError};
 use crate::keys::{
     BLOCK_SHARD_EPOCHS, COLUMN_SHARD_EPOCHS, blocks_shard_table, columns_shard_table,
     parse_shard_suffix,
 };
 use crate::meta::{ConfigDigest, KEY_CONFIG_DIGEST, KEY_SCHEMA_VERSION, SchemaVersion, TABLE_META};
+use crate::snapshots::TABLE_SNAPSHOTS;
 
 /// Current on-disk schema version. Phase 4: one value, no migration path.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -135,10 +138,12 @@ struct BlobScheduleDigestEntry {
     max_blobs_per_block: u64,
 }
 
-/// Canonical SSZ payload for the config digest.
+/// Legacy SSZ payload still stored under `meta.config_digest`.
 ///
-/// Field names / comments carry the §2.5 grep anchors; do not add fields without
-/// a schema version bump.
+/// Field names carry the §2.5 grep anchors. Do not add `digest_version` or any
+/// other field: that would change the bytes the rollback binary compares.
+/// Running-config buckets carry [`DIGEST_VERSION`] on their own payloads.
+/// [`SCHEMA_VERSION`] is not bumped for that split.
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
 struct ConfigDigestPayload {
     // --- fork epochs ---
@@ -212,6 +217,36 @@ impl ConfigDigestInput {
 /// not a silent truncation (SEC-40a-1).
 pub const CONFIG_DIGEST_BLOB_SCHEDULE_MAX: usize = 256;
 
+/// Version mixed into both running-config bucket payloads.
+///
+/// Adding a digested field bumps this integer. It does not bump [`SCHEMA_VERSION`].
+/// The legacy payload does not carry it.
+pub const DIGEST_VERSION: u16 = 1;
+
+/// Identity bucket: fatal network fields. `config_name` is not included.
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+struct IdentityDigestPayload {
+    digest_version: u16,
+    genesis_fork_version: ForkVersion,
+    deposit_contract_address: ExecutionAddress,
+    deposit_chain_id: u64,
+    genesis_validators_root: Root,
+    seconds_per_slot: u64,
+}
+
+/// Schedule bucket: fork epochs and `BLOB_SCHEDULE`. Comparison is a later open.
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+struct ScheduleDigestPayload {
+    digest_version: u16,
+    altair_fork_epoch: u64,
+    bellatrix_fork_epoch: u64,
+    capella_fork_epoch: u64,
+    deneb_fork_epoch: u64,
+    electra_fork_epoch: u64,
+    fulu_fork_epoch: u64,
+    blob_schedule: VariableList<BlobScheduleDigestEntry, U256>,
+}
+
 /// Compute the config digest over the §2.5 named field list only.
 ///
 /// Encoding: SSZ of [`ConfigDigestPayload`], then SHA-256 → [`Root`].
@@ -223,31 +258,7 @@ pub const CONFIG_DIGEST_BLOB_SCHEDULE_MAX: usize = 256;
 /// `genesis_validators_root`, `BLOB_SCHEDULE`, `SECONDS_PER_SLOT`,
 /// `MIN_VALIDATOR_WITHDRAWABILITY_DELAY`, `CHURN_LIMIT_QUOTIENT`, fork epochs.
 pub fn compute_config_digest(input: &ConfigDigestInput) -> Result<Root, StoreError> {
-    let n = input.chain.blob_schedule.entries().len();
-    if n > CONFIG_DIGEST_BLOB_SCHEDULE_MAX {
-        return Err(StoreError::Config(format!(
-            "BLOB_SCHEDULE has {n} entries; digest encoding capacity is \
-             {CONFIG_DIGEST_BLOB_SCHEDULE_MAX} (refuse to truncate)"
-        )));
-    }
-    let entries: Vec<BlobScheduleDigestEntry> = input
-        .chain
-        .blob_schedule
-        .entries()
-        .iter()
-        .map(|e| BlobScheduleDigestEntry {
-            epoch: e.epoch.as_u64(),
-            max_blobs_per_block: e.max_blobs_per_block,
-        })
-        .collect();
-    // Fail closed on encode capacity — no take(N) / unwrap_or_default (SEC-40a-1).
-    let blob_schedule = VariableList::new(entries).map_err(|e| {
-        StoreError::Config(format!(
-            "BLOB_SCHEDULE does not fit digest encoding (capacity \
-             {CONFIG_DIGEST_BLOB_SCHEDULE_MAX}): {e}"
-        ))
-    })?;
-
+    let blob_schedule = blob_schedule_entries(&input.chain)?;
     let payload = ConfigDigestPayload {
         altair_fork_epoch: epoch_u64(input.chain.altair_fork_epoch),
         bellatrix_fork_epoch: epoch_u64(input.chain.bellatrix_fork_epoch),
@@ -266,16 +277,154 @@ pub fn compute_config_digest(input: &ConfigDigestInput) -> Result<Root, StoreErr
         // CHURN_LIMIT_QUOTIENT
         churn_limit_quotient: input.churn_limit_quotient,
     };
+    Ok(sha256_root(&payload.as_ssz_bytes()))
+}
 
-    let bytes = payload.as_ssz_bytes();
-    let hash = Sha256::digest(&bytes);
+/// Identity-bucket digest of the running network.
+///
+/// `digest_version` is part of the hashed payload, so bumping [`DIGEST_VERSION`]
+/// changes the bytes without a [`SCHEMA_VERSION`] bump.
+pub fn compute_identity_digest(chain: &ChainConfig, genesis_validators_root: Root) -> Root {
+    identity_digest_at(chain, genesis_validators_root, DIGEST_VERSION)
+}
+
+/// Schedule-bucket digest of the running network.
+///
+/// Fails closed on an oversized `BLOB_SCHEDULE`, same as [`compute_config_digest`].
+pub fn compute_schedule_digest(chain: &ChainConfig) -> Result<Root, StoreError> {
+    schedule_digest_at(chain, DIGEST_VERSION)
+}
+
+fn identity_digest_at(
+    chain: &ChainConfig,
+    genesis_validators_root: Root,
+    digest_version: u16,
+) -> Root {
+    let payload = IdentityDigestPayload {
+        digest_version,
+        genesis_fork_version: chain.genesis_fork_version,
+        deposit_contract_address: chain.deposit_contract_address,
+        deposit_chain_id: chain.deposit_chain_id,
+        genesis_validators_root,
+        seconds_per_slot: chain.seconds_per_slot,
+    };
+    sha256_root(&payload.as_ssz_bytes())
+}
+
+fn schedule_digest_at(chain: &ChainConfig, digest_version: u16) -> Result<Root, StoreError> {
+    let payload = ScheduleDigestPayload {
+        digest_version,
+        altair_fork_epoch: epoch_u64(chain.altair_fork_epoch),
+        bellatrix_fork_epoch: epoch_u64(chain.bellatrix_fork_epoch),
+        capella_fork_epoch: epoch_u64(chain.capella_fork_epoch),
+        deneb_fork_epoch: epoch_u64(chain.deneb_fork_epoch),
+        electra_fork_epoch: epoch_u64(chain.electra_fork_epoch),
+        fulu_fork_epoch: epoch_u64(chain.fulu_fork_epoch),
+        blob_schedule: blob_schedule_entries(chain)?,
+    };
+    Ok(sha256_root(&payload.as_ssz_bytes()))
+}
+
+fn blob_schedule_entries(
+    chain: &ChainConfig,
+) -> Result<VariableList<BlobScheduleDigestEntry, U256>, StoreError> {
+    let n = chain.blob_schedule.entries().len();
+    if n > CONFIG_DIGEST_BLOB_SCHEDULE_MAX {
+        return Err(StoreError::Config(format!(
+            "BLOB_SCHEDULE has {n} entries; digest encoding capacity is \
+             {CONFIG_DIGEST_BLOB_SCHEDULE_MAX} (refuse to truncate)"
+        )));
+    }
+    let entries: Vec<BlobScheduleDigestEntry> = chain
+        .blob_schedule
+        .entries()
+        .iter()
+        .map(|e| BlobScheduleDigestEntry {
+            epoch: e.epoch.as_u64(),
+            max_blobs_per_block: e.max_blobs_per_block,
+        })
+        .collect();
+    // Fail closed on encode capacity — no take(N) / unwrap_or_default (SEC-40a-1).
+    VariableList::new(entries).map_err(|e| {
+        StoreError::Config(format!(
+            "BLOB_SCHEDULE does not fit digest encoding (capacity \
+             {CONFIG_DIGEST_BLOB_SCHEDULE_MAX}): {e}"
+        ))
+    })
+}
+
+fn sha256_root(bytes: &[u8]) -> Root {
+    let hash = Sha256::digest(bytes);
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&hash);
-    Ok(Root::from_array(arr))
+    Root::from_array(arr)
 }
 
 fn epoch_u64(e: Epoch) -> u64 {
     e.as_u64()
+}
+
+/// `meta.config_digest` written for a new store and recognised by the rollback binary.
+///
+/// Hoodi fixture, `Root::ZERO`, and the two `with_mainnet_scalars` constants.
+/// Recognising that value is not a running-config input, and it is not permission
+/// to open a populated store.
+pub fn legacy_config_digest() -> Root {
+    Root::from_array([
+        0x0c, 0xe1, 0xca, 0xba, 0x76, 0xb2, 0xc6, 0xd0, 0xd5, 0x35, 0xc7, 0xce, 0xd6, 0xcc, 0xf6,
+        0x97, 0x40, 0x4e, 0xb5, 0x36, 0xea, 0x2f, 0x0c, 0xb7, 0xde, 0xfa, 0x8d, 0x34, 0x35, 0x4b,
+        0x77, 0x1e,
+    ])
+}
+
+/// Canonical rows, block bodies, or snapshots — history a running config must not adopt.
+///
+/// Cold `blocks_{shard}` tables are checked before `snapshots`. A snapshot value
+/// is a beacon state. Presence is [`ReadTxn::has_any`] (untyped header length;
+/// that call does not `get_page` the table root). The snapshot table is not
+/// opened once a block row already answers the question.
+pub fn store_holds_chain_history(engine: &Engine) -> Result<bool, StoreError> {
+    let names = engine.table_names()?;
+    let rt = engine.read()?;
+    if table_has_any_row(&rt, TABLE_CANONICAL)? || table_has_any_row(&rt, TABLE_BLOCKS_HOT)? {
+        return Ok(true);
+    }
+    for name in &names {
+        if parse_shard_table(name).is_some_and(|(class, _)| class == "blocks")
+            && table_has_any_row(&rt, name)?
+        {
+            return Ok(true);
+        }
+    }
+    table_has_any_row(&rt, TABLE_SNAPSHOTS)
+}
+
+/// Refuse a populated store that would otherwise open because `config_digest`
+/// equals [`legacy_config_digest`].
+///
+/// An empty store returns `Ok`. Side-key comparison is not performed here.
+/// An absent genesis validators root is not replaced with [`Root::ZERO`].
+pub fn refuse_populated_legacy_open(engine: &Engine, gvr_present: bool) -> Result<(), StoreError> {
+    if !store_holds_chain_history(engine)? {
+        return Ok(());
+    }
+    if !gvr_present {
+        return Err(StoreError::Config(
+            "genesis_validators_root is required when the store holds chain history \
+             (absent GVR is not Root::ZERO)"
+                .into(),
+        ));
+    }
+    Err(StoreError::Config(
+        "populated store refused: config_digest equality with the legacy constant \
+         is not an open until side keys are compared"
+            .into(),
+    ))
+}
+
+fn table_has_any_row(rt: &crate::engine::ReadTxn, table: &str) -> Result<bool, StoreError> {
+    // Untyped header length. `range_max` copies the first value.
+    rt.has_any(table)
 }
 
 fn root_hex(r: &Root) -> String {
@@ -838,6 +987,187 @@ mod tests {
             msg.contains("SchemaVersion") || msg.contains("codec"),
             "{msg}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two networks must not share a digest. At the parent this fails: the
+    /// running-digest helpers ignore the supplied chain.
+    #[test]
+    fn two_networks_produce_different_digests() {
+        let gvr = Root::from_array([0x11; 32]);
+        let hoodi = ChainConfig::from_yaml_str(include_str!(
+            "../../types/tests/fixtures/hoodi-config.yaml"
+        ))
+        .unwrap();
+        let mainnet = ChainConfig::from_yaml_str(include_str!(
+            "../../types/tests/fixtures/mainnet-config.yaml"
+        ))
+        .unwrap();
+        assert_ne!(
+            hoodi.genesis_fork_version, mainnet.genesis_fork_version,
+            "fixture pair must actually differ"
+        );
+        let hoodi_id = compute_identity_digest(&hoodi, gvr);
+        let mainnet_id = compute_identity_digest(&mainnet, gvr);
+        assert_ne!(
+            hoodi_id, mainnet_id,
+            "identity digests must differ across networks"
+        );
+        let hoodi_sched = compute_schedule_digest(&hoodi).unwrap();
+        let mainnet_sched = compute_schedule_digest(&mainnet).unwrap();
+        assert_ne!(
+            hoodi_sched, mainnet_sched,
+            "schedule digests must differ across networks"
+        );
+    }
+
+    /// Bumping [`DIGEST_VERSION`] changes the hashed bytes. The integer is the
+    /// mechanism; a comment is not.
+    #[test]
+    fn digest_version_bump_changes_both_payloads() {
+        let gvr = Root::from_array([0x11; 32]);
+        let hoodi = ChainConfig::from_yaml_str(include_str!(
+            "../../types/tests/fixtures/hoodi-config.yaml"
+        ))
+        .unwrap();
+        assert_ne!(
+            identity_digest_at(&hoodi, gvr, 1),
+            identity_digest_at(&hoodi, gvr, 2),
+            "identity payload must hash digest_version"
+        );
+        assert_ne!(
+            schedule_digest_at(&hoodi, 1).unwrap(),
+            schedule_digest_at(&hoodi, 2).unwrap(),
+            "schedule payload must hash digest_version"
+        );
+        assert_eq!(
+            compute_identity_digest(&hoodi, gvr),
+            identity_digest_at(&hoodi, gvr, DIGEST_VERSION)
+        );
+        assert_eq!(
+            compute_schedule_digest(&hoodi).unwrap(),
+            schedule_digest_at(&hoodi, DIGEST_VERSION).unwrap()
+        );
+    }
+
+    /// An operator label is not a network change.
+    #[test]
+    fn config_name_is_not_a_running_digest_input() {
+        let gvr = Root::from_array([0x22; 32]);
+        let hoodi = ChainConfig::from_yaml_str(include_str!(
+            "../../types/tests/fixtures/hoodi-config.yaml"
+        ))
+        .unwrap();
+        let mut renamed = hoodi.clone();
+        renamed.config_name = "not-the-label".into();
+        assert_eq!(
+            compute_identity_digest(&hoodi, gvr),
+            compute_identity_digest(&renamed, gvr)
+        );
+        assert_eq!(
+            compute_schedule_digest(&hoodi).unwrap(),
+            compute_schedule_digest(&renamed).unwrap()
+        );
+    }
+
+    /// The rollback constant is the Hoodi fixture digested with `Root::ZERO`.
+    /// Production does not re-read that fixture to obtain it.
+    #[test]
+    fn legacy_constant_is_the_hoodi_zero_gvr_digest() {
+        let chain = ChainConfig::from_yaml_str(include_str!(
+            "../../types/tests/fixtures/hoodi-config.yaml"
+        ))
+        .unwrap();
+        let live =
+            compute_config_digest(&ConfigDigestInput::with_mainnet_scalars(chain, Root::ZERO))
+                .unwrap();
+        assert_eq!(live, legacy_config_digest());
+    }
+
+    #[test]
+    fn populated_store_is_refused_even_when_legacy_digest_matches() {
+        let dir = tmp_dir("populated-refuse");
+        let input = hoodi_input();
+        let store = Store::open(&dir, open_opts(&input)).unwrap();
+        let engine = store.engine();
+        let rt = engine.read().unwrap();
+        let mut batch = engine.batch();
+        crate::canonical::put_canonical(
+            &rt,
+            &mut batch,
+            cc_types::Slot::new(1),
+            &Root::from_array([7; 32]),
+        )
+        .unwrap();
+        engine.commit(batch).unwrap();
+        drop(rt);
+        assert!(store_holds_chain_history(engine).unwrap());
+        let missing = refuse_populated_legacy_open(engine, false).unwrap_err();
+        assert!(
+            missing.to_string().contains("genesis_validators_root"),
+            "{missing}"
+        );
+        let present = refuse_populated_legacy_open(engine, true).unwrap_err();
+        assert!(
+            present.to_string().contains("populated store refused"),
+            "{present}"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_store_is_not_a_populated_refusal() {
+        let dir = tmp_dir("empty-allow");
+        let store = Store::open(&dir, open_opts(&hoodi_input())).unwrap();
+        assert!(!store_holds_chain_history(store.engine()).unwrap());
+        refuse_populated_legacy_open(store.engine(), false).unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn assert_populated_refusal(engine: &Engine) {
+        assert!(store_holds_chain_history(engine).unwrap());
+        let missing = refuse_populated_legacy_open(engine, false).unwrap_err();
+        assert!(
+            missing.to_string().contains("genesis_validators_root"),
+            "{missing}"
+        );
+        let present = refuse_populated_legacy_open(engine, true).unwrap_err();
+        assert!(
+            present.to_string().contains("populated store refused"),
+            "{present}"
+        );
+    }
+
+    /// A snapshot and no blocks is still chain history. The bytes here are
+    /// tiny; they do not prove the snapshot page was skipped.
+    #[test]
+    fn snapshot_only_store_is_a_populated_refusal() {
+        use crate::snapshots::put_snapshot;
+
+        let dir = tmp_dir("snap-only");
+        let store = Store::open(&dir, open_opts(&hoodi_input())).unwrap();
+        let engine = store.engine();
+        put_snapshot(engine, cc_types::Slot::new(32), b"snapshot-bytes", 4).unwrap();
+        assert_populated_refusal(engine);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cold `blocks_{shard}` row, with no hot block and no snapshot, refuses.
+    #[test]
+    fn cold_block_shard_only_store_is_a_populated_refusal() {
+        let dir = tmp_dir("cold-shard-only");
+        let store = Store::open(&dir, open_opts(&hoodi_input())).unwrap();
+        let engine = store.engine();
+        let table = blocks_shard_table(3);
+        let mut batch = engine.batch();
+        batch.put(&table, &1u64.to_be_bytes(), b"cold-block");
+        engine.commit(batch).unwrap();
+        assert!(engine.table_names().unwrap().contains(&table));
+        assert_populated_refusal(engine);
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

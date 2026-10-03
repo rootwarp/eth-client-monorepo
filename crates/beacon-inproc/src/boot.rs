@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 use cc_store::engine::{Durability, Engine, EngineOptions};
 use cc_store::meta::{AnchorInfo, KEY_ANCHOR_INFO, KEY_FC_SCALARS, KEY_NODE_ID, TABLE_META};
 use cc_store::snapshots::newest_snapshot;
-use cc_store::{ConfigDigestInput, Root, SszDecode, SszEncode, Store, StoreOpenOptions};
-use cc_types::ChainConfig;
+use cc_store::{
+    Root, SszDecode, SszEncode, Store, StoreOpenOptions, legacy_config_digest,
+    refuse_populated_legacy_open,
+};
 
 /// Ordered boot phases. [`BootPhase::Open`] is always first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,9 +106,9 @@ struct OpenedStore {
 fn open_store(cfg: &BootConfig) -> anyhow::Result<OpenedStore> {
     let durability =
         Durability::parse(&cfg.durability).map_err(|e| anyhow::anyhow!("durability: {e}"))?;
-    let gvr = parse_gvr(cfg.genesis_validators_root.as_deref())?;
-    let chain = digest_chain_config();
-    let digest_input = ConfigDigestInput::with_mainnet_scalars(chain, gvr);
+    // Absent GVR stays absent. The running network is threaded by beacon-core later;
+    // this opener does not read a source-tree fixture in its place.
+    let gvr_present = parse_gvr(cfg.genesis_validators_root.as_deref())?.is_some();
     let expected_node_id = load_expected_node_id_from_key_path(cfg.node_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?;
     if expected_node_id.is_some() {
@@ -115,10 +117,10 @@ fn open_store(cfg: &BootConfig) -> anyhow::Result<OpenedStore> {
             "I-node-id node key loaded from node_key_path"
         );
     }
-    let store_opts = StoreOpenOptions::from_config(
+    let store_opts = StoreOpenOptions::with_digest(
         EngineOptions::default().with_durability(durability),
-        &digest_input,
-    )?
+        legacy_config_digest(),
+    )
     .with_check_invariants(cfg.check_invariants)
     .with_snapshot_ring(cfg.snapshot_ring.max(1))
     .with_max_open_scan_rows(cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS.max(1))
@@ -127,6 +129,8 @@ fn open_store(cfg: &BootConfig) -> anyhow::Result<OpenedStore> {
         Store::open(&cfg.data_dir, store_opts).map_err(|e| anyhow::anyhow!("store open: {e}"))?;
     refuse_missing_key_if_anchor_present(store.engine(), cfg.node_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    refuse_populated_legacy_open(store.engine(), gvr_present)
+        .map_err(|e| anyhow::anyhow!("store open: {e}"))?;
     Ok(OpenedStore {
         store,
         expected_node_id,
@@ -254,9 +258,9 @@ fn refuse_missing_key_if_anchor_present(
     ))
 }
 
-fn parse_gvr(s: Option<&str>) -> anyhow::Result<Root> {
+fn parse_gvr(s: Option<&str>) -> anyhow::Result<Option<Root>> {
     let Some(raw) = s.filter(|s| !s.is_empty()) else {
-        return Ok(Root::ZERO);
+        return Ok(None);
     };
     let hex = raw.strip_prefix("0x").unwrap_or(raw);
     if hex.len() != 64 {
@@ -270,22 +274,5 @@ fn parse_gvr(s: Option<&str>) -> anyhow::Result<Root> {
         arr[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
             .map_err(|e| anyhow::anyhow!("genesis_validators_root hex: {e}"))?;
     }
-    Ok(Root::from_array(arr))
-}
-
-fn digest_chain_config() -> ChainConfig {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../types/tests/fixtures/hoodi-config.yaml");
-    if fixture.is_file()
-        && let Ok(cfg) = ChainConfig::from_yaml_file(&fixture)
-    {
-        return cfg;
-    }
-    match ChainConfig::from_yaml_str(include_str!("../../types/tests/fixtures/hoodi-config.yaml")) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            tracing::error!(error = %e, "bundled hoodi-config.yaml failed to parse");
-            std::process::exit(1);
-        }
-    }
+    Ok(Some(Root::from_array(arr)))
 }

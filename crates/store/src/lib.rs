@@ -87,9 +87,11 @@ pub use invariants::{
 };
 pub use keys::{BlockRegion, shard_of, slots_in};
 pub use schema::{
-    BLOCK_SHARD_WIDTH_EPOCHS, COLUMN_SHARD_WIDTH_EPOCHS, ConfigDigestInput, FIXED_TABLES,
-    SCHEMA_VERSION, Store, StoreOpenOptions, compute_config_digest, is_registered_table,
-    iter_shard_tables, parse_shard_table,
+    BLOCK_SHARD_WIDTH_EPOCHS, COLUMN_SHARD_WIDTH_EPOCHS, ConfigDigestInput, DIGEST_VERSION,
+    FIXED_TABLES, SCHEMA_VERSION, Store, StoreOpenOptions, compute_config_digest,
+    compute_identity_digest, compute_schedule_digest, is_registered_table, iter_shard_tables,
+    legacy_config_digest, parse_shard_table, refuse_populated_legacy_open,
+    store_holds_chain_history,
 };
 pub use snapshots::{
     DEFAULT_SNAPSHOT_EPOCHS, MAX_SNAPSHOT_BYTES, SnapshotPlan, TABLE_SNAPSHOTS,

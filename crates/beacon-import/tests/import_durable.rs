@@ -356,9 +356,19 @@ async fn import_on_block_then_ingest_writes_durable_rows() {
     drop(runtime);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let reopened = boot_in_process(&boot_cfg(dir.clone())).expect("reopen");
+    // The host must not reopen a populated store on the legacy digest constant.
+    // The bytes are still in the file; a direct engine open proves that.
+    let err = boot_in_process(&boot_cfg(dir.clone()))
+        .expect_err("populated store must not open on the legacy constant");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("genesis_validators_root") && msg.contains("not Root::ZERO"),
+        "absent GVR must be refused, not substituted: {msg}"
+    );
+    let engine = cc_store::engine::Engine::open(&dir, cc_store::engine::EngineOptions::default())
+        .expect("committed rows stay readable");
     {
-        let rt = reopened.store.engine().read().unwrap();
+        let rt = engine.read().unwrap();
         assert_eq!(
             get_canonical(&rt, child.message.slot).unwrap(),
             Some(child_root)
@@ -368,11 +378,11 @@ async fn import_on_block_then_ingest_writes_durable_rows() {
             Some(child_ssz.as_slice())
         );
     }
-    let durable = read_cursor(reopened.store.engine()).expect("cursor survives reopen");
+    let durable = read_cursor(&engine).expect("cursor survives reopen");
     assert_eq!(durable.seq, after.seq);
     assert_eq!(durable.root, child_root);
 
-    drop(reopened);
+    drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -55,6 +55,7 @@ mod tests {
             max_open_scan_rows: cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS,
             genesis_validators_root: None,
             node_key_path: Some(node_key),
+            chain: None,
         }
     }
 
@@ -252,22 +253,20 @@ mod tests {
         assert_eq!(file_ino(&db), ino_before);
         assert!(std::fs::metadata(&db).unwrap().len() > 0);
 
-        let reopened = open(&dir, current_writer_opts(key_path)).unwrap_or_else(|e| {
-            let msg = e.to_string();
-            assert_not_refuse("storage-core::open", &msg);
-            panic!("storage-core::open failed: {msg}");
-        });
-        {
-            let rt = reopened.engine().read().unwrap();
-            let cursor = WriteCursor::from_ssz_bytes(
-                &rt.get(TABLE_META, KEY_WRITE_CURSOR.as_bytes())
-                    .unwrap()
-                    .expect("write_cursor after storage-core::open"),
-            )
-            .unwrap();
-            assert_eq!(cursor.seq, CURSOR_SEQ);
-        }
-        drop(reopened);
+        // The rollback binary opened above. This binary must not: the store holds
+        // a block and has no side keys, so legacy `config_digest` equality is not
+        // an open. No GVR was configured, and that is not `Root::ZERO`.
+        let err = open(&dir, current_writer_opts(key_path))
+            .expect_err("populated store must not open on the legacy constant");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("genesis_validators_root") && msg.contains("not Root::ZERO"),
+            "absent GVR on a store that holds a block must refuse: {msg}"
+        );
+        assert!(
+            !msg.contains("config digest mismatch"),
+            "refusal must not be a mismatch against a substituted root: {msg}"
+        );
 
         assert_eq!(file_ino(&db), ino_before, "same inode after both opens");
         eprintln!(

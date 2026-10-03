@@ -182,6 +182,7 @@ impl ReplayDriver {
         writer: WriterHandle,
         metrics: StorageMetrics,
         cfg: ReplayConfig,
+        chain_config: ChainConfig,
     ) -> Self {
         // Seed last-snapshot epoch from the ring if present.
         let (has, last_epoch) = match engine.read() {
@@ -205,7 +206,7 @@ impl ReplayDriver {
             writer,
             metrics,
             cfg,
-            chain_config: Arc::new(load_chain_config()),
+            chain_config: Arc::new(chain_config),
             last_snapshot_epoch: AtomicU64::new(last_epoch),
             has_last_snapshot: AtomicBool::new(has),
             snapshots_written: AtomicU64::new(0),
@@ -582,26 +583,6 @@ fn decode_signed_block(ssz: &[u8]) -> Result<SignedBeaconBlock<Mainnet>, ReplayE
         .map_err(|e| ReplayError::Ssz(format!("SignedBeaconBlock decode failed: {e:?}")))
 }
 
-/// Load chain config for ST (bundled Hoodi fixture, same as storage open path).
-fn load_chain_config() -> ChainConfig {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/types/tests/fixtures/hoodi-config.yaml");
-    if fixture.is_file()
-        && let Ok(cfg) = ChainConfig::from_yaml_file(&fixture)
-    {
-        return cfg;
-    }
-    match ChainConfig::from_yaml_str(include_str!(
-        "../../../crates/types/tests/fixtures/hoodi-config.yaml"
-    )) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            tracing::error!(error = %e, "bundled hoodi-config.yaml failed to parse");
-            std::process::exit(1);
-        }
-    }
-}
-
 fn resolve_expected_root(engine: &Engine, slot: Slot, fallback: Root) -> Result<Root, ReplayError> {
     let rt = engine.read().map_err(ReplayError::Store)?;
     if let Some(sr) = get_state_root(&rt, slot).map_err(ReplayError::Store)? {
@@ -921,8 +902,15 @@ mod tests {
             state_root: Root::ZERO,
             block_root: Root::ZERO,
         }));
+        let mut chain = ChainConfig::from_yaml_str(include_str!(
+            "../../../crates/types/tests/fixtures/hoodi-config.yaml"
+        ))
+        .expect("hoodi fixture for replay tests");
+        // The label is not a fork input. It proves `new` keeps the caller's chain.
+        chain.config_name = "replay-supplied".into();
         let driver = Arc::new(
-            ReplayDriver::new(engine, split, writer, metrics, cfg).with_divergence_exit(exit),
+            ReplayDriver::new(engine, split, writer, metrics, cfg, chain)
+                .with_divergence_exit(exit),
         );
         (driver, shutdown_tx)
     }
@@ -1306,6 +1294,7 @@ mod tests {
         )
         .await;
 
+        assert_eq!(driver.chain_config.config_name, "replay-supplied");
         let state0 = BeaconState::<Mainnet>::default();
         assert_eq!(state0.slot().as_u64(), 0);
         let ssz0 = state0.as_ssz_bytes();

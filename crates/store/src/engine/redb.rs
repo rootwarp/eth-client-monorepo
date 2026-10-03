@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use redb::{
-    Database, DatabaseError, ReadOnlyDatabase, ReadableDatabase, TableDefinition, TableHandle,
+    Database, DatabaseError, ReadOnlyDatabase, ReadableDatabase, ReadableTableMetadata,
+    TableDefinition, TableHandle,
 };
 
 use super::{
@@ -542,6 +543,25 @@ impl ReadTxn {
         }
     }
 
+    /// Whether `table` contains any row.
+    ///
+    /// Opens the table with `ReadTransaction::open_untyped_table`.
+    /// redb 4.1 `ReadOnlyUntypedTable::new` stores the catalog header in
+    /// `RawBtree` and does not `get_page` that table's root. `len` is
+    /// `BtreeHeader.length`. A one-row snapshot leaf is not loaded. The name
+    /// lookup can still read table-catalog pages. A missing table is
+    /// `Ok(false)`. Any other error is `Err` — a read failure is not an empty
+    /// store.
+    pub fn has_any(&self, table: &str) -> Result<bool, StoreError> {
+        let t = match self.txn.open_untyped_table(table_def(table)?) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(StoreError::engine(e)),
+        };
+        let n = t.len().map_err(StoreError::engine)?;
+        Ok(n > 0)
+    }
+
     /// Half-open range `[lo, hi)`. Yields owned key/value pairs.
     ///
     /// Materialisation is capped at [`MAX_RANGE_ENTRIES`] / [`MAX_RANGE_BYTES`]
@@ -634,6 +654,42 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cc-store-{label}-{nanos}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn has_any_uses_untyped_open_and_reports_rows() {
+        // The small value does not prove a snapshot page was skipped. The
+        // source assertion pins the untyped constructor; redb 4.1
+        // `RawBtree::new` does not `get_page`.
+        let src = include_str!("redb.rs");
+        let start = src.find("pub fn has_any").expect("has_any");
+        let rest = &src[start..];
+        let end = rest.find("\n    /// Half-open range").expect("next method");
+        let body = &rest[..end];
+        assert!(
+            body.contains("open_untyped_table"),
+            "has_any must use the untyped open: {body}"
+        );
+        assert!(
+            !body.contains("open_table("),
+            "typed open_table loads the btree root: {body}"
+        );
+        assert!(
+            body.contains("TableDoesNotExist"),
+            "a missing table is empty, not an error: {body}"
+        );
+
+        let dir = tmp_dir("has-any");
+        let eng = Engine::open(&dir, EngineOptions::default()).unwrap();
+        assert!(
+            !eng.read().unwrap().has_any("snapshots").unwrap(),
+            "missing table is empty"
+        );
+        let mut b = eng.batch();
+        b.put("snapshots", b"k", b"v");
+        eng.commit(b).unwrap();
+        assert!(eng.read().unwrap().has_any("snapshots").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

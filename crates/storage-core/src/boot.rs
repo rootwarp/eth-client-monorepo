@@ -406,11 +406,13 @@ impl StorageConfig {
     }
 }
 
-/// Open the store under `data_dir` with durability + digest from config.
+/// Open the store under `data_dir` with durability + the configured network.
 ///
 /// When [`StorageConfig::node_key_path`] is set and present, loads the expected
 /// NodeId surface for **I-node-id** (§1.7) so a mismatched key refuses open.
-fn open_store(cfg: &StorageConfig) -> anyhow::Result<Store> {
+///
+/// `chain` is the digest input. There is no fixture fallback.
+fn open_store(cfg: &StorageConfig, chain: &ChainConfig) -> anyhow::Result<Store> {
     Ok(crate::open(
         &cfg.data_dir,
         crate::OpenOpts {
@@ -420,9 +422,29 @@ fn open_store(cfg: &StorageConfig) -> anyhow::Result<Store> {
             max_open_scan_rows: cfg.max_open_scan_rows,
             genesis_validators_root: cfg.genesis_validators_root.clone(),
             node_key_path: cfg.node_key_path.clone(),
+            chain: Some(chain.clone()),
         },
     )?
     .into_store())
+}
+
+/// Load the network the digest and the retention floor both require.
+///
+/// A missing path is a startup error. The Hoodi source tree is not a substitute.
+fn load_configured_chain(cfg: &StorageConfig) -> anyhow::Result<ChainConfig> {
+    let path = cfg.network_config.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "storage.network_config is required for the config digest \
+             (a missing network is not replaced with a source-tree fixture)"
+        )
+    })?;
+    ChainConfig::from_yaml_file(path).map_err(|e| {
+        anyhow::anyhow!(
+            "storage.network_config {}: {e} \
+             (digest input must be the configured network)",
+            path.display()
+        )
+    })
 }
 
 /// Fire the process shutdown watch from bootstrap's SIGTERM/SIGINT pre-drain hook.
@@ -433,38 +455,6 @@ fn pre_drain_fire_shutdown(shutdown_tx: watch::Sender<bool>) -> cc_bootstrap::Pr
             let _ = shutdown_tx.send(true);
         })
     })
-}
-
-/// Minimal chain config for the config-digest input when no network YAML is set.
-trait MainnetLikeDigest {
-    fn mainnet_like_for_digest() -> Self;
-}
-
-impl MainnetLikeDigest for ChainConfig {
-    fn mainnet_like_for_digest() -> Self {
-        // Prefer loading the committed Hoodi fixture when present; fall back to
-        // a compile-time skeleton so unit tests / bare binaries still open.
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/types/tests/fixtures/hoodi-config.yaml");
-        if fixture.is_file()
-            && let Ok(cfg) = ChainConfig::from_yaml_file(&fixture)
-        {
-            return cfg;
-        }
-        // Last-resort skeleton (digest is still well-defined).
-        match ChainConfig::from_yaml_str(include_str!(
-            "../../../crates/types/tests/fixtures/hoodi-config.yaml"
-        )) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                // Bundle is compile-time; a parse failure is a shipping bug.
-                tracing::error!(error = %e, "bundled hoodi-config.yaml failed to parse");
-                // Return a zeroed-epoch skeleton via re-parse of empty is impossible;
-                // panic is process-fatal at startup before bind (same as open fail).
-                std::process::exit(1);
-            }
-        }
-    }
 }
 
 /// Fail-before-bind storage host: config, open, resume, writer, serve.
@@ -502,8 +492,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut _pruner_keep: Option<Arc<Pruner>> = None;
 
     if cfg.enable_write_path {
+        let chain = load_configured_chain(&cfg)?;
         let open_t0 = std::time::Instant::now();
-        match open_store(&cfg) {
+        match open_store(&cfg, &chain) {
             Ok(store) => {
                 let engine = Arc::new(store.into_engine());
                 // CC-45b: populate open phase of restart_seconds.
@@ -526,7 +517,6 @@ pub async fn run() -> anyhow::Result<()> {
                     da_status_roots: Vec::new(),
                 };
                 // Resume drops the plan; fork tags never leave this process.
-                let chain = ChainConfig::mainnet_like_for_digest();
                 match resume::run_resume_sequence(
                     &engine,
                     &storage_metrics,
@@ -583,11 +573,11 @@ pub async fn run() -> anyhow::Result<()> {
                     writer.clone(),
                     storage_metrics.clone(),
                     cfg.replay_config(),
+                    chain.clone(),
                 ));
                 let _replay_join = spawn_replay_task(Arc::clone(&replayer), shutdown_rx.clone());
                 // CC-46a: five prune passes (wall-clock epoch ticks; P2 chunks).
-                let chain_for_prune = ChainConfig::mainnet_like_for_digest();
-                let prune_cfg = cfg.prune_config(&chain_for_prune)?;
+                let prune_cfg = cfg.prune_config(&chain)?;
                 tracing::info!(
                     genesis_time = prune_cfg.genesis_time,
                     blocks_retention_epochs = prune_cfg.blocks_retention_epochs,
@@ -709,6 +699,13 @@ mod config_tests {
     fn hoodi_network_config() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../crates/types/tests/fixtures/hoodi-config.yaml")
+    }
+
+    /// Chain for prune tests. Not a digest input — production loads
+    /// [`load_configured_chain`].
+    fn hoodi_chain() -> ChainConfig {
+        ChainConfig::from_yaml_file(hoodi_network_config())
+            .unwrap_or_else(|e| panic!("hoodi yaml: {e}"))
     }
 
     fn load_storage_toml() -> StorageConfig {
@@ -937,7 +934,7 @@ mod config_tests {
             std::env::remove_var("CC_STORAGE_NETWORK_CONFIG");
         }
         let cfg = load_storage_toml_for_prune();
-        let chain = ChainConfig::mainnet_like_for_digest();
+        let chain = hoodi_chain();
         let prune = cfg.prune_config(&chain).expect("prune_config");
         assert!(
             prune.genesis_time > 0,
@@ -968,7 +965,7 @@ mod config_tests {
         );
 
         let cfg = load_storage_toml_for_prune();
-        let chain = ChainConfig::mainnet_like_for_digest();
+        let chain = hoodi_chain();
         let prune = cfg.prune_config(&chain).expect("prune_config");
         assert_eq!(
             prune.blocks_retention_epochs, 33_024,
@@ -990,7 +987,7 @@ mod config_tests {
         let mut cfg = load_storage_toml();
         cfg.network_config = None;
         cfg.retention_override = None;
-        let chain = ChainConfig::mainnet_like_for_digest();
+        let chain = hoodi_chain();
         let err = cfg
             .prune_config(&chain)
             .expect_err("missing network_config must refuse to start");
@@ -1013,7 +1010,7 @@ mod config_tests {
             "/no/such/cc-storage-network-config-p1a5.yaml",
         ));
         cfg.retention_override = None;
-        let chain = ChainConfig::mainnet_like_for_digest();
+        let chain = hoodi_chain();
         let err = cfg
             .prune_config(&chain)
             .expect_err("unreadable network_config must refuse to start");
@@ -1051,7 +1048,7 @@ mod config_tests {
         let mut cfg = load_storage_toml();
         cfg.network_config = Some(yaml);
         cfg.retention_override = None;
-        let chain = ChainConfig::mainnet_like_for_digest();
+        let chain = hoodi_chain();
         let err = cfg
             .prune_config(&chain)
             .expect_err("vestigial mismatch must refuse to start");
@@ -1089,7 +1086,7 @@ mod config_tests {
         let mut cfg = load_storage_toml();
         cfg.network_config = Some(yaml);
         cfg.retention_override = None;
-        let chain = ChainConfig::mainnet_like_for_digest();
+        let chain = hoodi_chain();
         let err = cfg
             .prune_config(&chain)
             .expect_err("0 floor must refuse to start");
@@ -1114,7 +1111,7 @@ mod config_tests {
             columns_epochs: 64,
             blocks_epochs: 256,
         });
-        let chain = ChainConfig::mainnet_like_for_digest();
+        let chain = hoodi_chain();
         let prune = cfg
             .prune_config(&chain)
             .expect("retention_override must not require network_config");
@@ -1203,7 +1200,8 @@ mod config_tests {
         cfg.durability = "immediate".into();
         // open_store uses Durability::parse which rejects none; use immediate for the
         // production path (engine still opens an existing db).
-        let err = open_store(&cfg).expect_err("mismatched node key must refuse open");
+        let err =
+            open_store(&cfg, &hoodi_chain()).expect_err("mismatched node key must refuse open");
         let msg = err.to_string();
         assert!(
             msg.contains("node_id") || msg.contains("I-node-id") || msg.contains("invariant"),
@@ -1297,7 +1295,8 @@ mod config_tests {
         cfg.node_key_path = Some(key_path);
         cfg.check_invariants = false;
         cfg.durability = "immediate".into();
-        let err = open_store(&cfg).expect_err("missing key with identity must refuse");
+        let err =
+            open_store(&cfg, &hoodi_chain()).expect_err("missing key with identity must refuse");
         let msg = err.to_string();
         assert!(
             msg.contains("I-node-id") && msg.contains("identity"),
@@ -1339,8 +1338,46 @@ mod config_tests {
         cfg.node_key_path = Some(key_path);
         cfg.check_invariants = false;
         cfg.durability = "immediate".into();
-        open_store(&cfg).expect("first boot with missing key must still open");
+        open_store(&cfg, &hoodi_chain()).expect("first boot with missing key must still open");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The digest input is the configured network, and a missing path is fatal.
+    #[test]
+    fn digest_input_requires_configured_network() {
+        let _g = env_lock();
+        unsafe {
+            std::env::remove_var("CC_STORAGE_NETWORK_CONFIG");
+        }
+        let mut missing = load_storage_toml();
+        missing.network_config = None;
+        let err = load_configured_chain(&missing).expect_err("network_config is required");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("network_config") && msg.contains("fixture"),
+            "missing network must not fall back to a fixture: {msg}"
+        );
+
+        let mut cfg = load_storage_toml_for_prune();
+        let hoodi = load_configured_chain(&cfg).expect("hoodi network");
+        assert_eq!(hoodi.config_name, "hoodi");
+        cfg.network_config = Some(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../crates/types/tests/fixtures/mainnet-config.yaml"),
+        );
+        let mainnet = load_configured_chain(&cfg).expect("mainnet network");
+        assert_eq!(mainnet.config_name, "mainnet");
+        let gvr = cc_types::Root::from_array([0x11; 32]);
+        assert_ne!(
+            cc_store::compute_identity_digest(&hoodi, gvr),
+            cc_store::compute_identity_digest(&mainnet, gvr),
+            "configured networks must not share an identity digest"
+        );
+        assert_ne!(
+            cc_store::compute_schedule_digest(&hoodi).unwrap(),
+            cc_store::compute_schedule_digest(&mainnet).unwrap(),
+            "configured networks must not share a schedule digest"
+        );
     }
 }

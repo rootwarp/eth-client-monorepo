@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cc_store::engine::{Durability, Engine, EngineOptions};
-use cc_store::{ConfigDigestInput, Store, StoreOpenOptions};
+use cc_store::{
+    Store, StoreOpenOptions, compute_identity_digest, compute_schedule_digest,
+    legacy_config_digest, refuse_populated_legacy_open,
+};
 use cc_types::{ChainConfig, Root};
 use tokio::sync::watch;
 
@@ -34,10 +37,18 @@ pub struct OpenOpts {
     pub snapshot_ring: u64,
     /// Per-check row cap at open (`storage.max_open_scan_rows`).
     pub max_open_scan_rows: u64,
-    /// Network identity for the config digest (`0x` + 64 hex).
+    /// Network identity for the running digest (`0x` + 64 hex).
+    ///
+    /// Absent is not [`Root::ZERO`]. A populated store without this value is refused.
     pub genesis_validators_root: Option<String>,
     /// Path to the 32-byte p2p node key (`I-node-id`).
     pub node_key_path: Option<PathBuf>,
+    /// Running network for the identity and schedule digests.
+    ///
+    /// `None` is not a fixture fallback. The caller has not supplied a network
+    /// (beacon-core threads its loaded network separately). `meta.config_digest`
+    /// stays [`legacy_config_digest`] either way.
+    pub chain: Option<ChainConfig>,
 }
 
 impl fmt::Debug for OpenOpts {
@@ -49,6 +60,10 @@ impl fmt::Debug for OpenOpts {
             .field("max_open_scan_rows", &self.max_open_scan_rows)
             .field("genesis_validators_root", &self.genesis_validators_root)
             .field("node_key_path", &self.node_key_path)
+            .field(
+                "chain",
+                &self.chain.as_ref().map(|chain| chain.config_name.as_str()),
+            )
             .finish()
     }
 }
@@ -62,6 +77,7 @@ impl Default for OpenOpts {
             max_open_scan_rows: cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS,
             genesis_validators_root: None,
             node_key_path: None,
+            chain: None,
         }
     }
 }
@@ -75,6 +91,10 @@ pub struct OpenedStore {
     snapshot_ring: u64,
     max_open_scan_rows: u64,
     expected_node_id: Option<Root>,
+    /// Identity digest of [`OpenOpts::chain`], when both the network and a GVR were supplied.
+    identity_digest: Option<Root>,
+    /// Schedule digest of [`OpenOpts::chain`], when a network was supplied.
+    schedule_digest: Option<Root>,
 }
 
 impl fmt::Debug for OpenedStore {
@@ -88,6 +108,8 @@ impl fmt::Debug for OpenedStore {
                 "expected_node_id",
                 &self.expected_node_id.as_ref().map(|_| "<redacted>"),
             )
+            .field("identity_digest", &self.identity_digest)
+            .field("schedule_digest", &self.schedule_digest)
             .finish()
     }
 }
@@ -244,9 +266,8 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
     let data_dir = data_dir.as_ref();
     let durability =
         Durability::parse(&opts.durability).map_err(|e| anyhow::anyhow!("durability: {e}"))?;
+    // Absent GVR stays absent. Root::ZERO is the legacy constant's input, not a substitute.
     let gvr = parse_gvr(opts.genesis_validators_root.as_deref())?;
-    let chain = digest_chain_config();
-    let digest_input = ConfigDigestInput::with_mainnet_scalars(chain, gvr);
     let expected_node_id = load_expected_node_id_from_key_path(opts.node_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?;
     if expected_node_id.is_some() {
@@ -255,10 +276,12 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
             "I-node-id node key loaded from node_key_path"
         );
     }
-    let store_opts = StoreOpenOptions::from_config(
+    // The on-disk legacy key stays the constant so a pre-fold binary still opens.
+    // The running network is digested separately and is not written under that key.
+    let store_opts = StoreOpenOptions::with_digest(
         EngineOptions::default().with_durability(durability),
-        &digest_input,
-    )?
+        legacy_config_digest(),
+    )
     .with_check_invariants(opts.check_invariants)
     .with_snapshot_ring(opts.snapshot_ring.max(1))
     .with_max_open_scan_rows(opts.max_open_scan_rows.max(1))
@@ -267,12 +290,39 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
         Store::open(data_dir, store_opts).map_err(|e| anyhow::anyhow!("store open: {e}"))?;
     refuse_missing_key_if_anchor_present(store.engine(), opts.node_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    refuse_populated_legacy_open(store.engine(), gvr.is_some())
+        .map_err(|e| anyhow::anyhow!("store open: {e}"))?;
+    let (identity_digest, schedule_digest) = match &opts.chain {
+        Some(chain) => {
+            let schedule = compute_schedule_digest(chain)
+                .map_err(|e| anyhow::anyhow!("schedule digest: {e}"))?;
+            let identity = gvr.map(|gvr| compute_identity_digest(chain, gvr));
+            if let Some(identity) = identity {
+                tracing::debug!(
+                    identity = %identity,
+                    schedule = %schedule,
+                    config_name = %chain.config_name,
+                    "running config digests (side-key comparison is later)"
+                );
+            } else {
+                tracing::debug!(
+                    schedule = %schedule,
+                    config_name = %chain.config_name,
+                    "schedule digest from the running config; identity skipped without a GVR"
+                );
+            }
+            (identity, Some(schedule))
+        }
+        None => (None, None),
+    };
     Ok(OpenedStore {
         store,
         node_key_path: opts.node_key_path,
         snapshot_ring: opts.snapshot_ring.max(1),
         max_open_scan_rows: opts.max_open_scan_rows.max(1),
         expected_node_id,
+        identity_digest,
+        schedule_digest,
     })
 }
 
@@ -354,9 +404,9 @@ fn map_resume(e: ResumeError) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
-fn parse_gvr(s: Option<&str>) -> anyhow::Result<Root> {
+fn parse_gvr(s: Option<&str>) -> anyhow::Result<Option<Root>> {
     let Some(raw) = s.filter(|s| !s.is_empty()) else {
-        return Ok(Root::ZERO);
+        return Ok(None);
     };
     let hex = raw.strip_prefix("0x").unwrap_or(raw);
     if hex.len() != 64 {
@@ -370,26 +420,7 @@ fn parse_gvr(s: Option<&str>) -> anyhow::Result<Root> {
         arr[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
             .map_err(|e| anyhow::anyhow!("genesis_validators_root hex: {e}"))?;
     }
-    Ok(Root::from_array(arr))
-}
-
-fn digest_chain_config() -> ChainConfig {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/types/tests/fixtures/hoodi-config.yaml");
-    if fixture.is_file()
-        && let Ok(cfg) = ChainConfig::from_yaml_file(&fixture)
-    {
-        return cfg;
-    }
-    match ChainConfig::from_yaml_str(include_str!(
-        "../../../crates/types/tests/fixtures/hoodi-config.yaml"
-    )) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            tracing::error!(error = %e, "bundled hoodi-config.yaml failed to parse");
-            std::process::exit(1);
-        }
-    }
+    Ok(Some(Root::from_array(arr)))
 }
 
 #[cfg(test)]
@@ -408,6 +439,7 @@ mod tests {
             max_open_scan_rows: cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS,
             genesis_validators_root: None,
             node_key_path: node_key,
+            chain: None,
         }
     }
 
@@ -527,9 +559,27 @@ mod tests {
         }
         drop(opened);
 
-        let _reopen = open(&dir, test_opts(Some(key_a)))
-            .expect("same-key reopen of gappy canonical must succeed");
-        drop(_reopen);
+        // Host open refuses: the store holds canonical rows and no GVR.
+        // The store layer still opens, so the refusal is not I-contig.
+        let err = open(&dir, test_opts(Some(key_a.clone())))
+            .expect_err("populated store must not open on the legacy constant");
+        assert!(
+            err.to_string().contains("genesis_validators_root"),
+            "absent GVR is refused, not Root::ZERO: {err}"
+        );
+        let direct = Store::open(
+            &dir,
+            StoreOpenOptions::with_digest(
+                cc_store::engine::EngineOptions::default(),
+                legacy_config_digest(),
+            )
+            .with_check_invariants(true)
+            .with_expected_node_id(Some(id_a))
+            .with_snapshot_ring(4)
+            .with_max_open_scan_rows(cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS),
+        )
+        .expect("I-contig stays vacuous on gappy canonical");
+        drop(direct);
 
         let key_b = dir.join("node_key_b");
         std::fs::write(&key_b, [0xBBu8; 32]).unwrap();
@@ -567,9 +617,25 @@ mod tests {
         }
         drop(opened);
 
-        let _reopen = open(&dir, test_opts(Some(key_a)))
-            .expect("same-key restart must succeed without planted slot 0");
-        drop(_reopen);
+        let err = open(&dir, test_opts(Some(key_a.clone())))
+            .expect_err("populated store must not open on the legacy constant");
+        assert!(
+            err.to_string().contains("genesis_validators_root"),
+            "absent GVR is refused, not a planted slot 0: {err}"
+        );
+        let direct = Store::open(
+            &dir,
+            StoreOpenOptions::with_digest(
+                cc_store::engine::EngineOptions::default(),
+                legacy_config_digest(),
+            )
+            .with_check_invariants(true)
+            .with_expected_node_id(Some(id_a))
+            .with_snapshot_ring(4)
+            .with_max_open_scan_rows(cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS),
+        )
+        .expect("restart at the store layer must not plant slot 0 / fail I-contig");
+        drop(direct);
 
         let key_b = dir.join("node_key_b");
         std::fs::write(&key_b, [0xBBu8; 32]).unwrap();
@@ -773,11 +839,10 @@ mod tests {
             "OpenOpts Debug leaked key bytes: {opts_dbg}"
         );
 
-        let store_opts = StoreOpenOptions::from_config(
+        let store_opts = StoreOpenOptions::with_digest(
             cc_store::engine::EngineOptions::default(),
-            &cc_store::ConfigDigestInput::with_mainnet_scalars(digest_chain_config(), Root::ZERO),
+            legacy_config_digest(),
         )
-        .unwrap()
         .with_expected_node_id(Some(root));
         let store_dbg = format!("{store_opts:?}");
         assert!(
@@ -786,5 +851,123 @@ mod tests {
         );
 
         drop(opened);
+    }
+
+    fn fixture_chain(name: &str) -> ChainConfig {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/types/tests/fixtures")
+            .join(name);
+        ChainConfig::from_yaml_file(&path).expect("fixture chain yaml")
+    }
+
+    fn gvr_hex(byte: u8) -> String {
+        format!("0x{}", hex_byte(byte).repeat(32))
+    }
+
+    fn hex_byte(byte: u8) -> String {
+        format!("{byte:02x}")
+    }
+
+    fn stored_config_digest(opened: &OpenedStore) -> Root {
+        use cc_store::SszDecode;
+        use cc_store::meta::{ConfigDigest, KEY_CONFIG_DIGEST, TABLE_META};
+        let rt = opened.engine().read().unwrap();
+        let bytes = rt
+            .get(TABLE_META, KEY_CONFIG_DIGEST.as_bytes())
+            .unwrap()
+            .unwrap();
+        ConfigDigest::from_ssz_bytes(&bytes).unwrap().digest
+    }
+
+    #[test]
+    fn open_digests_the_supplied_network_and_keeps_the_legacy_key() {
+        let gvr = gvr_hex(0x11);
+        let hoodi_dir = unique_temp_dir("digest-hoodi");
+        let mainnet_dir = unique_temp_dir("digest-mainnet");
+        std::fs::create_dir_all(&hoodi_dir).unwrap();
+        std::fs::create_dir_all(&mainnet_dir).unwrap();
+
+        let mut hoodi_opts = test_opts(None);
+        hoodi_opts.chain = Some(fixture_chain("hoodi-config.yaml"));
+        hoodi_opts.genesis_validators_root = Some(gvr.clone());
+        let mut mainnet_opts = test_opts(None);
+        mainnet_opts.chain = Some(fixture_chain("mainnet-config.yaml"));
+        mainnet_opts.genesis_validators_root = Some(gvr);
+
+        let hoodi = open(&hoodi_dir, hoodi_opts).expect("empty hoodi open");
+        let mainnet = open(&mainnet_dir, mainnet_opts).expect("empty mainnet open");
+        assert_ne!(
+            hoodi.identity_digest, mainnet.identity_digest,
+            "two networks must not share an identity digest"
+        );
+        assert_ne!(
+            hoodi.schedule_digest, mainnet.schedule_digest,
+            "two networks must not share a schedule digest"
+        );
+        assert!(hoodi.identity_digest.is_some() && mainnet.identity_digest.is_some());
+        let legacy = legacy_config_digest();
+        assert_eq!(stored_config_digest(&hoodi), legacy);
+        assert_eq!(stored_config_digest(&mainnet), legacy);
+        assert_ne!(hoodi.identity_digest, Some(legacy));
+        drop(hoodi);
+        drop(mainnet);
+        let _ = std::fs::remove_dir_all(&hoodi_dir);
+        let _ = std::fs::remove_dir_all(&mainnet_dir);
+    }
+
+    #[test]
+    fn populated_store_without_gvr_is_refused() {
+        let dir = unique_temp_dir("populated-no-gvr");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opts = test_opts(None);
+        opts.check_invariants = false;
+        let opened = open(&dir, opts.clone()).expect("empty open");
+        {
+            use cc_store::Slot;
+            use cc_store::canonical::put_canonical;
+            let engine = opened.engine();
+            let rt = engine.read().unwrap();
+            let mut batch = engine.batch();
+            put_canonical(&rt, &mut batch, Slot::new(1), &Root::from_array([9; 32])).unwrap();
+            engine.commit(batch).unwrap();
+        }
+        drop(opened);
+
+        let err = open(&dir, opts).expect_err("populated store without GVR must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("genesis_validators_root") && msg.contains("not Root::ZERO"),
+            "must refuse instead of substituting Root::ZERO: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn populated_store_with_gvr_is_not_opened_on_the_legacy_constant() {
+        let dir = unique_temp_dir("populated-with-gvr");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opts = test_opts(None);
+        opts.check_invariants = false;
+        opts.chain = Some(fixture_chain("hoodi-config.yaml"));
+        opts.genesis_validators_root = Some(gvr_hex(0xab));
+        let opened = open(&dir, opts.clone()).expect("empty open");
+        {
+            use cc_store::Slot;
+            use cc_store::canonical::put_canonical;
+            let engine = opened.engine();
+            let rt = engine.read().unwrap();
+            let mut batch = engine.batch();
+            put_canonical(&rt, &mut batch, Slot::new(4), &Root::from_array([3; 32])).unwrap();
+            engine.commit(batch).unwrap();
+        }
+        drop(opened);
+
+        let err = open(&dir, opts).expect_err("populated store must not open on the constant");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("populated store refused"),
+            "legacy equality must not be the success path: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
