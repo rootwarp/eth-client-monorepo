@@ -2,18 +2,20 @@
 //!
 //! ```text
 //! open redb  →  durable_set  →  seed_from_durable | checkpoint_sync
-//!            →  start_writer + chain-core
+//!            →  start_writer + chain-core  →  serve
 //! ```
 //!
-//! No 30 s restore grace — that was a two-process synchronisation device.
+//! [`boot`] runs that sequence and returns. [`run`] is the only env-config
+//! load, then [`BootedNode::serve`]. No 30 s restore grace — that was a
+//! two-process synchronisation device.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cc_bootstrap::{
-    LocalReadyHandle, PeerSpec, ServeOptions, ServiceSpec, SignalTrigger, TelemetrySettings,
-    serve_with_options,
+    Bootstrap, LocalReadyHandle, PeerSpec, ServeOptions, ServiceSpec, SignalTrigger,
+    TelemetrySettings, serve_with_options,
 };
 use cc_chain::checkpoint_sync::{
     CheckpointBootstrapConfig, bootstrap_core_from_providers_with_epoch, parse_optional_root,
@@ -115,7 +117,7 @@ pub struct Booted {
 
 /// Open redb, then start storage-core's writer. No gRPC. No 30 s grace.
 ///
-/// Chain seed/checkpoint is a separate step in [`run`] so tests can assert
+/// Chain seed/checkpoint is a separate step in [`boot`] so tests can assert
 /// that **no** subsystem starts before [`open`] returns.
 ///
 /// S2-A-13: proto-free twin lives in crates/beacon-inproc (one TempDir, one
@@ -150,42 +152,63 @@ pub fn boot_in_process(
     })
 }
 
+/// Process configuration for [`boot`] (`config/beacon-core.toml`, `CC_BEACON_CORE_*`).
+///
+/// [`run`] is the only place this is loaded from the environment. Callers — and
+/// tests — pass an already-built value so [`boot`] does not read the process env.
 #[derive(Debug, Deserialize)]
-struct BeaconCoreConfig {
+pub struct BeaconCoreConfig {
+    /// Shared bind, peer, and telemetry settings.
     #[serde(flatten)]
-    service: ServiceConfig,
+    pub service: ServiceConfig,
+    /// On-disk store directory.
     #[serde(default = "default_data_dir")]
-    data_dir: PathBuf,
+    pub data_dir: PathBuf,
+    /// Durability token (`immediate` | `paranoid`).
     #[serde(default = "default_durability")]
-    durability: String,
+    pub durability: String,
+    /// Run store invariants at open (includes `I-node-id`).
     #[serde(default = "default_check_invariants")]
-    check_invariants: bool,
+    pub check_invariants: bool,
+    /// Snapshot ring depth.
     #[serde(default = "default_snapshot_ring")]
-    snapshot_ring: u64,
+    pub snapshot_ring: u64,
+    /// Optional GVR for the config digest.
     #[serde(default)]
-    genesis_validators_root: Option<String>,
+    pub genesis_validators_root: Option<String>,
+    /// Node key path for `I-node-id`.
     #[serde(default = "default_node_key_path")]
-    node_key_path: PathBuf,
+    pub node_key_path: PathBuf,
+    /// Chain-core resident state cap.
     #[serde(default = "default_max_resident_states")]
-    max_resident_states: usize,
+    pub max_resident_states: usize,
+    /// Chain-core body ring capacity.
     #[serde(default = "default_body_ring_capacity")]
-    body_ring_capacity: usize,
+    pub body_ring_capacity: usize,
+    /// Event ring event cap.
     #[serde(default = "default_event_ring_events")]
-    event_ring_events: usize,
+    pub event_ring_events: usize,
+    /// Event ring byte cap.
     #[serde(default = "default_event_ring_bytes")]
-    event_ring_bytes: usize,
+    pub event_ring_bytes: usize,
+    /// Per-subscriber event queue.
     #[serde(default = "default_subscriber_queue_capacity")]
-    subscriber_queue_capacity: usize,
+    pub subscriber_queue_capacity: usize,
+    /// Checkpoint sync URLs. Empty leaves the core absent on an empty store.
     #[serde(default)]
-    checkpoint_providers: Vec<String>,
+    pub checkpoint_providers: Vec<String>,
+    /// Optional expected checkpoint root.
     #[serde(default)]
-    checkpoint_root: Option<String>,
+    pub checkpoint_root: Option<String>,
+    /// Chain config YAML. Absent uses bundled Hoodi when providers are empty.
     #[serde(default)]
-    network_config: Option<String>,
+    pub network_config: Option<String>,
+    /// Engine API transport (flattened beside the service fields).
     #[serde(flatten)]
-    engine: cc_engine_api::config::EngineTransportConfig,
+    pub engine: cc_engine_api::config::EngineTransportConfig,
+    /// `MAXIMUM_GOSSIP_CLOCK_DISPARITY` in milliseconds.
     #[serde(default = "default_maximum_gossip_clock_disparity_ms")]
-    maximum_gossip_clock_disparity_ms: u64,
+    pub maximum_gossip_clock_disparity_ms: u64,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -399,9 +422,46 @@ impl CoreJoinOwner {
     }
 }
 
-/// Production host: JWT abort-before-bind, open redb, then start subsystems.
+/// Production sequence stopped before the listen loop.
+///
+/// [`BootedNode::serve`] binds. Holding this is what lets a test enter [`boot`]
+/// and return. `core` keeps an empty-store engine alive until serve returns —
+/// that local used to drop only after `serve_with_options`.
+#[allow(missing_debug_implementations)]
+pub struct BootedNode {
+    bootstrap: Bootstrap,
+    spec: ServiceSpec,
+    routes: Routes,
+    options: ServeOptions,
+    core: Option<CoreConfig>,
+    storage: StorageRuntime,
+}
+
+impl BootedNode {
+    /// Bind gRPC and metrics and block until SIGTERM/SIGINT.
+    pub async fn serve(self) -> anyhow::Result<()> {
+        let Self {
+            bootstrap,
+            spec,
+            routes,
+            options,
+            core: _core,
+            storage: _storage,
+        } = self;
+        serve_with_options(bootstrap, spec, routes, options, SignalTrigger::UnixSignals).await?;
+        Ok(())
+    }
+}
+
+/// Load env config and run the production sequence. The only env-config load.
 pub async fn run() -> anyhow::Result<()> {
-    let cfg = cc_config::load::<BeaconCoreConfig>(SERVICE)?;
+    boot(cc_config::load(SERVICE)?).await?.serve().await
+}
+
+/// Production sequence: JWT abort-before-bind, open redb, then start subsystems.
+///
+/// Does not read the process environment and does not listen.
+pub async fn boot(cfg: BeaconCoreConfig) -> anyhow::Result<BootedNode> {
     let network = load_network(&cfg)?;
     let prepared =
         cc_engine_api::EngineApi::prepare_with_chain_config(&cfg.engine, network.clone())
@@ -464,7 +524,7 @@ pub async fn run() -> anyhow::Result<()> {
     );
     let core_owner: Arc<Mutex<CoreJoinOwner>> = Arc::new(Mutex::new(CoreJoinOwner::default()));
 
-    match durable {
+    let core = match durable {
         Some(d) => {
             let applied = seed_from_durable::<Mainnet>(
                 map_durable(d),
@@ -487,6 +547,7 @@ pub async fn run() -> anyhow::Result<()> {
                 core_cfg.clone(),
             );
             install_core(&svc, &core_owner, install)?;
+            Some(core_cfg)
         }
         None if !cfg.checkpoint_providers.is_empty() => {
             let expected = parse_optional_root(cfg.checkpoint_root.as_deref())
@@ -525,15 +586,16 @@ pub async fn run() -> anyhow::Result<()> {
                     matched_expected: true,
                 },
             )?;
+            None
         }
         None => {
             tracing::info!(
                 "empty store and no checkpoint_providers; core remains absent (NOT_BOOTSTRAPPED)"
             );
+            Some(core_cfg)
         }
-    }
+    };
 
-    let _keep_storage = storage;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let core_owner_live = Arc::clone(&core_owner);
     let metrics_live = chain_metrics.clone();
@@ -571,15 +633,15 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     let routes = Routes::default().add_service(ChainServiceServer::new(svc));
-    serve_with_options(
-        bs,
-        cfg.service_spec(),
+    let spec = cfg.service_spec();
+    Ok(BootedNode {
+        bootstrap: bs,
+        spec,
         routes,
         options,
-        SignalTrigger::UnixSignals,
-    )
-    .await?;
-    Ok(())
+        core,
+        storage,
+    })
 }
 
 fn install_core(

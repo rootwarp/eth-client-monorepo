@@ -7,4 +7,4 @@
 
 pub mod boot;
 
-pub use boot::{BootConfig, BootPhase, Booted, boot_in_process, run};
+pub use boot::{BeaconCoreConfig, BootConfig, BootPhase, Booted, BootedNode, boot_in_process, run};
