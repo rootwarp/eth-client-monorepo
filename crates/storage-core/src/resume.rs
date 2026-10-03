@@ -26,6 +26,7 @@ use cc_store::meta::{
 };
 use cc_store::snapshots::newest_snapshot;
 use cc_store::{Root, Slot, SszDecode, TABLE_BLOCK_SLOT_BY_ROOT};
+use cc_types::{ChainConfig, Mainnet, Minimal, Preset, PresetName};
 use tracing::{error, info};
 
 use crate::durable_set::{
@@ -81,6 +82,8 @@ pub(crate) struct DurablePlan {
     pub empty: bool,
     pub state_ssz: Vec<u8>,
     pub anchor_block_ssz: Vec<u8>,
+    /// Canonical key that selected `anchor_block_ssz`. Seed checks the body against it.
+    pub anchor_block_root: [u8; 32],
     pub anchor_block_fork: u32,
     pub fork_choice_scalars_ssz: Vec<u8>,
     pub blocks: Vec<DurableBlock>,
@@ -97,6 +100,7 @@ pub(crate) fn run_resume_sequence(
     metrics: &StorageMetrics,
     durable_ctx: &DurableSetContext,
     _exit: ResumeExit,
+    chain: &ChainConfig,
 ) -> Result<ResumeOutcome, ResumeError> {
     // ── schema_check ────────────────────────────────────────────────────────
     let t0 = Instant::now();
@@ -121,7 +125,7 @@ pub(crate) fn run_resume_sequence(
 
     // ── snapshot_load ───────────────────────────────────────────────────────
     let t_snap = Instant::now();
-    let plan = build_durable_plan(engine, durable_ctx)?;
+    let plan = build_durable_plan(engine, durable_ctx, chain)?;
     observe_phase(metrics, RestartPhase::SnapshotLoad, t_snap.elapsed());
     observe_phase(metrics, RestartPhase::RestoreSend, Duration::ZERO);
     observe_phase(metrics, RestartPhase::ChainReplay, Duration::ZERO);
@@ -190,6 +194,7 @@ pub(crate) fn is_store_empty(engine: &Engine) -> Result<bool, ResumeError> {
 pub(crate) fn build_durable_plan(
     engine: &Engine,
     ctx: &DurableSetContext,
+    chain: &ChainConfig,
 ) -> Result<DurablePlan, ResumeError> {
     // Prefer newest snapshot; degrade to next-older is handled by durable_set
     // assess — here we just load what is present.
@@ -213,7 +218,7 @@ pub(crate) fn build_durable_plan(
     let anchor_info: Option<AnchorInfo> = read_meta_ssz_rt(&rt, KEY_ANCHOR_INFO)?;
 
     // Real stored anchor-block SSZ for the snapshot slot (never Default body).
-    let anchor_block_ssz =
+    let (anchor_block_root, anchor_block_ssz) =
         load_snapshot_anchor_block_ssz(&rt, snap_slot, split.as_ref(), anchor_info.as_ref())?;
 
     // Expected head from scalars (preferred) or walk.
@@ -226,15 +231,15 @@ pub(crate) fn build_durable_plan(
     // Blocks: snapshot_slot+1 .. last stored slot, including non-canonical siblings.
     let start = snap_slot.as_u64().saturating_add(1);
     let end = expected_head_slot.max(start);
-    let blocks = collect_restore_blocks(engine, Slot::new(start), Slot::new(end), ctx)?;
+    let blocks = collect_restore_blocks(engine, Slot::new(start), Slot::new(end), ctx, chain)?;
 
     let _ = (schema_version, config_digest, anchor_ssz, split_ssz, split);
     Ok(DurablePlan {
         empty: false,
         state_ssz,
         anchor_block_ssz,
-        // Fulu-only production path (fork tag for decode; 0 = Fulu in chain decoder).
-        anchor_block_fork: 0,
+        anchor_block_root: *anchor_block_root.as_array(),
+        anchor_block_fork: fork_tag(chain, snap_slot),
         fork_choice_scalars_ssz: fc_ssz,
         blocks,
         expected_head_root: *expected_head_root.as_array(),
@@ -255,14 +260,14 @@ fn load_snapshot_anchor_block_ssz(
     snap_slot: Slot,
     split: Option<&Split>,
     anchor: Option<&AnchorInfo>,
-) -> Result<Vec<u8>, ResumeError> {
+) -> Result<(Root, Vec<u8>), ResumeError> {
     // 1. Canonical root at the snapshot slot.
     if let Some(root) =
         get_canonical(rt, snap_slot).map_err(|e| ResumeError::Store(e.to_string()))?
         && let Some(ssz) =
             get_block_by_root(rt, &root).map_err(|e| ResumeError::Store(e.to_string()))?
     {
-        return Ok(ssz);
+        return Ok((root, ssz));
     }
     // 2. Split block when the split is the snapshot.
     if let Some(s) = split
@@ -271,7 +276,7 @@ fn load_snapshot_anchor_block_ssz(
         && let Some(ssz) =
             get_block_by_root(rt, &s.block_root).map_err(|e| ResumeError::Store(e.to_string()))?
     {
-        return Ok(ssz);
+        return Ok((s.block_root, ssz));
     }
     // 3. Anchor block when the snapshot is the checkpoint origin.
     if let Some(a) = anchor
@@ -280,7 +285,7 @@ fn load_snapshot_anchor_block_ssz(
         && let Some(ssz) =
             get_block_by_root(rt, &a.anchor_root).map_err(|e| ResumeError::Store(e.to_string()))?
     {
-        return Ok(ssz);
+        return Ok((a.anchor_root, ssz));
     }
     // Last resort: any known root for the snapshot slot via reverse index (hot).
     let lo = [0u8; 32];
@@ -305,7 +310,7 @@ fn load_snapshot_anchor_block_ssz(
         if let Some(ssz) =
             get_block_by_root(rt, &root).map_err(|e| ResumeError::Store(e.to_string()))?
         {
-            return Ok(ssz);
+            return Ok((root, ssz));
         }
     }
     Err(ResumeError::Store(format!(
@@ -321,6 +326,7 @@ fn collect_restore_blocks(
     start: Slot,
     end: Slot,
     _ctx: &DurableSetContext,
+    chain: &ChainConfig,
 ) -> Result<Vec<DurableBlock>, ResumeError> {
     let rt = engine
         .read()
@@ -379,13 +385,21 @@ fn collect_restore_blocks(
         };
         out.push(DurableBlock {
             ssz,
-            fork: 0, // Fulu-only production; fork tag unused under current decoder defaults
+            fork: fork_tag(chain, slot),
             root: root.as_slice().to_vec(),
             da_status: DurableDaStatus::from_store(da),
         });
-        let _ = slot;
     }
     Ok(out)
+}
+
+/// Replay fork tag: the schedule's fork at `slot`, not a fixed Fulu constant.
+fn fork_tag(chain: &ChainConfig, slot: Slot) -> u32 {
+    let slots_per_epoch = match chain.preset_base {
+        PresetName::Mainnet => Mainnet::SLOTS_PER_EPOCH,
+        PresetName::Minimal => Minimal::SLOTS_PER_EPOCH,
+    };
+    chain.fork_name_at_epoch(slot.epoch(slots_per_epoch)) as u32
 }
 
 fn load_write_cursor(engine: &Engine) -> Result<Option<WriteCursor>, ResumeError> {
@@ -471,8 +485,17 @@ mod tests {
 
     use super::*;
     use crate::metrics::StorageMetrics;
+    use cc_store::blocks::{
+        MIN_BLOCK_SSZ_LEN, PARENT_ROOT_SSZ_OFFSET, SLOT_SSZ_OFFSET, STATE_ROOT_SSZ_OFFSET,
+        put_block,
+    };
+    use cc_store::canonical::put_canonical;
     use cc_store::engine::{Durability, EngineOptions};
-    use cc_store::{ConfigDigestInput, Store, StoreOpenOptions};
+    use cc_store::keys::BlockRegion;
+    use cc_store::{
+        ConfigDigestInput, DaStatus, SszEncode, Store, StoreOpenOptions, put_da_status,
+        put_snapshot,
+    };
     use cc_types::config::{BlobParameters, BlobSchedule, ChainConfig, PresetName};
     use cc_types::primitives::{Epoch, ExecutionAddress, ForkVersion, Root};
     use prometheus_client::registry::Registry;
@@ -491,13 +514,13 @@ mod tests {
         dir
     }
 
-    fn hoodi_input() -> ConfigDigestInput {
+    fn test_chain(electra_epoch: u64, fulu_epoch: u64) -> ChainConfig {
         let blob_schedule = BlobSchedule::try_from_entries(vec![BlobParameters {
             epoch: Epoch::new(0),
             max_blobs_per_block: 9,
         }])
         .unwrap();
-        let chain = ChainConfig {
+        ChainConfig {
             preset_base: PresetName::Mainnet,
             config_name: "test".into(),
             genesis_fork_version: ForkVersion::from_array([0x00, 0x00, 0x00, 0x01]),
@@ -510,9 +533,9 @@ mod tests {
             deneb_fork_version: ForkVersion::from_array([0x04, 0x00, 0x00, 0x01]),
             deneb_fork_epoch: Epoch::new(0),
             electra_fork_version: ForkVersion::from_array([0x05, 0x00, 0x00, 0x01]),
-            electra_fork_epoch: Epoch::new(0),
+            electra_fork_epoch: Epoch::new(electra_epoch),
             fulu_fork_version: ForkVersion::from_array([0x06, 0x00, 0x00, 0x01]),
-            fulu_fork_epoch: Epoch::new(0),
+            fulu_fork_epoch: Epoch::new(fulu_epoch),
             seconds_per_slot: 12,
             blob_schedule,
             deposit_chain_id: 0,
@@ -522,8 +545,11 @@ mod tests {
             max_per_epoch_activation_exit_churn_limit: 256_000_000_000,
             shard_committee_period: Epoch::new(256),
             max_blobs_per_block_electra: 9,
-        };
-        ConfigDigestInput::with_mainnet_scalars(chain, Root::ZERO)
+        }
+    }
+
+    fn hoodi_input() -> ConfigDigestInput {
+        ConfigDigestInput::with_mainnet_scalars(test_chain(0, 0), Root::ZERO)
     }
 
     fn open_empty_store(label: &str) -> (PathBuf, Engine) {
@@ -591,5 +617,116 @@ mod tests {
         }
         // Seed already observes 0; our observations add samples — no panic.
         assert_eq!(RestartPhase::ALL.len(), 7);
+    }
+
+    fn synth_block(slot: u64) -> Vec<u8> {
+        let mut v = vec![0u8; MIN_BLOCK_SSZ_LEN];
+        v[SLOT_SSZ_OFFSET..SLOT_SSZ_OFFSET + 8].copy_from_slice(&slot.to_le_bytes());
+        v[PARENT_ROOT_SSZ_OFFSET..PARENT_ROOT_SSZ_OFFSET + 32]
+            .copy_from_slice(Root::from_array([0x11; 32]).as_slice());
+        v[STATE_ROOT_SSZ_OFFSET..STATE_ROOT_SSZ_OFFSET + 32]
+            .copy_from_slice(Root::from_array([0x22; 32]).as_slice());
+        v
+    }
+
+    /// Anchor at epoch 0 and a later block at epoch 1 must take the schedule's
+    /// fork, not a fixed tag.
+    #[test]
+    fn fork_tag_follows_chain_schedule() {
+        let (dir, engine) = open_empty_store("fork-schedule");
+        // Deneb at 0, Electra at 1, Fulu at 2. Mainnet slots/epoch = 32, so
+        // slot 32 is epoch 1 (Electra) and slot 0 is epoch 0 (Deneb).
+        let chain = test_chain(1, 2);
+        let anchor_slot = Slot::new(0);
+        let child_slot = Slot::new(32);
+        let anchor_root = Root::from_array([0xA1; 32]);
+        let child_root = Root::from_array([0xB2; 32]);
+        let anchor_ssz = synth_block(anchor_slot.as_u64());
+        let child_ssz = synth_block(child_slot.as_u64());
+
+        let rt = engine.read().unwrap();
+        let mut batch = engine.batch();
+        put_block(
+            &rt,
+            &mut batch,
+            anchor_slot,
+            &anchor_root,
+            &anchor_ssz,
+            BlockRegion::Hot,
+            false,
+        )
+        .unwrap();
+        put_canonical(&rt, &mut batch, anchor_slot, &anchor_root).unwrap();
+        put_block(
+            &rt,
+            &mut batch,
+            child_slot,
+            &child_root,
+            &child_ssz,
+            BlockRegion::Hot,
+            false,
+        )
+        .unwrap();
+        put_da_status(
+            &rt,
+            &mut batch,
+            &child_root,
+            DaStatus::Available,
+            child_slot,
+        )
+        .unwrap();
+        let fc = ForkChoiceScalars {
+            head_root: child_root,
+            head_slot: child_slot,
+            ..ForkChoiceScalars::default()
+        };
+        batch.put(TABLE_META, KEY_FC_SCALARS.as_bytes(), &fc.as_ssz_bytes());
+        drop(rt);
+        engine.commit(batch).unwrap();
+        put_snapshot(&engine, anchor_slot, b"snap", 4).unwrap();
+
+        let plan = build_durable_plan(&engine, &DurableSetContext::new(), &chain).unwrap();
+        assert_eq!(
+            plan.anchor_block_fork,
+            chain.fork_name_at_epoch(Epoch::new(0)) as u32,
+            "anchor fork must follow the schedule at the snapshot slot"
+        );
+        assert_eq!(
+            plan.blocks.len(),
+            1,
+            "child block must be in the replay set"
+        );
+        assert_eq!(
+            plan.blocks[0].fork,
+            chain.fork_name_at_epoch(Epoch::new(1)) as u32,
+            "replay block fork must follow the schedule at that block's slot"
+        );
+        assert_ne!(plan.anchor_block_fork, plan.blocks[0].fork);
+        assert_eq!(
+            plan.anchor_block_root,
+            *anchor_root.as_array(),
+            "anchor root must be the canonical key that selected the body"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fork_tag_uses_preset_slots_per_epoch() {
+        let mut minimal = test_chain(1, 2);
+        minimal.preset_base = PresetName::Minimal;
+        let mainnet = test_chain(1, 2);
+        // Slot 8 is epoch 1 on minimal (8 slots/epoch) and still epoch 0 on mainnet.
+        assert_eq!(
+            fork_tag(&minimal, Slot::new(8)),
+            minimal.fork_name_at_epoch(Epoch::new(1)) as u32
+        );
+        assert_eq!(
+            fork_tag(&mainnet, Slot::new(8)),
+            mainnet.fork_name_at_epoch(Epoch::ZERO) as u32
+        );
+        assert_ne!(
+            fork_tag(&minimal, Slot::new(8)),
+            fork_tag(&mainnet, Slot::new(8))
+        );
     }
 }

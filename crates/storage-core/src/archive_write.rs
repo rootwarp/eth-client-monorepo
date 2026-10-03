@@ -23,7 +23,6 @@ use cc_store::columns::{
 use cc_store::engine::{Engine, StoreError};
 use cc_store::meta::WriteCursor;
 use cc_store::{Root, Slot, SszEncode, TABLE_BLOCKS_HOT, TABLE_CANONICAL};
-use cc_types::{ForkName, Mainnet, Minimal, SignedBeaconBlock};
 
 use crate::writer::{
     CommitUnit, StagedBlock, StagedColumn, WriterError, WriterHandle, block_present,
@@ -257,11 +256,12 @@ impl ArchiveWrite for ArchiveWriter {
     }
 }
 
-/// Bind caller `(slot, parent_root, block_root)` to the SSZ payload (H1).
+/// Bind caller `(slot, parent_root, block_root)` to the SSZ header.
 ///
-/// Slot and parent_root are fixed-offset header peeks (same style as column
-/// parent/index). `block_root` must equal `hash_tree_root(message)` under a
-/// Fulu decode (Mainnet or Minimal). Self-parent is first-seed only.
+/// Slot and parent_root are fixed-offset peeks. `block_root` is the caller's
+/// value — storage does not decode the body to recompute it. Continuity is
+/// `block_present` on that parent (or the parent row is first in this batch).
+/// Self-parent is first-seed only.
 fn bind_ingest_block(
     engine: &Engine,
     block: IngestBlock,
@@ -281,12 +281,6 @@ fn bind_ingest_block(
         parent_root_at_offset(ssz).map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
     let claimed_parent = Root::from_array(block.parent_root);
     let claimed_root = Root::from_array(block.block_root);
-
-    if !ssz_block_root_matches(ssz, &claimed_root)? {
-        return Err(SeamError::InvalidArgument(
-            "block_root mismatch: caller != hash_tree_root of SSZ payload".into(),
-        ));
-    }
 
     let genesis_remap = ssz_parent == Root::ZERO && claimed_parent == claimed_root;
     if ssz_parent != claimed_parent && !genesis_remap {
@@ -324,32 +318,6 @@ fn bind_ingest_block(
         }],
         columns: Vec::new(),
     }))
-}
-
-fn ssz_block_root_matches(ssz: &[u8], claimed: &Root) -> Result<bool, SeamError> {
-    let mut decoded = false;
-    for computed in [
-        SignedBeaconBlock::<Mainnet>::from_ssz_bytes_with(ForkName::Fulu, ssz)
-            .ok()
-            .map(|b| Root::from_hash256(b.canonical_root())),
-        SignedBeaconBlock::<Minimal>::from_ssz_bytes_with(ForkName::Fulu, ssz)
-            .ok()
-            .map(|b| Root::from_hash256(b.canonical_root())),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        decoded = true;
-        if computed == *claimed {
-            return Ok(true);
-        }
-    }
-    if decoded {
-        return Ok(false);
-    }
-    Err(SeamError::InvalidArgument(
-        "signed block SSZ did not decode; refuse unvalidated ingest".into(),
-    ))
 }
 
 fn durable_head_present(engine: &Engine) -> Result<bool, SeamError> {
@@ -392,9 +360,7 @@ mod tests {
     use cc_store::keys::BlockRegion;
     use cc_store::meta::WriteCursor;
     use cc_store::{get_block_by_root, put_block};
-    use cc_types::{BeaconBlock, SignedBeaconBlock};
     use prometheus_client::registry::Registry;
-    use ssz::Encode;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::watch;
@@ -799,21 +765,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn signed_minimal(slot: u64, parent: Root) -> (Root, Vec<u8>) {
-        let signed = SignedBeaconBlock::<Minimal> {
-            message: BeaconBlock {
-                slot: Slot::new(slot),
-                parent_root: parent,
-                ..Default::default()
-            },
-            signature: Default::default(),
-        };
-        (
-            Root::from_hash256(signed.canonical_root()),
-            signed.as_ssz_bytes(),
-        )
-    }
-
     fn block_archive(label: &str) -> (PathBuf, Arc<Engine>, ArchiveWriter, watch::Sender<bool>) {
         let (dir, engine) = eng(label);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -833,7 +784,8 @@ mod tests {
     #[tokio::test]
     async fn ingest_block_rejects_slot_mismatch() {
         let (dir, _engine, archive, shutdown_tx) = block_archive("slot-bind");
-        let (root, ssz) = signed_minimal(1, Root::ZERO);
+        let root = Root::from_array([0x42; 32]);
+        let ssz = synth_block(1, &Root::ZERO, &Root::from_array([0xF0; 32]));
         let err = archive
             .ingest_block(IngestBlock {
                 parent_root: root.into_array(),
@@ -850,24 +802,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_block_rejects_root_mismatch() {
-        let (dir, _engine, archive, shutdown_tx) = block_archive("root-bind");
-        let (_root, ssz) = signed_minimal(1, Root::ZERO);
+    async fn ingest_block_rejects_parent_mismatch() {
+        let (dir, _engine, archive, shutdown_tx) = block_archive("parent-bind");
+        let ssz = synth_block(1, &Root::ZERO, &Root::from_array([0xF0; 32]));
         let err = archive
             .ingest_block(IngestBlock {
                 parent_root: [0xAB; 32],
                 slot: 1,
-                block_root: [0xAB; 32],
+                block_root: [0xCD; 32],
                 ssz: Bytes::from(ssz),
             })
             .await
             .unwrap_err();
         assert!(matches!(err, SeamError::InvalidArgument(_)));
-        assert!(
-            err.to_string().contains("block_root mismatch")
-                || err.to_string().contains("did not decode"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("parent_root mismatch"), "{err}");
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -875,7 +823,8 @@ mod tests {
     #[tokio::test]
     async fn ingest_block_rejects_self_parent_after_head_exists() {
         let (dir, engine, archive, shutdown_tx) = block_archive("self-parent");
-        let (g_root, g_ssz) = signed_minimal(0, Root::ZERO);
+        let g_root = Root::from_array([0x01; 32]);
+        let g_ssz = synth_block(0, &Root::ZERO, &Root::from_array([0xF0; 32]));
         archive
             .ingest_block(IngestBlock {
                 parent_root: g_root.into_array(),
@@ -887,7 +836,8 @@ mod tests {
             .unwrap();
         assert!(durable_head_present(&engine).unwrap());
 
-        let (fake_root, fake_ssz) = signed_minimal(3, Root::ZERO);
+        let fake_root = Root::from_array([0x02; 32]);
+        let fake_ssz = synth_block(3, &Root::ZERO, &Root::from_array([0xF1; 32]));
         let err = archive
             .ingest_block(IngestBlock {
                 parent_root: fake_root.into_array(),
@@ -908,7 +858,11 @@ mod tests {
     #[tokio::test]
     async fn ingest_block_reimport_ancestor_keeps_durable_head() {
         let (dir, engine, archive, shutdown_tx) = block_archive("h3-no-rewind");
-        let (g_root, g_ssz) = signed_minimal(0, Root::ZERO);
+        let g_root = Root::from_array([0x01; 32]);
+        let a_root = Root::from_array([0x02; 32]);
+        let b_root = Root::from_array([0x03; 32]);
+        let state = Root::from_array([0xF0; 32]);
+        let g_ssz = synth_block(0, &Root::ZERO, &state);
         archive
             .ingest_block(IngestBlock {
                 parent_root: g_root.into_array(),
@@ -918,7 +872,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (a_root, a_ssz) = signed_minimal(1, g_root);
+        let a_ssz = synth_block(1, &g_root, &state);
         archive
             .ingest_block(IngestBlock {
                 parent_root: g_root.into_array(),
@@ -928,7 +882,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (b_root, b_ssz) = signed_minimal(2, a_root);
+        let b_ssz = synth_block(2, &a_root, &state);
         archive
             .ingest_block(IngestBlock {
                 parent_root: a_root.into_array(),
@@ -969,20 +923,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_block_rejects_opaque_synth_ssz() {
-        let (dir, _engine, archive, shutdown_tx) = block_archive("opaque");
-        let ssz = synth_block(1, &Root::ZERO, &Root::from_array([0xF0; 32]));
-        let err = archive
+    async fn ingest_block_persists_caller_block_root_without_decode() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("caller-root");
+        let root = Root::from_array([0x42; 32]);
+        let ssz = synth_block(0, &Root::ZERO, &Root::from_array([0xF0; 32]));
+        archive
             .ingest_block(IngestBlock {
-                parent_root: [0x11; 32],
-                slot: 1,
-                block_root: [0x11; 32],
-                ssz: Bytes::from(ssz),
+                parent_root: root.into_array(),
+                slot: 0,
+                block_root: root.into_array(),
+                ssz: Bytes::from(ssz.clone()),
             })
             .await
-            .unwrap_err();
-        assert!(matches!(err, SeamError::InvalidArgument(_)));
-        assert!(err.to_string().contains("did not decode"), "{err}");
+            .expect("caller block_root is the bind; storage must not decode the body");
+        let rt = engine.read().unwrap();
+        assert_eq!(
+            get_block_by_root(&rt, &root).unwrap().as_deref(),
+            Some(ssz.as_slice()),
+            "stored key must be the caller's block_root"
+        );
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&dir);
     }

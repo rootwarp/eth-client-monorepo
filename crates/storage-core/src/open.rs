@@ -159,6 +159,8 @@ pub struct DurableSet {
     pub state_ssz: Vec<u8>,
     /// Real stored anchor-block SSZ (never a Default body).
     pub anchor_block_ssz: Vec<u8>,
+    /// Canonical key that selected `anchor_block_ssz`. Seed checks the body against it.
+    pub anchor_block_root: [u8; 32],
     /// Fork tag for the anchor block decode.
     pub anchor_block_fork: u32,
     /// Replay set (ascending), including non-canonical siblings.
@@ -243,7 +245,7 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
 }
 
 /// Load the durable set from an already-opened store. `None` = empty (checkpoint).
-pub fn durable_set(db: &OpenedStore) -> anyhow::Result<Option<DurableSet>> {
+pub fn durable_set(db: &OpenedStore, chain: &ChainConfig) -> anyhow::Result<Option<DurableSet>> {
     let engine = db.store.engine();
     if resume::is_store_empty(engine).map_err(|e| anyhow::anyhow!("{e}"))? {
         return Ok(None);
@@ -256,13 +258,14 @@ pub fn durable_set(db: &OpenedStore) -> anyhow::Result<Option<DurableSet>> {
         max_open_scan_rows: db.max_open_scan_rows,
         da_status_roots: Vec::new(),
     };
-    let plan = resume::build_durable_plan(engine, &ctx).map_err(map_resume)?;
+    let plan = resume::build_durable_plan(engine, &ctx, chain).map_err(map_resume)?;
     if plan.empty {
         return Ok(None);
     }
     Ok(Some(DurableSet {
         state_ssz: plan.state_ssz,
         anchor_block_ssz: plan.anchor_block_ssz,
+        anchor_block_root: plan.anchor_block_root,
         anchor_block_fork: plan.anchor_block_fork,
         blocks: plan.blocks,
         fork_choice_scalars_ssz: plan.fork_choice_scalars_ssz,

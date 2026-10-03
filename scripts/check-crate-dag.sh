@@ -394,7 +394,8 @@ allowed_deps() {
     # S2-A-01: append cc-chain-core (never re-sort).
     cc-chain)             echo "cc-bootstrap cc-config cc-proto cc-types cc-crypto cc-state-transition cc-fork-choice cc-scheduler cc-seam cc-engine-api cc-chain-core" ;;
     # Phase 2: services/p2p may take cc-libp2p (CC-2K / Architecture §1.2).
-    cc-p2p)               echo "cc-bootstrap cc-config cc-proto cc-types cc-crypto cc-libp2p cc-seam" ;;
+    # Custody-vector dev-dep (services/p2p/tests/custody_subset.rs). Append-only.
+    cc-p2p)               echo "cc-bootstrap cc-config cc-proto cc-types cc-crypto cc-libp2p cc-seam cc-spec-tests" ;;
     cc-attestation)       echo "cc-bootstrap cc-config cc-proto" ;;
     # CC-32b: append cc-types (never re-sort). CC-37b: append cc-crypto (never re-sort).
     # S1-A-02: append cc-engine-api (transport + config move).

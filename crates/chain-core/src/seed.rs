@@ -101,6 +101,8 @@ pub struct SeedApplyInput<'a, P: Preset> {
     /// Optional signed anchor block SSZ (else reconstructed from state header).
     pub anchor_block_ssz: Option<&'a [u8]>,
     pub anchor_block_fork: u32,
+    /// Canonical key that selected `anchor_block_ssz`.
+    pub anchor_block_root: Root,
     /// Replay set (ascending).
     pub blocks: &'a [SeedBlock],
     /// Fork-choice scalars SSZ (240 B) — may be empty to skip.
@@ -139,6 +141,8 @@ pub struct DurableSeed {
     pub state_ssz: Vec<u8>,
     /// Real stored anchor-block SSZ (never a Default body).
     pub anchor_block_ssz: Vec<u8>,
+    /// Canonical key that selected `anchor_block_ssz`.
+    pub anchor_block_root: Root,
     /// Fork tag for the anchor block decode.
     pub anchor_block_fork: u32,
     /// Replay set (ascending).
@@ -188,6 +192,13 @@ fn apply_durable_seed<P: Preset + 'static>(
             )
         })?;
     let signed_anchor = decode_signed_block::<P>(anchor_ssz, input.anchor_block_fork)?;
+    let true_root = Root::from_hash256(tree_hash::TreeHash::tree_hash_root(&signed_anchor.message));
+    if true_root != input.anchor_block_root {
+        return Err(Status::invalid_argument(format!(
+            "seed anchor root mismatch: supplied {} true {true_root}",
+            input.anchor_block_root
+        )));
+    }
     let anchor_block = signed_anchor.message;
 
     let peer_das = Arc::new(PeerDasAvailability::new());
@@ -391,6 +402,7 @@ pub async fn seed_from_durable<P: Preset + 'static>(
     let applied = apply_durable_seed_blocking(SeedApplyOwned {
         state_ssz: seed.state_ssz,
         anchor_block_ssz: seed.anchor_block_ssz,
+        anchor_block_root: seed.anchor_block_root,
         anchor_block_fork: seed.anchor_block_fork,
         blocks: seed.blocks,
         fork_choice_scalars_ssz: seed.fork_choice_scalars_ssz,
@@ -445,6 +457,7 @@ pub fn spawn_core_from_seed<P: Preset + 'static>(
 struct SeedApplyOwned<P: Preset + 'static> {
     state_ssz: Vec<u8>,
     anchor_block_ssz: Vec<u8>,
+    anchor_block_root: Root,
     anchor_block_fork: u32,
     blocks: Vec<SeedBlock>,
     fork_choice_scalars_ssz: Vec<u8>,
@@ -468,6 +481,7 @@ async fn apply_durable_seed_blocking<P: Preset + 'static>(
                 Some(owned.anchor_block_ssz.as_slice())
             },
             anchor_block_fork: owned.anchor_block_fork,
+            anchor_block_root: owned.anchor_block_root,
             blocks: &owned.blocks,
             fork_choice_scalars_ssz: &owned.fork_choice_scalars_ssz,
             chain_config: &owned.chain_config,
@@ -992,6 +1006,46 @@ mod tests {
         }
     }
 
+    /// A body stored under a different key must not become the fork-choice anchor.
+    #[test]
+    fn seed_refuses_anchor_whose_root_does_not_match_canonical_key() {
+        let mut snapshot = seed_payload_state();
+        let post_root = snapshot.canonical_root();
+        let signed_anchor = SignedBeaconBlock::<Minimal> {
+            message: BeaconBlock {
+                slot: Slot::new(0),
+                proposer_index: ValidatorIndex::new(0),
+                parent_root: Root::ZERO,
+                state_root: post_root,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        let state_ssz = snapshot.as_ssz_bytes();
+        let anchor_ssz = signed_anchor.as_ssz_bytes();
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let config = minimal_config();
+        let err = match apply_durable_seed::<Minimal>(SeedApplyInput {
+            state_ssz: &state_ssz,
+            anchor_block_ssz: Some(&anchor_ssz),
+            anchor_block_fork: 0,
+            anchor_block_root: Root::from_array([0xAB; 32]),
+            blocks: &[],
+            fork_choice_scalars_ssz: &[],
+            chain_config: &config,
+            engine: Arc::new(AcceptEngine) as Arc<dyn ExecutionEngine<Minimal>>,
+            expected_head_root: Root::ZERO,
+            expected_head_slot: 0,
+            metrics: &metrics,
+            _preset: PhantomData,
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("mismatched canonical key must be refused"),
+        };
+        assert!(err.to_string().contains("anchor root mismatch"), "{err}");
+    }
+
     /// S0-A-28: durable seed from a runtime worker + a real engine object + a
     /// payload-carrying block must not panic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1015,6 +1069,7 @@ mod tests {
         let _ = cc_state_transition::process_slots(&mut child_pre, Slot::new(1), &config).unwrap();
         let child = payload_carrying_child(&child_pre, &config);
         let child_root = Root::from_hash256(TreeHash::tree_hash_root(&child.message));
+        let anchor_root = Root::from_hash256(TreeHash::tree_hash_root(&signed_anchor.message));
 
         let seed_block = SeedBlock {
             ssz: child.as_ssz_bytes(),
@@ -1028,6 +1083,7 @@ mod tests {
         let applied = apply_durable_seed_blocking::<Minimal>(SeedApplyOwned {
             state_ssz: snapshot.as_ssz_bytes(),
             anchor_block_ssz: signed_anchor.as_ssz_bytes(),
+            anchor_block_root: anchor_root,
             anchor_block_fork: 0,
             blocks: vec![seed_block],
             fork_choice_scalars_ssz: Vec::new(),

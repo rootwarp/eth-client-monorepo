@@ -525,11 +525,14 @@ pub async fn run() -> anyhow::Result<()> {
                     max_open_scan_rows: cfg.max_open_scan_rows,
                     da_status_roots: Vec::new(),
                 };
+                // Resume drops the plan; fork tags never leave this process.
+                let chain = ChainConfig::mainnet_like_for_digest();
                 match resume::run_resume_sequence(
                     &engine,
                     &storage_metrics,
                     &durable_ctx,
                     resume::ResumeExit::Os,
+                    &chain,
                 ) {
                     Ok(outcome) => {
                         if outcome.empty {

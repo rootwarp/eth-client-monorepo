@@ -129,7 +129,8 @@ pub fn boot_in_process(
     let opened = open_and_stamp(cfg)?;
     phases.push(BootPhase::Open);
 
-    let _durable = durable_set(&opened)?;
+    let chain = bundled_hoodi_config()?;
+    let _durable = durable_set(&opened, &chain)?;
     phases.push(BootPhase::DurableSet);
 
     if !start_writer {
@@ -272,6 +273,10 @@ fn load_network(cfg: &BeaconCoreConfig) -> anyhow::Result<NetworkChainConfig> {
             "network_config is required when checkpoint_providers is non-empty"
         ));
     }
+    bundled_hoodi_config()
+}
+
+fn bundled_hoodi_config() -> anyhow::Result<NetworkChainConfig> {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../crates/types/tests/fixtures/hoodi-config.yaml");
     match NetworkChainConfig::from_yaml_file(&fixture) {
@@ -326,6 +331,7 @@ fn map_durable(d: cc_storage_core::DurableSet) -> DurableSeed {
     DurableSeed {
         state_ssz: d.state_ssz,
         anchor_block_ssz: d.anchor_block_ssz,
+        anchor_block_root: Root::from_array(d.anchor_block_root),
         anchor_block_fork: d.anchor_block_fork,
         blocks: d
             .blocks
@@ -414,7 +420,7 @@ pub async fn run() -> anyhow::Result<()> {
         writer_process_fatal: true,
     };
     let opened = open_and_stamp(&boot_cfg)?;
-    let durable = durable_set(&opened)?;
+    let durable = durable_set(&opened, &network)?;
 
     let mut bs = cc_bootstrap::init(SERVICE, TelemetrySettings::from(&cfg.service))?;
     let chain_metrics = ChainMetrics::register(&mut bs.registry);
