@@ -1,0 +1,140 @@
+# Two-process self-devnet host: cc-p2p + cc-beacon-core.
+#
+# Same anchor, publisher, ./out fixtures, and EL snapshot as devnet/compose.yml
+# (compose.mesh.yml). Liveness only: a fresh beacon-core store persists nothing
+# and run() has no genesis arm, so this file does not claim a loaded import.
+#
+#   docker compose -f devnet/compose.beacon-core.yml config --services
+#   CC_DEVNET_COMPOSE=devnet/compose.beacon-core.yml ./devnet/up.sh
+#
+# cc-p2p creates the identity file (mode 0600) before cc-beacon-core opens it
+# read-only. Aggregate health on p2p stays NOT_SERVING until beacon-core is up,
+# so the p2p healthcheck probes P2pService, not "".
+
+name: cc-devnet
+
+include:
+  - compose.mesh.yml
+
+x-cc-env: &cc-env
+  RUST_LOG: ${RUST_LOG:-info}
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+
+x-cc-runtime: &cc-runtime
+  restart: unless-stopped
+  stop_signal: SIGTERM
+  stop_grace_period: 5s
+  networks: [ccdev]
+
+x-hc: &hc
+  interval: 5s
+  timeout: 2s
+  retries: 12
+  start_period: 30s
+
+x-p2p-build: &p2p-build
+  context: ..
+  dockerfile: Dockerfile
+  args:
+    SERVICE: cc-p2p
+    CC_GIT_SHA: ${CC_GIT_SHA:-unknown}
+
+x-core-build: &core-build
+  context: ..
+  dockerfile: Dockerfile
+  args:
+    SERVICE: cc-beacon-core
+    CC_GIT_SHA: ${CC_GIT_SHA:-unknown}
+
+services:
+  cc-p2p:
+    <<: *cc-runtime
+    build: *p2p-build
+    environment:
+      <<: *cc-env
+      CC_P2P_GRPC_ADDR: 0.0.0.0:9002
+      CC_P2P_METRICS_ADDR: 0.0.0.0:9102
+      # Chain surface moved into beacon-core. StorageService is not hosted;
+      # the probe target that still exists is the same process.
+      CC_P2P_PEERS__CHAIN: http://cc-beacon-core:9001
+      CC_P2P_PEERS__STORAGE: http://cc-beacon-core:9001
+      CC_P2P_NODE_KEY_PATH: /app/data/node_key
+      CC_P2P_LISTEN_MULTIADDR: /ip4/0.0.0.0/tcp/9000
+      CC_P2P_NETWORK_CONFIG: /fixture/config.yaml
+      CC_P2P_GENESIS_VALIDATORS_ROOT: "${CC_DEVNET_GVR:-0x4d04ab2dc363bf4d5e09d605f2872f49edf76c0bc09bcd14ad875f11742d11d0}"
+      CC_P2P_CLOCK__GENESIS_TIME: ${CC_DEVNET_GENESIS_TIME:-1}
+      CC_P2P_CLOCK__SECONDS_PER_SLOT: ${CC_DEVNET_SECONDS_PER_SLOT:-3}
+      # config/p2p.toml is Hoodi (32 slots, 500 ms). up.sh fills these from
+      # devnet/out/config.yaml. Committed minimal devnet emits 8 and 125.
+      CC_P2P_CLOCK__SLOTS_PER_EPOCH: ${CC_DEVNET_SLOTS_PER_EPOCH:-8}
+      CC_P2P_CLOCK__MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS: ${CC_DEVNET_GOSSIP_DISPARITY_MS:-125}
+      # p2p.toml boot_nodes are Hoodi. Leave discovery off and dial the shared
+      # publisher. up.sh fills CC_P2P_STATIC_PEERS from devnet/out/peer_ids.txt.
+      CC_P2P_ENABLE_DISCOVERY: "false"
+      CC_P2P_PEER_MANAGER__STATIC_PEERS: '${CC_P2P_STATIC_PEERS:-[]}'
+    volumes:
+      - cc-p2p-identity:/app/data
+      - ./out:/fixture:ro
+    ports:
+      - "127.0.0.1:9102:9102"
+    depends_on:
+      anchor:
+        condition: service_started
+      publisher:
+        condition: service_started
+    healthcheck:
+      <<: *hc
+      test:
+        [
+          "CMD",
+          "/usr/local/bin/grpc-health-probe",
+          "-addr=:9002",
+          "-service=eth.p2p.v1.P2pService",
+        ]
+
+  cc-beacon-core:
+    <<: *cc-runtime
+    build: *core-build
+    environment:
+      <<: *cc-env
+      CC_BEACON_CORE_GRPC_ADDR: 0.0.0.0:9001
+      CC_BEACON_CORE_METRICS_ADDR: 0.0.0.0:9101
+      CC_BEACON_CORE_DATA_DIR: /app/data
+      CC_BEACON_CORE_NODE_KEY_PATH: /identity/node_key
+      CC_BEACON_CORE_JWT_SECRET_PATH: /jwt/jwt.hex
+      CC_BEACON_CORE_EL_ENDPOINT: http://el:8551
+      CC_BEACON_CORE_P2P_URI: http://cc-p2p:9002
+      CC_BEACON_CORE_NETWORK_CONFIG: /fixture/config.yaml
+      CC_BEACON_CORE_GENESIS_VALIDATORS_ROOT: "${CC_DEVNET_GVR:-0x4d04ab2dc363bf4d5e09d605f2872f49edf76c0bc09bcd14ad875f11742d11d0}"
+      CC_BEACON_CORE_SLOT_DURATION_MS: "${CC_DEVNET_SLOT_DURATION_MS:-3000}"
+      # config/beacon-core.toml is 500 ms. Same fixture disparity as p2p.
+      CC_BEACON_CORE_MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS: ${CC_DEVNET_GOSSIP_DISPARITY_MS:-125}
+    volumes:
+      - cc-store-data:/app/data
+      - cc-p2p-identity:/identity:ro
+      - ./out:/fixture:ro
+      - ../secrets:/jwt:ro
+    ports:
+      - "127.0.0.1:9101:9101"
+    depends_on:
+      cc-p2p:
+        condition: service_healthy
+      # service_started, never service_healthy (ADR P3-14). EL sync is not a
+      # liveness gate; beacon-core binds without a synced geth.
+      el:
+        condition: service_started
+      anchor:
+        condition: service_started
+    healthcheck:
+      <<: *hc
+      test:
+        [
+          "CMD",
+          "/usr/local/bin/grpc-health-probe",
+          "-addr=:9001",
+          "-service=eth.chain.v1.ChainService",
+        ]
+
+volumes:
+  cc-store-data:
+  cc-p2p-identity:

@@ -10,6 +10,9 @@
 #   6. docker compose up -d
 #
 # Env:
+#   CC_DEVNET_COMPOSE          compose file (default: devnet/compose.yml).
+#                              devnet/compose.beacon-core.yml is cc-p2p + cc-beacon-core
+#                              on the same anchor, publisher, fixtures, and EL volume.
 #   CC_DEVNET_GEN=1            force regenerate fixture (default: only if missing)
 #   CC_DEVNET_SLOT_COUNT=N     override generator slot count for a short smoke fixture
 #   CC_DEVNET_GENESIS_TIME     wall-clock genesis (default: now + grace after build)
@@ -22,7 +25,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEVNET="${ROOT}/devnet"
 OUT="${DEVNET}/out"
-COMPOSE_FILE="${DEVNET}/compose.yml"
+export COMPOSE_FILE="${CC_DEVNET_COMPOSE:-${DEVNET}/compose.yml}"
 cd "${ROOT}"
 
 export CC_GIT_SHA="${CC_GIT_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
@@ -92,6 +95,7 @@ fi
 
 # Per-node multiaddr files (everyone dials everyone else by default).
 python3 - <<'PY'
+import os
 from pathlib import Path
 out = Path("devnet/out")
 roles = [
@@ -118,13 +122,35 @@ def write_peers(for_role: str, peers, path: Path, publisher_only: bool = False):
         lines.append(f"/dns/{host}/tcp/{port} # {role} peer_id={pid}")
     path.write_text("\n".join(lines) + ("\n" if lines else ""))
 
-write_peers("publisher", roles, out / "multiaddrs.publisher.txt")
+# Beacon-core topology has no node-a/node-b. cc-p2p still dials the publisher
+# via CC_P2P_STATIC_PEERS; the publisher must not dial names that do not exist.
+compose = os.environ.get("COMPOSE_FILE", "")
+if compose.endswith("compose.beacon-core.yml"):
+    (out / "multiaddrs.publisher.txt").write_text("")
+    print("wrote publisher multiaddrs: empty (beacon-core topology)")
+else:
+    write_peers("publisher", roles, out / "multiaddrs.publisher.txt")
 write_peers("node-a", roles, out / "multiaddrs.node-a.txt")
 write_peers("node-b", roles, out / "multiaddrs.node-b.txt")
 # Single-peer scenario (CC-2Jb): node-a dials only the publisher.
 write_peers("node-a", roles, out / "multiaddrs.node-a.publisher-only.txt", publisher_only=True)
 print("wrote per-node multiaddr files")
 PY
+
+# GVR + publisher peer id are deterministic for a given fixture. The two-process
+# file dials the publisher with them; the four-container file ignores them.
+if [[ -f "${OUT}/manifest.json" ]]; then
+  CC_DEVNET_GVR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("genesis_validators_root",""))' "${OUT}/manifest.json")"
+  if [[ -n "${CC_DEVNET_GVR}" ]]; then
+    export CC_DEVNET_GVR
+  fi
+fi
+if [[ -f "${OUT}/peer_ids.txt" ]]; then
+  pub_pid="$(awk '$1=="publisher" {print $2}' "${OUT}/peer_ids.txt")"
+  if [[ -n "${pub_pid}" ]]; then
+    export CC_P2P_STATIC_PEERS="[{peer_id=\"${pub_pid}\",multiaddr=\"/dns/publisher/tcp/9000\"}]"
+  fi
+fi
 
 # Scenario peer set for node-a.
 if [[ "${CC_NODE_A_PEERS:-}" == "publisher" ]]; then
@@ -202,9 +228,56 @@ print("anchor ready")
 PY
 
 # ── 4. build images first (H1: genesis stamped after this) ───────────────────
-export CC_DEVNET_SECONDS_PER_SLOT="${CC_DEVNET_SECONDS_PER_SLOT:-3}"
+# Clock knobs come from the generated fixture, not config/p2p.toml (32 / 500 ms).
+# Committed devnet/devnet.toml (preset=minimal, seconds_per_slot=3) emits
+# SLOTS_PER_EPOCH 8 and MAXIMUM_GOSSIP_CLOCK_DISPARITY 125ms
+# (bin/devnet-gen: 500 * seconds_per_slot / 12).
+clock_line="$(OUT_CONFIG="${OUT}/config.yaml" python3 - <<'PY'
+import os, re
+from pathlib import Path
+text = Path(os.environ["OUT_CONFIG"]).read_text()
+
+def grab(key: str) -> str:
+    m = re.search(rf"^{key}:\s*(\S+)", text, re.M)
+    if not m:
+        raise SystemExit(f"error: {key} missing in {os.environ['OUT_CONFIG']}")
+    return m.group(1)
+
+slots = grab("SLOTS_PER_EPOCH")
+secs = grab("SECONDS_PER_SLOT")
+disp = grab("MAXIMUM_GOSSIP_CLOCK_DISPARITY")
+if disp.endswith("ms"):
+    disp = disp[:-2]
+if not (slots.isdigit() and secs.isdigit() and disp.isdigit()):
+    raise SystemExit(
+        f"error: clock fields not integers: slots={slots} secs={secs} disparity={disp}"
+    )
+print(f"{slots} {secs} {disp}")
+PY
+)"
+read -r yaml_slots yaml_secs yaml_disp <<<"${clock_line}"
+export CC_DEVNET_SLOTS_PER_EPOCH="${yaml_slots}"
+export CC_DEVNET_GOSSIP_DISPARITY_MS="${yaml_disp}"
+export CC_DEVNET_SECONDS_PER_SLOT="${CC_DEVNET_SECONDS_PER_SLOT:-${yaml_secs}}"
+export CC_DEVNET_SLOT_DURATION_MS="${CC_DEVNET_SLOT_DURATION_MS:-$((CC_DEVNET_SECONDS_PER_SLOT * 1000))}"
 export CC_DEVNET_MAX_SLOTS="${CC_DEVNET_MAX_SLOTS:-64}"
 export CC_NODE_A_DISABLE_DIAL="${CC_NODE_A_DISABLE_DIAL:-false}"
+echo "==> fixture clock: slots_per_epoch=${CC_DEVNET_SLOTS_PER_EPOCH} disparity_ms=${CC_DEVNET_GOSSIP_DISPARITY_MS} seconds_per_slot=${CC_DEVNET_SECONDS_PER_SLOT}"
+
+# el and cc-beacon-core both load this file (mode 0600). Do not rotate an
+# existing secret — both topologies must keep the same bytes. Create at 0600
+# before the first write so a crash cannot leave a umask mode.
+if [[ ! -f "${ROOT}/secrets/jwt.hex" ]]; then
+  echo "==> writing secrets/jwt.hex (0600)"
+  python3 - <<'PY'
+import os
+import secrets
+path = "secrets/jwt.hex"
+fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+with os.fdopen(fd, "w") as fh:
+    fh.write(secrets.token_hex(32) + "\n")
+PY
+fi
 
 # Capture any operator-supplied genesis before we overwrite for compose parse.
 OPERATOR_GENESIS="${CC_DEVNET_GENESIS_TIME:-}"
@@ -236,7 +309,16 @@ docker compose -f "${COMPOSE_FILE}" up -d --remove-orphans --no-build --force-re
 
 echo "==> waiting for metrics endpoints"
 deadline=$((SECONDS + 180))
-for port in 19102 19112 19122 18080; do
+case "${COMPOSE_FILE}" in
+  *compose.beacon-core.yml)
+    # publisher + anchor stay; the host is cc-beacon-core :9101 and cc-p2p :9102.
+    wait_ports=(19102 18080 9101 9102)
+    ;;
+  *)
+    wait_ports=(19102 19112 19122 18080)
+    ;;
+esac
+for port in "${wait_ports[@]}"; do
   ok=0
   while (( SECONDS < deadline )); do
     if curl -fsS "http://127.0.0.1:${port}/metrics" >/dev/null 2>&1 \
@@ -256,10 +338,21 @@ for port in 19102 19112 19122 18080; do
   echo "  port ${port}: ready"
 done
 
-echo "devnet up: publisher + node-a + node-b + anchor"
-echo "  publisher metrics: http://127.0.0.1:19102/metrics"
-echo "  node-a metrics:    http://127.0.0.1:19112/metrics"
-echo "  node-b metrics:    http://127.0.0.1:19122/metrics"
+case "${COMPOSE_FILE}" in
+  *compose.beacon-core.yml)
+    echo "devnet up: anchor + publisher + el + cc-p2p + cc-beacon-core (liveness, not import)"
+    echo "  publisher metrics:    http://127.0.0.1:19102/metrics"
+    echo "  cc-p2p metrics:       http://127.0.0.1:9102/metrics"
+    echo "  cc-beacon-core metrics: http://127.0.0.1:9101/metrics"
+    ;;
+  *)
+    echo "devnet up: publisher + node-a + node-b + anchor + el"
+    echo "  publisher metrics: http://127.0.0.1:19102/metrics"
+    echo "  node-a metrics:    http://127.0.0.1:19112/metrics"
+    echo "  node-b metrics:    http://127.0.0.1:19122/metrics"
+    ;;
+esac
 echo "  anchor:            http://127.0.0.1:18080/"
+echo "  el snapshot:       volume cc-devnet-el"
 echo "  bootnodes:         ${OUT}/bootnodes.txt"
 echo "  genesis_time:      ${CC_DEVNET_GENESIS_TIME}"

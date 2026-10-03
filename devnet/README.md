@@ -8,11 +8,18 @@ topology, runner scripts, and the static anchor.
 ## Topology
 
 ```text
-devnet network (cc-devnet)
+devnet network (cc-devnet) — shared by both topologies (compose.mesh.yml)
   ├─ publisher   cc-p2p --publish-fixture  (holds all 128 columns; cgc=128)
+  ├─ anchor      nginx serving genesis + CC-19 endpoints
+  └─ el          geth v1.17.5, volume cc-devnet-el (same snapshot either way)
+
+four-container (devnet/compose.yml) — also starts:
   ├─ node-a      peer under test — default peers with everything
-  ├─ node-b      second peer so gossip has a real mesh
-  └─ anchor      nginx serving genesis + CC-19 endpoints
+  └─ node-b      second peer so gossip has a real mesh
+
+two-process (devnet/compose.beacon-core.yml) — also starts:
+  ├─ cc-p2p          production p2p, dials the publisher, identity volume
+  └─ cc-beacon-core  chain+storage host, cc-store-data + identity :ro
 ```
 
 | Service | Host metrics / HTTP | Notes |
@@ -21,6 +28,9 @@ devnet network (cc-devnet)
 | **node-a** | `http://127.0.0.1:19112/metrics` | Booking (a) assertions land here |
 | **node-b** | `http://127.0.0.1:19122/metrics` | Mesh participant |
 | **anchor** | `http://127.0.0.1:18080/` | Checkpoint bootstrap without a public provider |
+| **cc-p2p** | `http://127.0.0.1:9102/metrics` | Two-process topology only |
+| **cc-beacon-core** | `http://127.0.0.1:9101/metrics` | Two-process topology only; liveness, not import |
+| **el** | `8545` (all interfaces) | Shared `cc-devnet-el` snapshot; not a CC process. Also `6060` and `30303` tcp+udp |
 
 ## What is committed
 
@@ -28,7 +38,9 @@ devnet network (cc-devnet)
 |------|---------|
 | `devnet.toml` | Generator parameters (seed, slot count ≥512, BPO epochs, blob cycle, slot time) |
 | `expected-manifest.json` | Expected half of the reproducibility record |
-| `compose.yml` | Self-devnet topology (CC-2Jd) |
+| `compose.yml` | Four-container mesh (publisher, node-a, node-b, anchor, el) |
+| `compose.mesh.yml` | Shared anchor, publisher, fixtures, and EL snapshot |
+| `compose.beacon-core.yml` | Two CC processes (`cc-p2p` + `cc-beacon-core`) on that mesh |
 | `up.sh` / `down.sh` / `smoke.sh` / `faults.sh` | Runner + docker fault primitives |
 | `anchor/nginx.conf` | Static CC-19 path map |
 | `out/.gitignore` | Keeps the output directory; ignores generated bulk |
@@ -71,14 +83,26 @@ export CC_DEVNET_SLOT_COUNT=16
 export CC_DEVNET_MAX_SLOTS=12
 export CC_DEVNET_SMOKE_SLOT_N=4
 
-./devnet/up.sh          # gen keys + bootnodes + build + genesis-after-build + up
-./devnet/smoke.sh       # M2.1 wire gate
+./devnet/up.sh          # four-container mesh: gen + build + genesis-after-build + up
+# Same fixtures and EL volume, two CC processes (liveness, not import):
+# CC_DEVNET_COMPOSE=devnet/compose.beacon-core.yml ./devnet/up.sh
+./devnet/smoke.sh       # M2.1 wire gate (four-container)
 ./devnet/faults.sh -f devnet/compose.yml exercise-once   # self-devnet primitives
 ./devnet/down.sh
 ```
 
-Host-published ports bind **127.0.0.1 only** (metrics + anchor). Libp2p is not
-published to the host — mesh stays on the `cc-devnet` docker network.
+Host-published metrics and the anchor bind **127.0.0.1 only**. Libp2p `9000`,
+gRPC `9001`/`9002`, and authrpc `8551` are not published. EL `8545`, `6060`, and
+`30303` tcp+udp are the existing SEC-H1 carve-out used by `docker-compose.yml`
+(`docs/architecture/01-deployment-and-processes.md`): those three publish on all
+interfaces. That is not a new exposure class.
+
+`publisher`, `node-a`, and `node-b` are `cc-p2p`. They can show
+`cc_p2p_gossip_messages_total` and `cc_p2p_peers`. They do not register
+`ChainMetrics`, so `cc_chain_import_total` is absent on the four-container
+topology. B-05 family 1 is **NOT_RUN** there. Blocker: four-container CC
+processes are `cc-p2p` and do not export `cc_chain_import_total`. The
+two-process host exports the series and does not claim a loaded import.
 
 Regenerate the full 512-slot fixture only:
 

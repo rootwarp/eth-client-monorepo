@@ -1,17 +1,25 @@
-# CC-2Jd self-devnet topology.
+# CC-2Jd self-devnet — four-container mesh.
 #
 #   devnet network (cc-devnet)
 #     ├─ publisher   cc-p2p --publish-fixture  (cgc=128, all columns)
 #     ├─ node-a      peer under test (default: mesh with everything)
 #     ├─ node-b      second peer (real gossip mesh)
-#     └─ anchor      nginx serving genesis + CC-19 endpoints
+#     ├─ anchor      nginx serving genesis + CC-19 endpoints
+#     └─ el          same image and cc-devnet-el snapshot as compose.beacon-core.yml
+#
+# Anchor, publisher, fixtures, and EL live in compose.mesh.yml so
+# devnet/compose.beacon-core.yml (cc-p2p + cc-beacon-core) is the same mesh.
 #
 # Usage (from monorepo root): always use ./devnet/up.sh (sets genesis after build).
 #
 # SEC-H1: host port publishes bind 127.0.0.1 only (metrics/anchor). Libp2p is not
 # published to the host — mesh stays on the docker network.
+# EL host ports match docker-compose.yml (operator HTTP/metrics/devp2p).
 
 name: cc-devnet
+
+include:
+  - compose.mesh.yml
 
 x-cc-env: &cc-env
   RUST_LOG: ${RUST_LOG:-info}
@@ -31,68 +39,6 @@ x-p2p-build: &p2p-build
     CC_GIT_SHA: ${CC_GIT_SHA:-unknown}
 
 services:
-  anchor:
-    <<: *cc-runtime
-    image: nginx:1.27-alpine
-    volumes:
-      - ./anchor/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./out/anchor:/usr/share/nginx/html:ro
-    ports:
-      - "127.0.0.1:18080:80"
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/eth/v1/config/spec"]
-      interval: 5s
-      timeout: 2s
-      retries: 12
-      start_period: 5s
-
-  publisher:
-    <<: *cc-runtime
-    build: *p2p-build
-    # Runtime image has no shell health probe tools; readiness is polled by up.sh/smoke.sh.
-    # Genesis must be set by up.sh *after* image build (H1). Do not rely on the
-    # ${CC_DEVNET_GENESIS_TIME:-0} fallback for a real run.
-    command:
-      - --publish-fixture
-      - /fixture/chain
-      - --node-key
-      - /keys/publisher.key
-      - --listen
-      - /ip4/0.0.0.0/tcp/9000
-      - --config-yaml
-      - /fixture/config.yaml
-      - --manifest
-      - /fixture/manifest.json
-      - --static-peers-file
-      - /fixture/multiaddrs.publisher.txt
-      - --metrics-addr
-      - 0.0.0.0:9102
-      - --genesis-time
-      # up.sh sets this *after* image build (H1). Placeholder 1 is only for compose parse.
-      - ${CC_DEVNET_GENESIS_TIME:-1}
-      - --seconds-per-slot
-      - ${CC_DEVNET_SECONDS_PER_SLOT:-3}
-      - --max-slots
-      - ${CC_DEVNET_MAX_SLOTS:-64}
-      - --fault-mode
-      - ${CC_PUBLISHER_FAULT_MODE:-none}
-      - --fault-flag-path
-      - ${CC_P2P_FAULT_FLAG:-/fault/cc-release-columns.flag}
-    environment:
-      <<: *cc-env
-      CC_P2P_FAULT_FLAG: ${CC_P2P_FAULT_FLAG:-/fault/cc-release-columns.flag}
-    volumes:
-      - ./out:/fixture:ro
-      - ./out/node_keys:/keys:ro
-      # Shared flag dir for CC-2Jb release (host + publisher container).
-      - ./out/fault:/fault:rw
-    ports:
-      # Metrics only on loopback (SEC-H1). Libp2p not published to host.
-      - "127.0.0.1:19102:9102"
-    depends_on:
-      anchor:
-        condition: service_started
-
   node-a:
     <<: *cc-runtime
     build: *p2p-build
@@ -113,6 +59,9 @@ services:
     environment:
       <<: *cc-env
       CC_P2P_DISABLE_DIAL: ${CC_NODE_A_DISABLE_DIAL:-false}
+      CC_P2P_CLOCK__SLOTS_PER_EPOCH: ${CC_DEVNET_SLOTS_PER_EPOCH:-8}
+      CC_P2P_CLOCK__MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS: ${CC_DEVNET_GOSSIP_DISPARITY_MS:-125}
+      CC_P2P_CLOCK__SECONDS_PER_SLOT: ${CC_DEVNET_SECONDS_PER_SLOT:-3}
     volumes:
       - ./out:/fixture:ro
       - ./out/node_keys:/keys:ro
@@ -141,6 +90,9 @@ services:
       - 0.0.0.0:9102
     environment:
       <<: *cc-env
+      CC_P2P_CLOCK__SLOTS_PER_EPOCH: ${CC_DEVNET_SLOTS_PER_EPOCH:-8}
+      CC_P2P_CLOCK__MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS: ${CC_DEVNET_GOSSIP_DISPARITY_MS:-125}
+      CC_P2P_CLOCK__SECONDS_PER_SLOT: ${CC_DEVNET_SECONDS_PER_SLOT:-3}
     volumes:
       - ./out:/fixture:ro
       - ./out/node_keys:/keys:ro
@@ -149,8 +101,3 @@ services:
     depends_on:
       publisher:
         condition: service_started
-
-networks:
-  ccdev:
-    name: cc-devnet
-    driver: bridge

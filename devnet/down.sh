@@ -3,7 +3,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${ROOT}/devnet/compose.yml"
 cd "${ROOT}"
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -11,8 +10,11 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+# Same project name (cc-devnet). Down both files so a two-process up is not left
+# behind, and so the shared cc-devnet-el volume is removed with -v.
 echo "==> docker compose down -v --remove-orphans"
-docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans 2>/dev/null || true
+docker compose -f "${ROOT}/devnet/compose.yml" down -v --remove-orphans 2>/dev/null || true
+docker compose -f "${ROOT}/devnet/compose.beacon-core.yml" down -v --remove-orphans 2>/dev/null || true
 
 # Named network from compose.yml `networks.ccdev.name`
 if docker network inspect cc-devnet >/dev/null 2>&1; then

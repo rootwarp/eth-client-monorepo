@@ -1,0 +1,139 @@
+# Shared self-devnet mesh for both topologies (S2 rollback A/B pair).
+#
+# Included by:
+#   devnet/compose.yml              four-container: + node-a + node-b
+#   devnet/compose.beacon-core.yml  two CC processes: + cc-p2p + cc-beacon-core
+#
+# Same anchor, same publisher command, same ./out fixtures, same EL image and
+# named volume `cc-devnet-el`. Paths are relative to this file (devnet/).
+
+x-cc-env: &cc-env
+  RUST_LOG: ${RUST_LOG:-info}
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+
+x-cc-runtime: &cc-runtime
+  restart: unless-stopped
+  stop_signal: SIGTERM
+  stop_grace_period: 5s
+  networks: [ccdev]
+
+x-p2p-build: &p2p-build
+  context: ..
+  dockerfile: Dockerfile
+  args:
+    SERVICE: cc-p2p
+    CC_GIT_SHA: ${CC_GIT_SHA:-unknown}
+
+services:
+  anchor:
+    <<: *cc-runtime
+    image: nginx:1.27-alpine
+    volumes:
+      - ./anchor/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./out/anchor:/usr/share/nginx/html:ro
+    ports:
+      - "127.0.0.1:18080:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/eth/v1/config/spec"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+      start_period: 5s
+
+  publisher:
+    <<: *cc-runtime
+    build: *p2p-build
+    # Runtime image has no shell health probe tools; readiness is polled by up.sh/smoke.sh.
+    # Genesis must be set by up.sh *after* image build (H1). Do not rely on the
+    # ${CC_DEVNET_GENESIS_TIME:-0} fallback for a real run.
+    command:
+      - --publish-fixture
+      - /fixture/chain
+      - --node-key
+      - /keys/publisher.key
+      - --listen
+      - /ip4/0.0.0.0/tcp/9000
+      - --config-yaml
+      - /fixture/config.yaml
+      - --manifest
+      - /fixture/manifest.json
+      - --static-peers-file
+      - /fixture/multiaddrs.publisher.txt
+      - --metrics-addr
+      - 0.0.0.0:9102
+      - --genesis-time
+      # up.sh sets this *after* image build (H1). Placeholder 1 is only for compose parse.
+      - ${CC_DEVNET_GENESIS_TIME:-1}
+      - --seconds-per-slot
+      - ${CC_DEVNET_SECONDS_PER_SLOT:-3}
+      - --max-slots
+      - ${CC_DEVNET_MAX_SLOTS:-64}
+      - --fault-mode
+      - ${CC_PUBLISHER_FAULT_MODE:-none}
+      - --fault-flag-path
+      - ${CC_P2P_FAULT_FLAG:-/fault/cc-release-columns.flag}
+    environment:
+      <<: *cc-env
+      CC_P2P_FAULT_FLAG: ${CC_P2P_FAULT_FLAG:-/fault/cc-release-columns.flag}
+      # --publish-fixture reads config.yaml and skips P2pConfig. These match
+      # that fixture so a production-config path on this image agrees too.
+      CC_P2P_CLOCK__SLOTS_PER_EPOCH: ${CC_DEVNET_SLOTS_PER_EPOCH:-8}
+      CC_P2P_CLOCK__MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS: ${CC_DEVNET_GOSSIP_DISPARITY_MS:-125}
+      CC_P2P_CLOCK__SECONDS_PER_SLOT: ${CC_DEVNET_SECONDS_PER_SLOT:-3}
+    volumes:
+      - ./out:/fixture:ro
+      - ./out/node_keys:/keys:ro
+      # Shared flag dir for CC-2Jb release (host + publisher container).
+      - ./out/fault:/fault:rw
+    ports:
+      # Metrics only on loopback (SEC-H1). Libp2p not published to host.
+      - "127.0.0.1:19102:9102"
+    depends_on:
+      anchor:
+        condition: service_started
+
+  # Same EL image, command, and volume as the other topology. Nothing in the
+  # mesh waits on eth_syncing (ADR P3-14): health is for operators, not depends_on.
+  el:
+    <<: *cc-runtime
+    image: ethereum/client-go:v1.17.5
+    command:
+      - --hoodi
+      - --syncmode=snap
+      - --datadir=/data
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.vhosts=el
+      - --authrpc.jwtsecret=/jwt/jwt.hex
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=eth,net,web3
+      - --http.vhosts=*
+      - --metrics
+      - --metrics.addr=0.0.0.0
+      - --metrics.port=6060
+    volumes:
+      - cc-devnet-el:/data
+      - ../secrets:/jwt:ro
+    ports:
+      - "8545:8545"
+      - "6060:6060"
+      - "30303:30303/tcp"
+      - "30303:30303/udp"
+    healthcheck:
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+      test: ["CMD-SHELL", "geth attach --exec 'eth.syncing == false' /data/geth.ipc | grep -q true"]
+
+networks:
+  ccdev:
+    name: cc-devnet
+    driver: bridge
+
+volumes:
+  # Explicit name so both compose files attach the same snapshot.
+  cc-devnet-el:
+    name: cc-devnet-el
