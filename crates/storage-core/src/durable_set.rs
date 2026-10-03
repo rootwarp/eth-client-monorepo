@@ -22,6 +22,7 @@
 
 #![allow(dead_code)] // production resume (CC-45b) calls these; tests exercise them now.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -215,7 +216,9 @@ impl ItemAssessment {
 }
 
 /// External inputs the durable-set assessor cannot derive from the engine alone.
-#[derive(Debug, Clone)]
+///
+/// [`Debug`] is hand-written: `expected_node_id` is the raw node key.
+#[derive(Clone)]
 pub(crate) struct DurableSetContext {
     /// Node id derived from the node key file (`p2p.node_key_path`) for **I-node-id**.
     pub expected_node_id: Option<Root>,
@@ -231,6 +234,22 @@ pub(crate) struct DurableSetContext {
     /// Roots that **must** carry a `da_status` row (restore set). Empty → item 9
     /// only fails when the whole `da_status` table is empty while hot blocks exist.
     pub da_status_roots: Vec<Root>,
+}
+
+impl fmt::Debug for DurableSetContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableSetContext")
+            .field(
+                "expected_node_id",
+                &self.expected_node_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("node_key_path", &self.node_key_path)
+            .field("enr_seq_path", &self.enr_seq_path)
+            .field("snapshot_ring", &self.snapshot_ring)
+            .field("max_open_scan_rows", &self.max_open_scan_rows)
+            .field("da_status_roots", &self.da_status_roots)
+            .finish()
+    }
 }
 
 impl Default for DurableSetContext {
@@ -835,10 +854,8 @@ fn assess_split(engine: &Engine, ctx: &DurableSetContext) -> Result<ItemAssessme
 
 /// 12. Node key vs AnchorInfo.node_id — cites **I-node-id** (`crates/store/src/invariants.rs`).
 ///
-/// On mismatch the error names stored `AnchorInfo.node_id` (already in the
-/// store) and cites I-node-id. It does **not** print the key-file bytes
-/// (the secp256k1 secret). A configured path whose file is missing is a
-/// named failure when `AnchorInfo` is already present.
+/// A configured path whose file is missing is a named failure when `AnchorInfo`
+/// is already present.
 fn assess_node_id_pairing(
     engine: &Engine,
     ctx: &DurableSetContext,
@@ -855,9 +872,9 @@ fn assess_node_id_pairing(
         return Ok(ItemAssessment::Present);
     };
 
-    // Prefer a direct read so the stored id is named even when another
-    // invariant would fire first under Open mode. Do not print `expected`
-    // (raw key-file bytes).
+    // Prefer a direct read so a secret-bearing `meta.node_id` is refused even
+    // when another invariant would fire first under Open mode. Do not print
+    // `stored` or `expected` (both are key bytes).
     if let Some(stored) = read_meta_ssz::<Root>(engine, KEY_NODE_ID)?
         && stored != expected
     {
@@ -865,7 +882,7 @@ fn assess_node_id_pairing(
             item,
             format!(
                 "durable item `{}`: I-node-id (crates/store/src/invariants.rs): \
-                 stored node_id {stored} does not match the configured node key",
+                 stored node_id <redacted> does not match the configured node key",
                 item.as_str(),
             ),
         ));
@@ -877,29 +894,24 @@ fn assess_node_id_pairing(
             item,
             format!(
                 "durable item `{}`: I-node-id (crates/store/src/invariants.rs): \
-                 AnchorInfo.node_id {} does not match the configured node key",
+                 AnchorInfo.node_id <redacted> does not match the configured node key",
                 item.as_str(),
-                anchor.node_id
             ),
         ));
     }
 
     // Route through the invariant as well so Open-path wording stays aligned.
+    // `detail` is already redacted where it is built; do not append the root.
     let inv_ctx = ctx.invariant_context();
     match check_invariants(engine, InvariantCheckMode::Open, &inv_ctx, None) {
         Err(StoreError::InvariantViolation {
             invariant: "node_id",
             detail,
         }) => {
-            let mut msg = format!(
+            let msg = format!(
                 "durable item `{}`: I-node-id violation (crates/store/src/invariants.rs): {detail}",
                 item.as_str()
             );
-            if let Some(anchor) = read_meta_ssz::<AnchorInfo>(engine, KEY_ANCHOR_INFO)?
-                && !msg.contains(&anchor.node_id.to_string())
-            {
-                msg.push_str(&format!(" (AnchorInfo.node_id {})", anchor.node_id));
-            }
             Ok(named_fail(item, msg))
         }
         Err(e) if e.to_string().contains("node_id") => {
@@ -1573,7 +1585,8 @@ mod tests {
     /// 12. Node key / AnchorInfo.node_id mismatch → named failure via I-node-id.
     ///
     /// Strong in-process: replace expected id (simulating a fresh key file) and
-    /// assert open + assess refuse, naming **both** ids.
+    /// assert open + assess refuse. The literal `node_id` stays; neither byte
+    /// string is printed.
     #[test]
     fn delete_12_node_id_mismatch_named_failure() {
         let f = Fixture::new("del-nodeid");
@@ -1597,17 +1610,39 @@ mod tests {
                 "must cite I-node-id: {detail}"
             );
             assert!(
-                detail.contains(&f.node_id.to_string()),
-                "must name stored AnchorInfo.node_id: {detail}"
+                !detail.contains(&f.node_id.to_string()) && !detail.contains(&from_key.to_string()),
+                "must not print stored or key-file bytes: {detail}"
+            );
+        }
+
+        // A secret-bearing `meta.node_id` is preferred over AnchorInfo and still refused.
+        {
+            let mut b = f.engine().batch();
+            b.put(
+                TABLE_META,
+                KEY_NODE_ID.as_bytes(),
+                &f.node_id.as_ssz_bytes(),
+            );
+            f.engine().commit(b).unwrap();
+        }
+        let meta = assess_item(f.engine(), DurableItem::NodeIdPairing, &ctx).unwrap();
+        assert!(
+            meta.is_named_failure_for(DurableItem::NodeIdPairing),
+            "secret-bearing meta.node_id must refuse, got {meta:?}"
+        );
+        if let ItemAssessment::NamedFailure { detail, .. } = &meta {
+            assert!(
+                detail.contains("stored node_id"),
+                "meta.node_id mismatch must keep the literal node_id: {detail}"
             );
             assert!(
-                !detail.contains(&from_key.to_string()),
-                "must not print key-file bytes: {detail}"
+                !detail.contains(&f.node_id.to_string()) && !detail.contains(&from_key.to_string()),
+                "meta.node_id mismatch leaked key bytes: {detail}"
             );
         }
 
         // Production open path: load expected id from the (replaced) key file and
-        // refuse Store::open with check_invariants — names both ids (I-node-id).
+        // refuse Store::open with check_invariants. Bytes stay out of the error.
         let loaded = load_expected_node_id_from_key_path(Some(&f.node_key_path))
             .unwrap()
             .expect("key file present");
@@ -1632,12 +1667,16 @@ mod tests {
             "err={err:?}"
         );
         assert!(
-            msg.contains(&f.node_id.to_string()),
-            "fatal must name stored AnchorInfo.node_id: {msg}"
+            msg.contains("node_id"),
+            "fatal must keep the literal node_id: {msg}"
         );
+        let dbg = format!("{err:?}");
         assert!(
-            !msg.contains(&from_key.to_string()),
-            "fatal must not print key-file bytes: {msg}"
+            !msg.contains(&f.node_id.to_string())
+                && !msg.contains(&from_key.to_string())
+                && !dbg.contains(&f.node_id.to_string())
+                && !dbg.contains(&from_key.to_string()),
+            "fatal Display/Debug leaked key bytes: {msg} / {dbg}"
         );
 
         // End-to-end Store::open with expected_node_id from key file refuses.
@@ -1661,12 +1700,16 @@ mod tests {
             "Store::open must refuse on key mismatch: {err:?}"
         );
         assert!(
-            msg.contains(&anchor_id.to_string()),
-            "open refuse must name stored AnchorInfo.node_id: {msg}"
+            msg.contains("node_id"),
+            "open refuse must keep the literal node_id: {msg}"
         );
+        let chain = format!("{err:#?}");
         assert!(
-            !msg.contains(&from_key2.to_string()),
-            "open refuse must not print key-file bytes: {msg}"
+            !msg.contains(&anchor_id.to_string())
+                && !msg.contains(&from_key2.to_string())
+                && !chain.contains(&anchor_id.to_string())
+                && !chain.contains(&from_key2.to_string()),
+            "open refuse leaked key bytes: {msg} / {chain}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

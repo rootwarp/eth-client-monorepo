@@ -159,7 +159,7 @@ fn persist_anchor_node_id(engine: &Engine, node_id: Root) -> anyhow::Result<()> 
     {
         anyhow::bail!(
             "I-node-id (crates/store/src/invariants.rs): refuse persist overwrite \
-             of stored node_id {stored}"
+             of stored node_id <redacted>"
         );
     }
     if let Some(anchor) = &existing_anchor
@@ -168,8 +168,7 @@ fn persist_anchor_node_id(engine: &Engine, node_id: Root) -> anyhow::Result<()> 
     {
         anyhow::bail!(
             "I-node-id (crates/store/src/invariants.rs): refuse persist overwrite \
-             of stored AnchorInfo.node_id {}",
-            anchor.node_id
+             of stored AnchorInfo.node_id <redacted>"
         );
     }
     let mut batch = engine.batch();

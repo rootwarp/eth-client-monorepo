@@ -15,6 +15,7 @@
 //! Naming the list in source stops the digest from silently widening to a
 //! runtime knob and refusing every restart.
 
+use std::fmt;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -291,7 +292,9 @@ fn root_hex(r: &Root) -> String {
 // ---------------------------------------------------------------------------
 
 /// Options for [`Store::open`].
-#[derive(Clone, Debug)]
+///
+/// [`Debug`] is hand-written: `expected_node_id` is the raw node key.
+#[derive(Clone)]
 pub struct StoreOpenOptions {
     /// Engine durability / open knobs.
     pub engine: EngineOptions,
@@ -307,6 +310,23 @@ pub struct StoreOpenOptions {
     pub max_open_scan_rows: u64,
     /// Optional invocation counter for tests (CC-4H /2). Production leaves `None`.
     pub invocation_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl fmt::Debug for StoreOpenOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoreOpenOptions")
+            .field("engine", &self.engine)
+            .field("config_digest", &self.config_digest)
+            .field("check_invariants", &self.check_invariants)
+            .field(
+                "expected_node_id",
+                &self.expected_node_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("snapshot_ring", &self.snapshot_ring)
+            .field("max_open_scan_rows", &self.max_open_scan_rows)
+            .field("invocation_counter", &self.invocation_counter)
+            .finish()
+    }
 }
 
 impl StoreOpenOptions {

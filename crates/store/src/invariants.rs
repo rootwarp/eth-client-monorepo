@@ -22,6 +22,7 @@
 //! [`InvariantContext::max_open_scan_rows`] (named default
 //! [`DEFAULT_MAX_OPEN_SCAN_ROWS`]). The budget is **per check**, not shared.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -149,7 +150,9 @@ pub enum InvariantCheckMode {
 }
 
 /// External inputs the structural checks cannot derive from the engine alone.
-#[derive(Debug, Clone)]
+///
+/// [`Debug`] is hand-written: `expected_node_id` is the raw node key.
+#[derive(Clone)]
 pub struct InvariantContext {
     /// Node id derived from the node key file (`p2p.node_key_path`).
     ///
@@ -199,6 +202,20 @@ impl InvariantContext {
     pub fn with_max_open_scan_rows(mut self, max_open_scan_rows: u64) -> Self {
         self.max_open_scan_rows = max_open_scan_rows;
         self
+    }
+}
+
+impl fmt::Debug for InvariantContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InvariantContext")
+            .field(
+                "expected_node_id",
+                &self.expected_node_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("snapshot_ring", &self.snapshot_ring)
+            .field("max_open_scan_rows", &self.max_open_scan_rows)
+            .field("invocation_counter", &self.invocation_counter)
+            .finish()
     }
 }
 
@@ -890,7 +907,7 @@ fn check_node_id(
     if &found != expected {
         return Ok(Some(InvariantViolation {
             invariant: StoreInvariant::NodeId,
-            detail: format!("stored node_id {found} does not match the configured node key"),
+            detail: "stored node_id <redacted> does not match the configured node key".to_owned(),
         }));
     }
     Ok(None)
@@ -1521,8 +1538,8 @@ mod tests {
     fn violates_only_node_id() {
         let f = Fixture::new("node-id");
         // Simulate a real key-file id: write a 32-byte secret and treat its bytes as
-        // the expected NodeId surface the storage process would pass after derivation.
-        // The mismatch names stored AnchorInfo.node_id, not the key-file bytes.
+        // the expected id the storage process compares. Neither side is printed:
+        // the stored row is itself key material.
         let key_path = f.dir.join("node_key");
         let key_bytes = [0xBBu8; 32];
         std::fs::write(&key_path, key_bytes).unwrap();
@@ -1536,6 +1553,11 @@ mod tests {
             max_open_scan_rows: DEFAULT_MAX_OPEN_SCAN_ROWS,
             invocation_counter: None,
         };
+        let ctx_dbg = format!("{ctx:?}");
+        assert!(
+            ctx_dbg.contains("<redacted>") && !ctx_dbg.contains(&from_key.to_string()),
+            "InvariantContext Debug leaked the key: {ctx_dbg}"
+        );
         let sink = CountingSink::new();
         let n =
             check_invariants(f.engine(), InvariantCheckMode::PostPass, &ctx, Some(&sink)).unwrap();
@@ -1543,16 +1565,17 @@ mod tests {
         assert_eq!(sink.count(StoreInvariant::NodeId), 1);
         let detail = &sink.violations()[0].detail;
         assert!(
-            detail.contains(&f.node_id.to_string()),
-            "detail must name stored AnchorInfo.node_id: {detail}"
+            detail.contains("node_id"),
+            "detail must keep the literal node_id: {detail}"
         );
         assert!(
-            !detail.contains(&from_key.to_string()),
-            "detail must not print key-file bytes: {detail}"
+            !detail.contains(&f.node_id.to_string()) && !detail.contains(&from_key.to_string()),
+            "detail must not print stored or key-file bytes: {detail}"
         );
-        // Fatal open path names both as well.
+        // Fatal open path: Display and Debug of the error both stay redacted.
         let err = check_invariants(f.engine(), InvariantCheckMode::Open, &ctx, None).unwrap_err();
         let msg = err.to_string();
+        let dbg = format!("{err:?}");
         assert!(
             matches!(
                 err,
@@ -1561,15 +1584,18 @@ mod tests {
                     ..
                 }
             ),
-            "err={err:?}"
+            "err={dbg}"
         );
         assert!(
-            msg.contains(&f.node_id.to_string()),
-            "fatal must name stored AnchorInfo.node_id: {msg}"
+            msg.contains("node_id") && dbg.contains("node_id"),
+            "fatal must keep the literal node_id: {msg} / {dbg}"
         );
         assert!(
-            !msg.contains(&from_key.to_string()),
-            "fatal must not print key-file bytes: {msg}"
+            !msg.contains(&f.node_id.to_string())
+                && !msg.contains(&from_key.to_string())
+                && !dbg.contains(&f.node_id.to_string())
+                && !dbg.contains(&from_key.to_string()),
+            "fatal Display/Debug leaked key bytes: {msg} / {dbg}"
         );
         // Key file exists for the durable-surface criterion.
         assert_eq!(std::fs::read(&key_path).unwrap(), key_bytes);

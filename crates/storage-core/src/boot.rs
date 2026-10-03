@@ -1123,8 +1123,8 @@ mod config_tests {
     }
 
     /// CC-45a / §1.7: production `open_store` wires `expected_node_id` from
-    /// `node_key_path` so I-node-id runs at start. Mismatched key refuses open
-    /// and the error names both AnchorInfo.node_id and the key-derived id.
+    /// `node_key_path` so I-node-id runs at start. Mismatched key refuses open.
+    /// The literal `node_id` stays; neither byte string is printed.
     #[test]
     fn open_store_mismatched_node_key_refuses() {
         use cc_store::engine::{Durability, EngineOptions};
@@ -1209,13 +1209,17 @@ mod config_tests {
             msg.contains("node_id") || msg.contains("I-node-id") || msg.contains("invariant"),
             "error must name I-node-id: {msg}"
         );
+        let chain = format!("{err:#}");
         assert!(
-            msg.contains(&anchor_id.to_string()),
-            "error must name stored AnchorInfo.node_id: {msg}"
+            chain.contains("node_id"),
+            "error chain must keep the literal node_id: {chain}"
         );
         assert!(
-            !msg.contains(&key_id.to_string()),
-            "error must not print key-file bytes: {msg}"
+            !msg.contains(&anchor_id.to_string())
+                && !msg.contains(&key_id.to_string())
+                && !chain.contains(&anchor_id.to_string())
+                && !chain.contains(&key_id.to_string()),
+            "error chain must not print stored or key-file bytes: {chain}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -3,6 +3,7 @@
 //! `bin/beacon-core` calls [`open`] **before** any subsystem starts. Fail-closed
 //! gates (schema / digest / `I-node-id`) are unchanged from the storage host.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,7 +21,10 @@ use crate::resume::{self, ResumeError};
 use crate::writer::{WriterBounds, WriterFaults, WriterHandle, spawn_writer};
 
 /// Options for [`open`]. Fail-closed gates match the storage host.
-#[derive(Debug, Clone)]
+///
+/// [`Debug`] is hand-written. This struct holds the key path, not the key
+/// bytes; `expected_node_id` lives on [`OpenedStore`] and is redacted there.
+#[derive(Clone)]
 pub struct OpenOpts {
     /// Engine durability token (`immediate` | `paranoid`).
     pub durability: String,
@@ -34,6 +38,19 @@ pub struct OpenOpts {
     pub genesis_validators_root: Option<String>,
     /// Path to the 32-byte p2p node key (`I-node-id`).
     pub node_key_path: Option<PathBuf>,
+}
+
+impl fmt::Debug for OpenOpts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenOpts")
+            .field("durability", &self.durability)
+            .field("check_invariants", &self.check_invariants)
+            .field("snapshot_ring", &self.snapshot_ring)
+            .field("max_open_scan_rows", &self.max_open_scan_rows)
+            .field("genesis_validators_root", &self.genesis_validators_root)
+            .field("node_key_path", &self.node_key_path)
+            .finish()
+    }
 }
 
 impl Default for OpenOpts {
@@ -50,13 +67,29 @@ impl Default for OpenOpts {
 }
 
 /// One opened redb handle. The composer starts subsystems only after this exists.
-#[derive(Debug)]
+///
+/// [`Debug`] is hand-written: `expected_node_id` is the raw node key.
 pub struct OpenedStore {
     store: Store,
     node_key_path: Option<PathBuf>,
     snapshot_ring: u64,
     max_open_scan_rows: u64,
     expected_node_id: Option<Root>,
+}
+
+impl fmt::Debug for OpenedStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenedStore")
+            .field("store", &self.store)
+            .field("node_key_path", &self.node_key_path)
+            .field("snapshot_ring", &self.snapshot_ring)
+            .field("max_open_scan_rows", &self.max_open_scan_rows)
+            .field(
+                "expected_node_id",
+                &self.expected_node_id.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl OpenedStore {
@@ -120,7 +153,7 @@ impl OpenedStore {
         {
             anyhow::bail!(
                 "I-node-id (crates/store/src/invariants.rs): refuse persist overwrite \
-                 of stored node_id {stored}"
+                 of stored node_id <redacted>"
             );
         }
         if let Some(anchor) = &existing_anchor
@@ -129,8 +162,7 @@ impl OpenedStore {
         {
             anyhow::bail!(
                 "I-node-id (crates/store/src/invariants.rs): refuse persist overwrite \
-                 of stored AnchorInfo.node_id {}",
-                anchor.node_id
+                 of stored AnchorInfo.node_id <redacted>"
             );
         }
         let mut batch = engine.batch();
@@ -548,5 +580,211 @@ mod tests {
             "second identity must fail I-node-id, got: {msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 32 consecutive hex digits (a Root / secp256k1 secret), with or without `0x`.
+    fn contains_32_byte_hex(text: &str) -> bool {
+        let mut run = 0u32;
+        for b in text.bytes() {
+            if b.is_ascii_hexdigit() {
+                run += 1;
+                if run >= 64 {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
+    }
+
+    /// Secret-bearing `meta.node_id` is still compared on open. `{e:#}` walks the
+    /// anyhow chain, so a wrapper around the production error must not hide bytes
+    /// that were interpolated into a cause.
+    #[test]
+    fn secret_bearing_node_id_mismatch_chain_redacts_key_bytes() {
+        use anyhow::Context;
+
+        let dir = unique_temp_dir("s2r-node-id-redact");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_a = dir.join("node_key");
+        let secret_a = [0xAAu8; 32];
+        let secret_b = [0xBBu8; 32];
+        let stored = Root::from_array(secret_a);
+        let configured = Root::from_array(secret_b);
+        std::fs::write(&key_a, secret_a).unwrap();
+
+        let opened = open(&dir, test_opts(Some(key_a))).expect("first open");
+        opened
+            .persist_anchor_node_id(stored)
+            .expect("stamp secret-bearing meta.node_id");
+        let persist_err = opened
+            .persist_anchor_node_id(configured)
+            .expect_err("persist must refuse a different secret-bearing node_id");
+        let persist_chain = format!("{persist_err:#}");
+        assert!(
+            persist_chain.contains("node_id"),
+            "persist mismatch must keep the literal node_id: {persist_chain}"
+        );
+        assert!(
+            !contains_32_byte_hex(&persist_chain),
+            "persist chain leaked key bytes: {persist_chain}"
+        );
+        drop(opened);
+
+        let key_b = dir.join("node_key_b");
+        std::fs::write(&key_b, secret_b).unwrap();
+        let err = open(&dir, test_opts(Some(key_b)))
+            .expect_err("existing secret-bearing meta.node_id must refuse, not be ignored");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("node_id"),
+            "open mismatch must keep the literal node_id: {chain}"
+        );
+        assert!(
+            !contains_32_byte_hex(&chain),
+            "open chain leaked key bytes: {chain}"
+        );
+        assert!(
+            !chain.contains(&stored.to_string()) && !chain.contains(&configured.to_string()),
+            "open chain named a node-id root: {chain}"
+        );
+
+        let wrapped = Err::<(), _>(err)
+            .context("outer wrapper")
+            .expect_err("wrapper keeps the cause");
+        let wrapped_chain = format!("{wrapped:#}");
+        assert!(
+            wrapped_chain.contains("outer wrapper") && wrapped_chain.contains("node_id"),
+            "formatted chain must include the cause, not only the wrapper: {wrapped_chain}"
+        );
+        assert!(
+            !contains_32_byte_hex(&wrapped_chain),
+            "wrapper chain leaked key bytes: {wrapped_chain}"
+        );
+    }
+
+    /// `AnchorInfo.node_id` is the same secret-bearing surface when `meta.node_id`
+    /// is absent. Persist refusal must still name `node_id` and omit the bytes.
+    #[test]
+    fn persist_anchor_info_node_id_mismatch_redacts_bytes() {
+        use cc_store::Slot;
+        use cc_store::SszEncode;
+        use cc_store::meta::{AnchorInfo, KEY_ANCHOR_INFO, TABLE_META};
+
+        let dir = unique_temp_dir("s2r-anchor-node-id-redact");
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = open(&dir, test_opts(None)).expect("open");
+        let stored = Root::from_array([0xDDu8; 32]);
+        let anchor = AnchorInfo {
+            anchor_slot: Slot::new(1),
+            anchor_root: Root::from_array([1; 32]),
+            anchor_state_root: Root::from_array([2; 32]),
+            node_id: stored,
+            oldest_block_slot: Slot::new(1),
+            oldest_block_parent: Root::from_array([3; 32]),
+        };
+        let engine = opened.engine();
+        let mut batch = engine.batch();
+        batch.put(
+            TABLE_META,
+            KEY_ANCHOR_INFO.as_bytes(),
+            &anchor.as_ssz_bytes(),
+        );
+        engine.commit(batch).unwrap();
+
+        let err = opened
+            .persist_anchor_node_id(Root::from_array([0xEEu8; 32]))
+            .expect_err("AnchorInfo.node_id mismatch must refuse");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("AnchorInfo.node_id"),
+            "literal node_id must survive: {chain}"
+        );
+        assert!(
+            !contains_32_byte_hex(&chain) && !chain.contains(&stored.to_string()),
+            "persist chain leaked AnchorInfo.node_id bytes: {chain}"
+        );
+    }
+
+    /// `{:?}` of every type that can carry `expected_node_id` prints `<redacted>`,
+    /// not the 32 key bytes. `OpenOpts` has no such field; its hand-written
+    /// `Debug` must still not grow a hex dump of a key path's contents.
+    #[test]
+    fn debug_redacts_expected_node_id() {
+        use crate::durable_set::DurableSetContext;
+        use cc_store::{InvariantContext, StoreOpenOptions};
+
+        let dir = unique_temp_dir("s2r-node-id-debug");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("node_key");
+        let secret = [0xCCu8; 32];
+        let root = Root::from_array(secret);
+        std::fs::write(&key, secret).unwrap();
+        let opts = test_opts(Some(key.clone()));
+        let opened = open(&dir, opts.clone()).expect("open");
+
+        let opened_dbg = format!("{opened:?}");
+        assert!(
+            opened_dbg.contains("<redacted>"),
+            "OpenedStore Debug must redact expected_node_id: {opened_dbg}"
+        );
+        assert!(
+            !opened_dbg.contains(&root.to_string()) && !contains_32_byte_hex(&opened_dbg),
+            "OpenedStore Debug leaked key bytes: {opened_dbg}"
+        );
+
+        let ctx = InvariantContext {
+            expected_node_id: Some(root),
+            ..InvariantContext::new()
+        };
+        let ctx_dbg = format!("{ctx:?}");
+        assert!(
+            ctx_dbg.contains("expected_node_id") && ctx_dbg.contains("<redacted>"),
+            "InvariantContext Debug must keep the field name and redact: {ctx_dbg}"
+        );
+        assert!(
+            !ctx_dbg.contains(&root.to_string()),
+            "InvariantContext Debug leaked key bytes: {ctx_dbg}"
+        );
+
+        let durable = DurableSetContext {
+            expected_node_id: Some(root),
+            node_key_path: Some(key.clone()),
+            ..DurableSetContext::new()
+        };
+        let durable_dbg = format!("{durable:?}");
+        assert!(
+            durable_dbg.contains("expected_node_id") && durable_dbg.contains("<redacted>"),
+            "DurableSetContext Debug must redact: {durable_dbg}"
+        );
+        assert!(
+            !durable_dbg.contains(&root.to_string()),
+            "DurableSetContext Debug leaked key bytes: {durable_dbg}"
+        );
+
+        let opts_dbg = format!("{opts:?}");
+        assert!(
+            opts_dbg.contains("OpenOpts") && opts_dbg.contains("node_key_path"),
+            "OpenOpts Debug must stay hand-written and name the path: {opts_dbg}"
+        );
+        assert!(
+            !opts_dbg.contains(&root.to_string()) && !contains_32_byte_hex(&opts_dbg),
+            "OpenOpts Debug leaked key bytes: {opts_dbg}"
+        );
+
+        let store_opts = StoreOpenOptions::from_config(
+            cc_store::engine::EngineOptions::default(),
+            &cc_store::ConfigDigestInput::with_mainnet_scalars(digest_chain_config(), Root::ZERO),
+        )
+        .unwrap()
+        .with_expected_node_id(Some(root));
+        let store_dbg = format!("{store_opts:?}");
+        assert!(
+            store_dbg.contains("<redacted>") && !store_dbg.contains(&root.to_string()),
+            "StoreOpenOptions Debug leaked expected_node_id: {store_dbg}"
+        );
+
+        drop(opened);
     }
 }
