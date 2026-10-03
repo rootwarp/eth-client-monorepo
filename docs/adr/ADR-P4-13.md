@@ -23,6 +23,18 @@ values ever match, the stored field **is** that secret; printing
 (`invariants.rs:696-703`; `main.rs:1285-1292`). That is not a redaction
 of the pairing value.
 
+> **Dated note (2026-10-04).** Struck: the citation of
+> `services/storage/src/main.rs:1285-1292` (and `main.rs:443` in the
+> same paragraph) as a `node_id` site. Confirmed by grep on this date:
+> `services/storage/src` does not reference `node_id`.
+> `services/storage/src/main.rs` is a 9-line shim over
+> `cc_storage_core::run()` and does not name `node_id`. The mismatch
+> display in `crates/store/src/invariants.rs` is the literal
+> `<redacted>` (**P1-G/1**); it does not print the stored value.
+> On-disk `meta.node_id` is still the raw key until **S2R-J-07**.
+> Superseded by **P1-G/2 / S2R-J-07**. The sentences above are the
+> original text.
+
 That compare is **not** a discv5 `NodeId` and is **not**
 `get_custody_groups(node_id, cgc)`. `docs/running.md:563-569` tells the
 custody-group story; the opener does not call that function and does not
@@ -37,6 +49,20 @@ the row is already on disk and disagrees, or when the path is set, the
 file is missing, and the row is present. `expected_node_id: None` skips
 the invariant (`invariants.rs:128-131`) — bootstrap, offline tools, and
 tests, not a configured production open of a populated store.
+
+> **Dated note (2026-10-04).** Struck: "No production path writes
+> `AnchorInfo.node_id` today." False since the beacon-core boot path.
+> `run` calls `open_and_stamp`, which calls `persist_anchor_node_id`
+> (`bin/beacon-core/src/boot.rs`; `crates/storage-core/src/open.rs`).
+> That writes `meta.node_id` and, when an `AnchorInfo` row is already
+> present, updates `AnchorInfo.node_id`. It does not create a missing
+> `AnchorInfo`. The same claim remains, unedited, in Decision ("Do not
+> claim a production writer of `AnchorInfo.node_id` until one exists")
+> and in Consequences ("Until a production writer lands"); both are
+> struck by this note. Pairs with **P1-G/1**: that writer still stores
+> the raw key in `meta.node_id` until **S2R-J-07**, and the mismatch
+> display is the literal `<redacted>`, not the key bytes. Superseded
+> by **P1-G/2 / S2R-J-07**. The paragraph above is the original text.
 
 ## Decision
 

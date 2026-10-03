@@ -130,6 +130,20 @@ What the **composed processes** do:
 | compose `storage` | Spawns the writer. Builds `ArchiveWriter` and **drops** it. No `SubscribeEvents` consumer. |
 | compose `chain` | `archive: None`. Columns fail-close. |
 
+> **Dated note (2026-10-04).** Struck: the `cc-beacon-core` cell
+> "Does **not** construct `ArchiveWriter`." False since `d3d7f60`.
+> Confirmed on the current boot path: `bin/beacon-core/src/boot.rs`
+> `run` calls `cc_storage_core::start_writer`, and
+> `start_writer_on_engine` builds `ArchiveWriter::new`
+> (`crates/storage-core/src/open.rs`). `run` then installs
+> `storage.archive()` as `CoreConfig.archive`. The other clause of
+> that cell still stands: this host does **not** call
+> `P2pStreamDeps::with_archive`. The sentence below that a leftover
+> cursor stays frozen unless some other P0 submitter writes it assumed
+> beacon-core was not such a submitter; a block ingest through the
+> injected handle can restamp `WriteCursor`. Superseded by that boot
+> path (`d3d7f60`). The table above is the original text.
+
 So leftover `write_cursor` on disk is **frozen** unless some other P0
 submitter writes it. Production replay / prune / migrate in this tree
 do not call `ArchiveWrite`. Leftover `CommitUnit` comments still say
@@ -381,6 +395,16 @@ This file does not record a re-sync duration. None was measured here.
 | This HEAD writes batch-seq into `WriteCursor.seq` | **no** |
 | `commit_max_latency_ms` is a live flush bound | **no** — leftover toml key |
 | Clean shutdown optional | **no** — lock + undrained mailbox |
+
+> **Dated note (2026-10-04).** Struck, for `cc-beacon-core` block
+> ingest: the parenthetical on "Composed ingest restamps
+> `WriteCursor`" that "`ArchiveWriter` restamp is unused by these
+> hosts." False for that host since `d3d7f60`. `run` calls
+> `start_writer`, `start_writer_on_engine` builds `ArchiveWriter::new`,
+> and `block_unit` commits a new `WriteCursor`
+> (`bin/beacon-core/src/boot.rs`; `crates/storage-core/src/open.rs`;
+> `crates/storage-core/src/archive_write.rs`). The row above is the
+> original wording.
 
 ---
 
