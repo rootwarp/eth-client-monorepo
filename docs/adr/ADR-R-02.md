@@ -1,6 +1,6 @@
 # ADR-R-02 — `beacon-core` owns redb; the event bus is not a data plane
 
-- **Status:** accepted · superseded-by: — · **Date:** 2026-08-16
+- **Status:** accepted · `IngestBlock` / `update_canonical` half superseded-by: ADR-R-08 · backpressure consequence amended-by: ADR-R-08 · **Date:** 2026-08-16
 - **Phase:** refactor (archive ownership at S2; `bin/beacon-core` lands at `S2-J-01`)
 - **Issues:** S2-A-07, S2-A-04, S2-A-05, S2-A-06, S2-A-09, S2-J-01, S2-J-02
 - **Citations:** `plan/architecture.md` §4.2 / §4.3 / §9.2 / §10.5; `plan/prd.md` R-1; `plan/project-plan.md` R-1 / R-17; `plan/issues/s2-fold-storage.md` S2-A-07; `crates/seam/src/lib.rs:298-322`; `crates/chain-core/src/p2p_stream.rs`; `crates/chain-core/src/events/fanout.rs`; `docs/adr/ADR-R-01.md`; `docs/adr/ADR-P2-11.md`; `docs/adr/ADR-P4-03.md`; `docs/adr/ADR-P4-04.md`; `docs/adr/ADR-P4-07.md`; `docs/adr/ADR-07.md`
@@ -101,7 +101,9 @@ What this makes easy:
 What this makes hard:
 
 - Import stalls when the writer mailbox is full. That is intended
-  (`ADR-P4-04`: a slow P0 consumer blocks slot commits).
+  (`ADR-P4-04`: a slow P0 consumer blocks slot commits). Past the commit
+  deadline the stall is a fail-closed abort; that amendment is ADR-R-08
+  (aborting is not backpressure), not a silent edit of this trade.
 - Anyone who wants Policy B on the archive path — drop the ingest and
   reconnect with a cursor — has to contradict this file, not restore a
   `SubscribeEvents` subscriber.
@@ -165,3 +167,23 @@ the write-behind data plane; `S2-J-02` deletes `RestoreFromStore`.
 | S2-J-01 | `bin/beacon-core` opens redb before any subsystem. Decision is this file. |
 | S2-J-02 | Delete `RestoreFromStore` / `restore.rs`. `ADR-P4-07` citations go with the code. |
 | S3 | `ADR-07` is revisited for E1 transport. This file is not that revisit. |
+
+## Amendment — durable-import contract (ADR-R-08, 2026-10-04)
+
+**Superseded half.** The block-ingest contract is no longer `IngestBlock`,
+and canonical rewrite is no longer a caller-settable `update_canonical`
+flag. ADR-R-08
+replaces that half with `commit_anchor`, `commit_import`, `set_head`, and
+`commit_snapshot`. `IngestBlock` / `ingest_block` keep compiling until their
+last caller is removed; they are not this contract, and they are not widened.
+
+**What stays this record.** Column ingest (`ingest_columns`), Policy A on
+that path, one process opening redb, the event bus not being a data plane,
+Policy B on external fan-out, and the refusal to rewrite column-admit or
+publish drop.
+
+**Backpressure consequence, amended.** A slow archive still applies
+backpressure and blocks import (Policy A). Past the commit deadline of
+2 slots the outcome is a fail-closed abort with a named reason. Aborting
+is not backpressure. The deadline and its conformance case cite ADR-R-08;
+they do not re-decide this paragraph. Policy A is not a new §2.2 row.

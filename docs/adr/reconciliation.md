@@ -145,3 +145,12 @@ stalls import; not an Ignore ACK). `beacon-core` owning redb and the
 event bus ceasing to be a data plane are part of the record. Supersedes
 `ADR-P2-11` / `ADR-P4-07` / `ADR-P4-03`. Does not fully supersede
 `ADR-07` (S3 transport re-decision remains). Not a census row.
+ADR-R-08 supersedes the `IngestBlock` / `update_canonical` half and amends
+the backpressure consequence (aborting is not backpressure).
+
+S2R lands [`ADR-R-08.md`](ADR-R-08.md) — Status: accepted. Four seam
+operations (`commit_anchor`, `commit_import`, `set_head`,
+`commit_snapshot`); canonical rewrite only on head change;
+`commit_snapshot` is P2 bound 256 drop-newest with a completion-marker
+exemption. Amends ADR-P4-06's scalar cadence (per-import, not
+per-finalization). Not a census row.

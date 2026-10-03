@@ -7,8 +7,10 @@
 - **Provenance:** new — records the R-1 discharge order; types landed at `S1-A-07`
 
 This is **ADR-R-01**. It records the order that discharges [PRD] R-1: **types
-land, transport later.** It does **not** change any `[ARCH]` §2.2 overflow
-row. A change to a row is its own ADR (`ADR-R-02` at S2 is the first). The
+land, transport later.** It does **not** change policies A–D. A change to a
+row is its own ADR (`ADR-R-02` at S2 is the first of those). ADR-R-08 later
+adds the `commit_snapshot` row in the table below: an exemption on the
+existing P2 class, not a fifth policy and not a revision of A–D. The
 column ring is **not** a §2.2 A–D row; this file freezes the landed stall
 contract, it does not invent Policy A on that path.
 
@@ -59,8 +61,11 @@ is **not** one of those four: it stalls, it does not return `Backpressure`.
 | **B** — try_send, drop the *subscriber* | stream terminated `RESOURCE_EXHAUSTED`; consumer reconnects with cursor | unchanged for the API/observer bus; **N/A** for storage after S2 |
 | **C** — try_send, drop the *message*, log | `error!(...)` on residual `CMD_BOUND` (512), no caller signal | **This file owns Policy C.** Handle bound is `PUBLISH_BOUND` (256) → `Ok(Published::Dropped)`. Residual `CMD_BOUND` hop stays log-only; it is **not** this handle and is **not** deleted. |
 | **D** — try_send, drop *silently* | **none** | **deleted** — the tick has its own never-shed lane |
+| **`commit_snapshot`** — P2 bound 256, drop-newest, **exempt** (ADR-R-08) | no snapshot writer | drop-newest still drops the chunk; the drop is not a durable snapshot. The newest snapshot advances only when a completion marker commits in the final chunk's transaction. Not a fifth A–D policy and not a move to P1. |
 
-Any change to a §2.2 row is a spec change requiring its own ADR. Do not
+The `commit_snapshot` row was added by ADR-R-08 (2026-10-04). It does not
+collapse A–D. Any change to a §2.2 row is a spec change requiring its own
+ADR. Do not
 change an overflow policy in the same PR that moves a transport (`[ARCH]`
 §9.2). A new numeric literal in a moved file is a review-stopper: the diff
 must show the bound moving, not being re-derived.

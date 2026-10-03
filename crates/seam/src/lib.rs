@@ -4,6 +4,8 @@
 //! Methods mirror today's proto `oneof` arms (gossip / DA / column sidecar
 //! / publish / view) without taking `cc-proto` types. [`ArchiveWrite`] is
 //! the S2 archive ingest handle: a typed [`ColumnBatch`], not a proto arm.
+//! `commit_anchor`, `commit_import`, `set_head`, and `commit_snapshot` are
+//! signatures only (ADR-R-08). Their defaults do not write.
 //!
 //! [`InProcess`] is the Single Hull transport: its lanes **are** the live
 //! import / column / publish queues. Do not wrap them in front of the
@@ -61,6 +63,18 @@ pub enum SeamError {
 pub enum FailedPreconditionReason {
     /// Called before checkpoint bootstrap completed.
     NotBootstrapped,
+    /// `commit_anchor` on a store that is not `Uninitialized`.
+    StoreNotUninitialized,
+    /// Import or head change while the store is `Incomplete`.
+    StoreIncomplete,
+    /// `commit_import` whose parent body is not durable.
+    ParentNotDurable,
+    /// Store is `Complete` and the head root is not durable.
+    ///
+    /// `set_head`: `head_root` is not already durable. `commit_import`: `head`
+    /// names a root other than the body this transaction writes. A store that
+    /// is not `Complete` is [`Self::StoreIncomplete`], not this reason.
+    HeadNotDurable,
 }
 
 impl FailedPreconditionReason {
@@ -69,6 +83,10 @@ impl FailedPreconditionReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotBootstrapped => "NOT_BOOTSTRAPPED",
+            Self::StoreNotUninitialized => "STORE_NOT_UNINITIALIZED",
+            Self::StoreIncomplete => "STORE_INCOMPLETE",
+            Self::ParentNotDurable => "PARENT_NOT_DURABLE",
+            Self::HeadNotDurable => "HEAD_NOT_DURABLE",
         }
     }
 }
@@ -280,11 +298,16 @@ pub trait P2pEgress: Send + Sync + 'static {
 /// Signed-block ingest unit for the archive writer (S2-A-14).
 ///
 /// Same continuity bind as [`ColumnBatch`]: a batch may only extend the
-/// durable frontier. Genesis uses `parent_root == block_root` so the first
-/// row satisfies the bind.
+/// durable frontier. The old genesis rule (`parent_root == block_root`) is
+/// struck: genesis is an anchor ([`TrustedAnchor`]). Callers that still
+/// remap a zero parent have not moved off this type yet.
+///
+/// Removed in S2R-A-12, with the last caller. Replaced by [`DurableImport`]
+/// and [`ArchiveWrite::commit_import`], not widened. `import.rs` calls this
+/// until S2R-A-05; `import_durable.rs` until S2R-A-12. Do not add callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestBlock {
-    /// Parent the block attaches to (or the block's own root at genesis).
+    /// Parent the block attaches to.
     pub parent_root: Root,
     pub slot: u64,
     pub block_root: Root,
@@ -306,6 +329,81 @@ pub struct ColumnBatch {
     pub ssz: Bytes,
 }
 
+/// Data-availability verdict stored with a durable body.
+///
+/// No `None`: absent DA is not a legal durable state (ADR-R-08). `Deferred`
+/// is durable and replay re-parks the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DaVerdict {
+    Available,
+    Deferred,
+}
+
+/// Why the selected head changed. Canonical rows follow this, not a flag on
+/// the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HeadCause {
+    Import,
+    Attestation,
+    EngineInvalidation,
+}
+
+/// A change of selected head.
+///
+/// On `set_head`, a store that is not `Complete` is `STORE_INCOMPLETE`.
+/// `HEAD_NOT_DURABLE` applies only when it is `Complete` and `head_root` is
+/// not already durable. On `commit_import`, `head_root` must be the body
+/// that call writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadChange {
+    pub head_root: Root,
+    pub head_slot: u64,
+    pub cause: HeadCause,
+}
+
+/// One imported body. Canonical rewrite happens iff [`Self::head`] is
+/// `Some` and `head.head_root` equals [`Self::block_root`] — this
+/// transaction writes that body. Any other head root is `HEAD_NOT_DURABLE`.
+/// Do not treat the inserted body as already durable. There is no
+/// `update_canonical` field.
+///
+/// `ssz` is the opaque arrival bytes. `scalars` is fork-choice scalars SSZ,
+/// chain-owned and opaque to storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableImport {
+    pub block_root: Root,
+    pub parent_root: Root,
+    pub slot: u64,
+    pub state_root: Root,
+    pub ssz: Bytes,
+    pub da: DaVerdict,
+    pub scalars: Bytes,
+    pub head: Option<HeadChange>,
+}
+
+/// Anchor verified in chain-core. Storage writes opaque bytes and metadata.
+/// Legal only on an uninitialized store, once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedAnchor {
+    pub block_root: Root,
+    pub parent_root: Root,
+    pub slot: u64,
+    pub state_root: Root,
+    pub block_ssz: Bytes,
+    pub state_ssz: Bytes,
+    pub scalars: Bytes,
+    pub da: DaVerdict,
+}
+
+/// Epoch-boundary state snapshot. The ring entry is durable only when its
+/// completion marker commits; this signature does not write that marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub slot: u64,
+    pub state_root: Root,
+    pub state_ssz: Bytes,
+}
+
 /// chain-core → storage-core. Typed column ingest (E7 replacement, S2-A-04).
 ///
 /// `chain-core` holds `Arc<dyn ArchiveWrite>`. It MUST NOT name a storage
@@ -320,8 +418,10 @@ pub struct ColumnBatch {
 ///
 /// The receiving bound is the live P0 class: `WRITER_P0_BOUND = 32`, on
 /// full **block** (never drop). P1 is bound 64 / block. P2 is bound 256 /
-/// drop-newest. `ingest_columns` is P0. This handle does not introduce a
-/// second bound and MUST NOT re-derive those literals as a new mailbox.
+/// drop-newest. `ingest_columns` is P0. [`Self::commit_snapshot`] rides that
+/// same P2 class with the ADR-R-08 exemption: a dropped chunk is not a
+/// durable snapshot. This handle does not introduce a second bound and MUST
+/// NOT re-derive those literals as a new mailbox.
 ///
 /// A full P0 mailbox MUST return [`SeamError::Backpressure`]. It MUST NOT
 /// silently drop, MUST NOT terminate the caller (policy B), and MUST NOT
@@ -341,12 +441,17 @@ pub trait ArchiveWrite: Send + Sync + 'static {
     ///
     /// Default is a no-op so column-only test doubles stay valid. Production
     /// [`ArchiveWriter`] submits a `CommitUnit` (mailbox + one batch).
+    ///
+    /// Removed in S2R-A-12. Do not add callers; new work uses
+    /// [`Self::commit_import`].
     async fn ingest_block(&self, block: IngestBlock) -> Result<(), SeamError> {
         let _ = block;
         Ok(())
     }
 
     /// Sync ingest for the core OS thread (not a tokio worker).
+    ///
+    /// Removed in S2R-A-12, with [`Self::ingest_block`].
     fn ingest_block_blocking(&self, block: IngestBlock) -> Result<(), SeamError> {
         let _ = block;
         Ok(())
@@ -356,11 +461,78 @@ pub trait ArchiveWrite: Send + Sync + 'static {
     ///
     /// Default is `false` so test doubles still persist on a DUPLICATE retry
     /// (M2). Production [`ArchiveWriter`] returns the live body presence.
-    /// Import must not call [`Self::ingest_block`] with `update_canonical`
-    /// when this is `true` — that rewinds the durable tip (H3).
+    /// When this is `true`, the live writer must not set `update_canonical:
+    /// true` on the commit unit — that rewinds the durable tip (H3). The
+    /// seam has no `update_canonical` argument. [`Self::commit_import`]
+    /// carries `head: None` unless `head.head_root` is the body that call
+    /// writes.
     fn block_is_durable(&self, root: Root) -> Result<bool, SeamError> {
         let _ = root;
         Ok(false)
+    }
+
+    /// Signature only. The default performs no store write and does not
+    /// apply the precondition below.
+    ///
+    /// Legal when the store is `Uninitialized`, once. A second call is
+    /// [`FailedPreconditionReason::StoreNotUninitialized`]. This is the only
+    /// op that may write a body whose parent is not durable.
+    async fn commit_anchor(&self, anchor: TrustedAnchor) -> Result<(), SeamError> {
+        let _ = anchor;
+        Ok(())
+    }
+
+    /// Signature only. The default performs no store write and does not
+    /// apply the preconditions below.
+    ///
+    /// Legal when the store is `Complete`
+    /// ([`FailedPreconditionReason::StoreIncomplete`] otherwise) and
+    /// `parent_root` is durable
+    /// ([`FailedPreconditionReason::ParentNotDurable`] otherwise).
+    /// `head` is `None`, or `head.head_root` equals `block_root` because
+    /// this transaction writes that body. Any other head root is
+    /// [`FailedPreconditionReason::HeadNotDurable`], the same token as
+    /// [`Self::set_head`]. Do not apply "already durable" to the body this
+    /// call inserts. One transaction writes the body, reverse index,
+    /// `state_roots[slot]`, `da_status`, scalars, and the cursor. The
+    /// canonical table changes only when that head rule holds. There is no
+    /// `update_canonical` field.
+    async fn commit_import(&self, import: DurableImport) -> Result<(), SeamError> {
+        let _ = import;
+        Ok(())
+    }
+
+    /// Signature only. The default performs no store write and does not
+    /// apply the precondition below.
+    ///
+    /// [`FailedPreconditionReason::StoreIncomplete`] when the store is not
+    /// `Complete`. [`FailedPreconditionReason::HeadNotDurable`] only when
+    /// the store is `Complete` and `head.head_root` is not already durable.
+    /// Those are different reasons. Durability of that root is not relaxed,
+    /// and this call does not insert the body. Writes the canonical rewrite
+    /// from that root, scalars, and the cursor. `scalars` is fork-choice
+    /// scalars SSZ, opaque to storage.
+    async fn set_head(&self, head: HeadChange, scalars: Bytes) -> Result<(), SeamError> {
+        let _ = (head, scalars);
+        Ok(())
+    }
+
+    /// Signature only. The default performs no store write.
+    ///
+    /// Legal when the store is `Complete`. One call per epoch boundary.
+    ///
+    /// # Overflow contract
+    ///
+    /// Writer class **P2**, bound **256**, **drop-newest** (ADR-P4-04).
+    /// This handle does not re-derive that bound.
+    ///
+    /// **Exemption (ADR-R-08):** a dropped chunk is not a durable snapshot.
+    /// The ring entry becomes the newest snapshot only when a completion
+    /// marker lands in the final chunk's transaction. Drop-newest itself
+    /// is unchanged. This is not a move to P1 and not a fifth overflow policy.
+    async fn commit_snapshot(&self, snapshot: Snapshot) -> Result<(), SeamError> {
+        let _ = snapshot;
+        Ok(())
     }
 }
 
@@ -521,5 +693,162 @@ mod tests {
             }
         }
         assert_eq!(classify(ObjectKind::Block), 0);
+    }
+
+    fn da_name(verdict: DaVerdict) -> &'static str {
+        match verdict {
+            DaVerdict::Available => "available",
+            DaVerdict::Deferred => "deferred",
+        }
+    }
+
+    fn head_cause_name(cause: HeadCause) -> &'static str {
+        match cause {
+            HeadCause::Import => "import",
+            HeadCause::Attestation => "attestation",
+            HeadCause::EngineInvalidation => "engine_invalidation",
+        }
+    }
+
+    /// The durable-import surface is types and signatures. The default
+    /// methods return `Ok` and do not open a store.
+    #[tokio::test]
+    async fn durable_import_ops_are_signatures_only() {
+        let block_root = [1u8; 32];
+        let parent_root = [2u8; 32];
+        let state_root = [3u8; 32];
+        let scalars = Bytes::from_static(b"scalars");
+        let head = HeadChange {
+            head_root: block_root,
+            head_slot: 7,
+            cause: HeadCause::Import,
+        };
+        let import = DurableImport {
+            block_root,
+            parent_root,
+            slot: 7,
+            state_root,
+            ssz: Bytes::from_static(b"block"),
+            da: DaVerdict::Deferred,
+            scalars: scalars.clone(),
+            head: Some(head.clone()),
+        };
+        // Canonical rewrite is `head`, not a caller-settable flag.
+        let DurableImport {
+            block_root: got_block,
+            parent_root: got_parent,
+            slot,
+            state_root: got_state,
+            ssz: _,
+            da,
+            scalars: got_scalars,
+            head: got_head,
+        } = import.clone();
+        assert_eq!(got_block, block_root);
+        assert_eq!(got_parent, parent_root);
+        assert_ne!(got_parent, got_block);
+        assert_eq!(slot, 7);
+        assert_eq!(got_state, state_root);
+        assert_eq!(da_name(da), "deferred");
+        assert_eq!(got_scalars.as_ref(), b"scalars");
+        let HeadChange {
+            head_root: got_head_root,
+            head_slot,
+            cause,
+        } = got_head.expect("head-changing import carries HeadChange");
+        assert_eq!(got_head_root, block_root);
+        assert_eq!(head_slot, 7);
+        assert_eq!(head_cause_name(cause), "import");
+
+        let anchor = TrustedAnchor {
+            block_root,
+            parent_root,
+            slot: 7,
+            state_root,
+            block_ssz: Bytes::from_static(b"block"),
+            state_ssz: Bytes::from_static(b"state"),
+            scalars: scalars.clone(),
+            da: DaVerdict::Available,
+        };
+        let TrustedAnchor {
+            block_root: _,
+            parent_root: _,
+            slot: _,
+            state_root: _,
+            block_ssz: _,
+            state_ssz: _,
+            scalars: _,
+            da: anchor_da,
+        } = anchor.clone();
+        assert_eq!(da_name(anchor_da), "available");
+
+        let snapshot = Snapshot {
+            slot: 8,
+            state_root,
+            state_ssz: Bytes::from_static(b"state"),
+        };
+        let Snapshot {
+            slot: snap_slot,
+            state_root: _,
+            state_ssz: _,
+        } = snapshot.clone();
+        assert_eq!(snap_slot, 8);
+        assert_eq!(head_cause_name(HeadCause::Attestation), "attestation");
+        assert_eq!(
+            head_cause_name(HeadCause::EngineInvalidation),
+            "engine_invalidation"
+        );
+
+        let archive: Arc<dyn ArchiveWrite> = Arc::new(Unused);
+        archive
+            .commit_anchor(anchor)
+            .await
+            .expect("signature default does not write");
+        archive
+            .commit_import(import)
+            .await
+            .expect("signature default does not write");
+        archive
+            .set_head(
+                HeadChange {
+                    head_root: block_root,
+                    head_slot: 7,
+                    cause: HeadCause::Attestation,
+                },
+                scalars,
+            )
+            .await
+            .expect("signature default does not write");
+        archive
+            .commit_snapshot(snapshot)
+            .await
+            .expect("signature default does not write");
+
+        // Tokens, not a runtime check. The default bodies above still return
+        // `Ok(())`. A collapsed mapping (one token for two reasons) fails.
+        fn precondition_token(reason: FailedPreconditionReason) -> &'static str {
+            match reason {
+                FailedPreconditionReason::NotBootstrapped => "NOT_BOOTSTRAPPED",
+                FailedPreconditionReason::StoreNotUninitialized => "STORE_NOT_UNINITIALIZED",
+                FailedPreconditionReason::StoreIncomplete => "STORE_INCOMPLETE",
+                FailedPreconditionReason::ParentNotDurable => "PARENT_NOT_DURABLE",
+                FailedPreconditionReason::HeadNotDurable => "HEAD_NOT_DURABLE",
+            }
+        }
+        let reasons = [
+            FailedPreconditionReason::NotBootstrapped,
+            FailedPreconditionReason::StoreNotUninitialized,
+            FailedPreconditionReason::StoreIncomplete,
+            FailedPreconditionReason::ParentNotDurable,
+            FailedPreconditionReason::HeadNotDurable,
+        ];
+        for reason in reasons {
+            assert_eq!(reason.as_str(), precondition_token(reason));
+        }
+        assert_ne!(
+            FailedPreconditionReason::StoreIncomplete.as_str(),
+            FailedPreconditionReason::HeadNotDurable.as_str(),
+            "an incomplete store is not a non-durable head"
+        );
     }
 }

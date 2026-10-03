@@ -1,6 +1,6 @@
 # ADR-P4-06 — Persist fork-choice scalars (~300 B), not a vote table
 
-- **Status:** accepted · superseded-by: — · **Date:** 2026-08-16 (reconstructed)
+- **Status:** accepted · amended-by: ADR-R-08 (scalar cadence) · superseded-by: — · **Date:** 2026-08-16 (reconstructed)
 - **Phase:** 4
 - **Issues:** S1-B-10, CC-45b
 - **Citations:** 5 sites — `crates/store/src/meta.rs:167`; `docs/storage-schema.md:64`; `proto/eth/chain/v1/chain.proto:358,360,384`
@@ -23,8 +23,11 @@ justified / finalized / unrealized checkpoints, head root and slot
 (`crates/store/src/meta.rs:167-188`). Fixed SSZ layout ~240 B, ~300 B on
 the wire comment. Do **not** persist a vote table in Phase 4. Carry the
 same blob on `RestoreHeader.fork_choice_scalars_ssz`
-(`chain.proto:357-385`). Two named expiry triggers, so they are not
-rediscovered:
+(`chain.proto:357-385`). **Cadence, amended by ADR-R-08 (2026-10-04):**
+the blob is unchanged, and it is still not a vote table. It is written on
+every `commit_import` and every `set_head`, not only at finalization.
+`da_status` and `state_roots` ride every body with it. Two named expiry
+triggers, so they are not rediscovered:
 
 - **A.** Block-embedded attestations are not yet wired into
   `on_attestation(..., is_from_block = true)`. Steady-state votes still
@@ -71,3 +74,8 @@ a table nothing reconstructs from.
 **Survives; becomes the boot seed at S2** (`[ARCH]` §4.2).
 `RestoreFromStore` goes away; `seed_from_durable` still reads this row.
 Trigger B remains a Phase 5 entry condition, not a Phase 4 gap.
+
+**Cadence amended by ADR-R-08.** Per-finalization writes (the
+`FINALIZED_CHECKPOINT` tail) are not the contract. Every `commit_import`
+and every `set_head` carries scalars. The ~300 B blob and the refusal to
+persist a vote table are unchanged.

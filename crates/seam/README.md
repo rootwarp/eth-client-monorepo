@@ -4,12 +4,20 @@ Typed handles and overflow contracts for internal service edges
 (`[ARCH]` §2.1).
 
 - `ChainIngress` / `P2pEgress` — p2p ↔ core (E1+E2).
-- `ArchiveWrite` — chain-core → archive typed column ingest (S2-A-04).
+- `ArchiveWrite` — chain-core → archive typed column ingest (S2-A-04),
+  plus the durable-import signatures (ADR-R-08): `commit_anchor`,
+  `commit_import`, `set_head`, `commit_snapshot`. Those four default to a
+  no-op and do not write. `DaVerdict` is `Available` or `Deferred` — no
+  `None`. Canonical rewrite is `head` / `set_head`, not an
+  `update_canonical` field. `IngestBlock` / `ingest_block` remain until
+  S2R-A-12 and are not the contract.
   Payload is `ColumnBatch { parent_root, slot, block_root, index, ssz }`;
   **`index` is a field**. Head is `(parent_root, slot)`: a batch may only
   extend the durable frontier, never jump it. Overflow is policy **A**:
   the writer mailbox (ADR-P4-04) surfaces `SeamError::Backpressure` to
   the import path. Ingest is `S2-A-05` (`chain-core` → live P0 mailbox).
+  `commit_snapshot` rides P2 (bound 256, drop-newest) with the ADR-R-08
+  exemption: a dropped chunk is not a durable snapshot.
 - Event payload layouts (`BlockImportedPayload`, `HeadPayload`,
   `ChainReorgPayload`, `FinalizedCheckpointPayload`) — S2-A-08. Decode
   is fail-closed; consumers must not index event `payload` bytes.

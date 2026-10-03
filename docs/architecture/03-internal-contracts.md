@@ -330,7 +330,7 @@ default `grpc` feature (boot, serve) adds `cc-proto` and `cc-seam/ipc` back
 `scripts/check-crate-dag.sh` forbids a `cc-chain <-> cc-p2p` crate dependency; at HEAD they meet
 over the P2pStream wire contract (p2p uses `cc_seam::Ipc`; chain serves the proto stream itself).
 The seam types (`Root`, `ObjectKind`, `Reason`, `ChainView`, ...) belong to cc-seam, not proto or
-`cc-types` (`crates/seam/src/lib.rs:82-218`), as do the SubscribeEvents payload layouts
+`cc-types` (`crates/seam/src/lib.rs:100-236`), as do the SubscribeEvents payload layouts
 (`event_payloads.rs`: BLOCK_IMPORTED verdict byte + SSZ, HEAD 8 B, CHAIN_REORG 40 B,
 FINALIZED_CHECKPOINT >= 40 B; a short or unknown payload decodes to `None`).
 
@@ -338,12 +338,13 @@ FINALIZED_CHECKPOINT >= 40 B; a short or unknown payload decodes to `None`).
  +------------------------------------------------------------------------------------------+
  | cc-seam  (crates/seam; default feature "ipc" = cc-proto + tonic)                         |
  | SeamError: Backpressure{bound, waited_ms}, Unavailable, InvalidArgument,                 |
- |            FailedPrecondition{reason: NotBootstrapped}            (exactly 4 variants)   |
+ |            FailedPrecondition{reason} (5 reasons; wire: NOT_BOOTSTRAPPED)                |
  | trait ChainIngress   p2p -> chain-core           submit_gossip, notify_data_available,   |
  |                                                  submit_column_sidecar                   |
  | trait P2pEgress      chain-core -> p2p           publish -> Queued/Dropped; update_view  |
- | trait ArchiveWrite   chain-core -> storage-core  ingest_columns, ingest_block,           |
- |                                                  ingest_block_blocking, block_is_durable |
+ | trait ArchiveWrite   chain-core -> storage-core  ingest_*, block_is_durable,             |
+ |                                                  commit_anchor, commit_import, set_head, |
+ |                                                  commit_snapshot (signatures, no write)  |
  +------------------------------------------------------------------------------------------+
               |                              |                              |
  +---------------------------+  +----------------------------+  +---------------------------+
@@ -363,9 +364,9 @@ Vertical lines: trait implemented by; no data edge is drawn.
 
 | Trait (`lib.rs`) | Direction / edge | Methods | Production impl | Status at HEAD |
 |---|---|---|---|---|
-| `ChainIngress` (`:251`) | p2p -> chain-core, E1 + E2 | `submit_gossip -> VerdictResolution`, `notify_data_available(root, slot)`, `submit_column_sidecar` | `Ipc` (p2p) | A: IDLE (gossip) / DEAD-AS-WIRED (DA, column); B: ABSENT |
-| `P2pEgress` (`:275`) | chain-core -> p2p, E1 | `publish -> Published{Queued, Dropped}`, `update_view` (sync, infallible) | none: chain writes `ChainToP2p` directly in `p2p_stream.rs`; p2p holds its `IpcEgress` unused (`services/p2p/src/chain_stream/client.rs:239`) | DEAD-AS-WIRED (the `InProcess` impl is TEST-ONLY) |
-| `ArchiveWrite` (`:337`) | chain-core -> storage-core, N1 | `ingest_columns(ColumnBatch)`, plus `ingest_block` / `ingest_block_blocking` (default no-op `Ok(())`) and `block_is_durable` (default `Ok(false)`) | `ArchiveWriter` (`crates/storage-core/src/archive_write.rs:33-38,224-258`) | A: N1 ABSENT; the `ArchiveWriter` cc-storage builds is DEAD-AS-WIRED (dropped, `crates/storage-core/src/boot.rs:563`). B: IDLE (iff core; blocks), DEAD-AS-WIRED (columns) |
+| `ChainIngress` (`:269`) | p2p -> chain-core, E1 + E2 | `submit_gossip -> VerdictResolution`, `notify_data_available(root, slot)`, `submit_column_sidecar` | `Ipc` (p2p) | A: IDLE (gossip) / DEAD-AS-WIRED (DA, column); B: ABSENT |
+| `P2pEgress` (`:293`) | chain-core -> p2p, E1 | `publish -> Published{Queued, Dropped}`, `update_view` (sync, infallible) | none: chain writes `ChainToP2p` directly in `p2p_stream.rs`; p2p holds its `IpcEgress` unused (`services/p2p/src/chain_stream/client.rs:239`) | DEAD-AS-WIRED (the `InProcess` impl is TEST-ONLY) |
+| `ArchiveWrite` | chain-core -> storage-core, N1 | `ingest_columns(ColumnBatch)`, plus `ingest_block` / `ingest_block_blocking` (default no-op `Ok(())`, removed in S2R-A-12) and `block_is_durable` (default `Ok(false)`). `commit_anchor`, `commit_import`, `set_head`, `commit_snapshot` are signatures only (default `Ok(())`, no store write; [ADR-R-08](../adr/ADR-R-08.md)) | `ArchiveWriter` (`crates/storage-core/src/archive_write.rs:33-38,224-258`) implements the ingest methods only | A: N1 ABSENT; the `ArchiveWriter` cc-storage builds is DEAD-AS-WIRED (dropped, `crates/storage-core/src/boot.rs:563`). B: IDLE (iff core; blocks), DEAD-AS-WIRED (columns). The four commit ops have no storage impl |
 
 `ArchiveWriter` admits a batch only if its head `(parent_root, slot)` is durable or is the batch's
 first row, else `InvalidArgument` (`archive_write.rs:131-154`). The core thread persists after
@@ -378,20 +379,22 @@ production holds; `ChainIngressHandle` and `P2pEgressHandle` (`services/chain/sr
 
 ### 5.2 SeamError
 
-Exactly four variants (`lib.rs:42-57`); a unit test pins the count, and adding one needs an ADR.
+Exactly four variants (`lib.rs:44`); a unit test pins the count, and adding one needs an ADR.
 
 | Variant | Meaning | Produced from |
 |---|---|---|
 | `Backpressure { bound, waited_ms }` | the receiving queue stayed full for the whole send deadline | gRPC `RESOURCE_EXHAUSTED` (`map_tonic_status`, `ipc.rs:124-127`), Ipc's `(Ignore, Internal, Invalid)` verdict (`ipc.rs:899-914`), and local send/reply timeouts; chain-core maps it back to `RESOURCE_EXHAUSTED` (`import.rs:846-852`) |
 | `Unavailable(String)` | receiver gone, or shed inside Ipc | closed channels, shutdown, writer `ShutDown`, store errors, other gRPC codes |
 | `InvalidArgument(String)` | structurally rejected before any work | gRPC `INVALID_ARGUMENT`; column > 10 MiB; writer `Codec` / `Limit` errors; continuity-bind failure (`archive_write.rs:131-154`) |
-| `FailedPrecondition { reason }` | precondition unmet; `FailedPreconditionReason::NotBootstrapped` is the only reason | gRPC `FAILED_PRECONDITION` with `ErrorInfo.reason == NOT_BOOTSTRAPPED`; any other reason maps to `Unavailable` |
+| `FailedPrecondition { reason }` | precondition unmet. Reasons: `NOT_BOOTSTRAPPED`, `STORE_NOT_UNINITIALIZED`, `STORE_INCOMPLETE`, `PARENT_NOT_DURABLE`, `HEAD_NOT_DURABLE` ([ADR-R-08](../adr/ADR-R-08.md)) | gRPC `FAILED_PRECONDITION` with `ErrorInfo.reason == NOT_BOOTSTRAPPED`; any other reason maps to `Unavailable` |
 
 ### 5.3 Overflow policies A-D
 
 Policies A-C come from `plan/architecture.md` §2.2. There, D names the old silent `SlotTick` drop,
 which S0 deleted by giving ticks a never-shed scheduler lane (case 11, `slot_tick_is_never_shed`);
 this doc set uses **Policy D** for that replacement. Name the letter with its behaviour.
+`commit_snapshot` is an exemption on writer class P2 (bound 256, drop-newest), recorded by
+[ADR-R-08](../adr/ADR-R-08.md). It is not a fifth policy.
 
 | Policy | Behaviour | Where it lives at HEAD | Test |
 |---|---|---|---|
@@ -399,6 +402,7 @@ this doc set uses **Policy D** for that replacement. Name the letter with its be
 | **B**: terminate the slow consumer | `try_send`; when the queue is full, the subscriber's stream ends with `RESOURCE_EXHAUSTED` | SubscribeEvents subscriber mpsc(256) (`crates/chain-core/src/events/fanout.rs:81`, `events/mod.rs:98`) | `services/chain/tests/events.rs:243` |
 | **C**: drop and report | full queue -> `Ok(Published::Dropped)`, never an error | `P2pEgress::publish`; p2p's real publish path drops the oldest item at 256, and drops again when `cmd_tx` is full | conformance case 3 |
 | **D**: never shed | producer blocks rather than drop | scheduler tick lane (`TICK_LANE_DEPTH = 4`, `crates/scheduler/src/config.rs:71`) | case 11, `crates/chain-core/src/core.rs:2446` |
+| **`commit_snapshot`** (P2 exemption, [ADR-R-08](../adr/ADR-R-08.md)) | writer class P2, bound 256, drop-newest. A dropped chunk is not a durable snapshot: the newest snapshot advances only when a completion marker commits in the final chunk's transaction. Not a fifth A–D policy and not a move to P1. | signature on `ArchiveWrite::commit_snapshot`; no storage write yet | `cc-seam` `durable_import_ops_are_signatures_only` calls the signature only. It does not exercise drop-newest or the completion marker. |
 
 ### 5.4 Impls and capacities
 
@@ -463,15 +467,15 @@ defer the block rather than reject it; re-drive depends on an EL health transiti
 
 | # | Documented | Implemented at HEAD | Evidence |
 |---|---|---|---|
-| 1 | `ArchiveWrite` trait doc, seam README and [ADR-R-02](../adr/ADR-R-02.md): a full P0 mailbox MUST return `Backpressure` (Policy A) | `ArchiveWriter` uses `blocking_send` / `send().await` with no deadline, then waits for the commit. It never returns `Backpressure`, so chain-core's `Backpressure -> RESOURCE_EXHAUSTED` arm is unreachable. The trait doc itself says both "block" and "MUST return Backpressure" (`lib.rs:321-329`). [ADR-P4-04](../adr/ADR-P4-04.md) ("P0 bound 32 on full: block") matches the code. "The trait documents Backpressure; the implementation blocks without a deadline." | `crates/storage-core/src/writer.rs:187-196,261-281`; `archive_write.rs:99-108` |
+| 1 | `ArchiveWrite` trait doc, seam README and [ADR-R-02](../adr/ADR-R-02.md): a full P0 mailbox MUST return `Backpressure` (Policy A) | `ArchiveWriter` uses `blocking_send` / `send().await` with no deadline, then waits for the commit. It never returns `Backpressure`, so chain-core's `Backpressure -> RESOURCE_EXHAUSTED` arm is unreachable. The trait doc itself says both "block" and "MUST return Backpressure" (`lib.rs:419-429`). [ADR-P4-04](../adr/ADR-P4-04.md) ("P0 bound 32 on full: block") matches the code. "The trait documents Backpressure; the implementation blocks without a deadline." | `crates/storage-core/src/writer.rs:187-196,261-281`; `archive_write.rs:99-108` |
 | 2 | [ADR-R-01](../adr/ADR-R-01.md) and the trait doc: a column is admitted with `send().await` on the **events ring** and never gets `Backpressure` | `InProcess` uses its own mpsc(4096). Chain sends columns to `ArchiveWrite`, not to the ring. `Ipc::submit_column_sidecar` shares the gossip 2 s path and can return `Backpressure{1024}`. Latent: there is no caller. | `in_process.rs:84`; `p2p_stream.rs:640-725`; `ipc.rs:1177-1196` |
 | 3 | ADR-R-01 (`docs/adr/ADR-R-01.md:58`) and `plan/architecture.md` §2.2: Policy A is `Backpressure` after 2 s on `IMPORT_LANE_DEPTH` (64) | Ipc reports `bound: 1024` for local send and reply timeouts, and `bound: 64` only when chain reports overflow | `ipc.rs:146-159` |
 | 4 | `ChainIngress`: `Backpressure` means the receiver's queue is full | Chain maps every import `Status` other than `InvalidArgument`, and `InternalProposerSig` outcomes, to `(Ignore, Internal, Invalid)`, which Ipc turns into `Backpressure{64}`; likewise a P2pStream open refused at the 8-session cap (`ipc.rs:593-598`). "Some internal import failures surface to p2p as backpressure." | `p2p_stream.rs:850-880,1002-1009`; `ipc.rs:899-914` |
 | 5 | `notify_data_available`: overflow MUST be `Backpressure` and never swallowed as `Ok(())` | Ipc acks `Ok(())` once the message is written to the stream. An overflow of chain's scheduler import lane is only logged. | `ipc.rs:792-818`; `p2p_stream.rs:622-639` |
 | 6 | `p2p.proto` `Verdict`: "Exactly one Verdict per GossipObject" | After an early ACCEPT, chain can send a second verdict with the same correlation id: a late `(Reject, Invalid, Invalid)`, or a terminal verdict when the import returns `Err` | `p2p_stream.rs:795-846` |
 | 7 | `StreamHello`: `session_id` is "per-process"; `resume_seq` is the "last seq the client processed" | `session_id` is drawn per connect; `resume_seq` is always 0, and chain ignores both fields | `ipc.rs:603-612`; `p2p_stream.rs:600-618` |
-| 8 | `plan/architecture.md` §2.1 and §2.5 (chain takes `Arc<dyn P2pEgress>`) and §2.3 (E8 becomes a second `P2pEgress` method) | No production code holds a `P2pEgress`, and the trait has only `publish` / `update_view` | `lib.rs:274-278` |
-| 9 | cc-seam doc comments cite `services/chain/src/core.rs`, `services/chain/src/events/mod.rs` and `services/storage/src/writer.rs` | The first two now live under `crates/chain-core/src/`; the writer is `crates/storage-core/src/writer.rs` | `lib.rs:225,232,244,317`; `in_process.rs:27,30,33`; `ipc.rs:46,49`; `conformance.rs:23` |
+| 8 | `plan/architecture.md` §2.1 and §2.5 (chain takes `Arc<dyn P2pEgress>`) and §2.3 (E8 becomes a second `P2pEgress` method) | No production code holds a `P2pEgress`, and the trait has only `publish` / `update_view` | `lib.rs:292-296` |
+| 9 | cc-seam doc comments cite `services/chain/src/core.rs`, `services/chain/src/events/mod.rs` and `services/storage/src/writer.rs` | The first two now live under `crates/chain-core/src/`; the writer is `crates/storage-core/src/writer.rs` | `lib.rs:243,250,262,415`; `in_process.rs:27,30,33`; `ipc.rs:46,49`; `conformance.rs:23` |
 | 10 | Proto comments: GetCanonicalRoots is "used by storage on CURSOR_TOO_OLD gap fill" (`chain.proto:47-50`); the EngineStream "client lives in services/engine" (`p2p.proto:20-23`); FetchBlobs is the "chain block-branch fast-path trigger" (`engine.proto:25-27`); `EVENT_KIND_DATA_COLUMN` is a column relay (`chain.proto:125-126`) | None of these callers or producers exist; chain reaches the EL through DirectEngine | 78a90e1; 631994c |
 | 11 | [../contracts.md](../contracts.md): the ChainService table, an event ring of "1024 events", and the remodelling gate list | The table omits P2pStream, GetValidatorRecords and GetCanonicalRoots. The ring holds 4096 events / 64 MiB. The gate also rejects ExecutionPayload, ExecutionRequests and DataColumnSidecar. | `events/mod.rs:90,95`; `check-no-remodelling.sh:19` |
 | 12 | "The ninth contract" | The phrase names two things: EngineStream (`p2p.proto:12`) and the p2p <-> cc-storage surface (`storage.proto:9`). `docs/supply-chain.md:136-138` uses it for the EngineStream client, whose engine-side code is gone; only the generated `cc-proto` stub remains | 631994c |
