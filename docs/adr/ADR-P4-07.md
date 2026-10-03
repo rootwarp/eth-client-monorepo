@@ -1,6 +1,6 @@
 # ADR-P4-07 — Storage pushes RestoreFromStore over the existing storage→chain edge
 
-- **Status:** superseded-by ADR-R-02 · **Date:** 2026-08-16 (reconstructed)
+- **Status:** superseded-by ADR-R-02 · completed-by: ADR-R-09 · **Date:** 2026-08-16 (reconstructed)
 - **Phase:** 4
 - **Issues:** S1-B-17, CC-45b
 - **Citations:** deleted at S2-J-02 — `restore.rs`, `restore_client.rs`, and `RestoreFromStore` on `chain.proto` are gone. History record only.
@@ -90,3 +90,4 @@ question does not survive the process merge.
 |---|---|
 | S1 | This file. Code citations stay. |
 | S2 (`S2-J-02`) | Delete `restore.rs`, `restore_client.rs`, and the proto RPC. Citations go with the code. ADR-R-02 is the surviving boot record. |
+| S2R (ADR-R-09) | Completes the replacement this deletion left open. The trusted anchor is one shot on an uninitialized store, verified in chain, not a second `RestoreFromStore`. This record stays superseded-by ADR-R-02. |

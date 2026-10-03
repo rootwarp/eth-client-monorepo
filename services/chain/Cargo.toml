@@ -21,6 +21,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 cc-bootstrap = { workspace = true }
 # S2-A-01 / S2-A-02 / S2-A-03: library lives in cc-chain-core (append-only).
@@ -52,7 +53,6 @@ tracing = { workspace = true }
 tree_hash = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 cc-crypto = { workspace = true, features = ["signing"] }
 http = { workspace = true }
 http-body-util = { workspace = true }

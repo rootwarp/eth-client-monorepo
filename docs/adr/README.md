@@ -9,7 +9,7 @@ the [reconciliation table](reconciliation.md) has no unclassified rows — not
 "write 58 ADRs".
 
 Landed records (`ADR-R-01.md`, `ADR-R-02.md`, `ADR-R-03.md`, `ADR-R-04.md`,
-`ADR-R-05.md`, `ADR-R-06.md`, `ADR-R-08.md`, `ADR-R-11.md`) already use this house format.
+`ADR-R-05.md`, `ADR-R-06.md`, `ADR-R-08.md`, `ADR-R-09.md`, `ADR-R-11.md`) already use this house format.
 Do not rewrite them. New records match them.
 
 ## Never-cited ids — no ADR
@@ -57,7 +57,7 @@ resolve under `docs/adr/`. `ADR-R-*` is out of the extractor: that series
 is the refactor records; `plan/` already cites unwritten `ADR-R-07`,
 and extracting them would go red before those bodies exist. Landed
 files (`ADR-R-01.md`, `ADR-R-02.md`, `ADR-R-03.md`, `ADR-R-04.md`,
-`ADR-R-05.md`, `ADR-R-06.md`, `ADR-R-08.md`, `ADR-R-11.md`) still count as resolvable by
+`ADR-R-05.md`, `ADR-R-06.md`, `ADR-R-08.md`, `ADR-R-09.md`, `ADR-R-11.md`) still count as resolvable by
 filename.
 
 ## Filename

@@ -25,24 +25,32 @@
 //! config (same class as network YAML).
 //!
 //! Anchor store construction (warm `canonical_root`, wall-clock `on_tick`) lives
-//! in [`spawn_core_from_checkpoint`] (CC-19b). Aggregate health / bind order
-//! remain in `main.rs`.
+//! in [`spawn_core_from_checkpoint`] (CC-19b) for the 4-container host.
+//! [`verify_anchor`] is the Teku split: fetch, state-root check, and
+//! expected-root match return a [`VerifiedAnchor`] and do not install a core.
+//! `commit_anchor` and [`crate::spawn_core_from_seed`] are not called here.
+//! Aggregate health / bind order remain in `main.rs`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use cc_fork_choice::{PeerDasAvailability, Store, get_forkchoice_store, on_tick};
 use cc_state_transition::TransitionContext;
 use cc_types::config::{BlobParameters, BlobSchedule, BlobScheduleError, ChainConfig};
+use cc_types::containers::Checkpoint;
 use cc_types::preset::Preset;
-use cc_types::primitives::{Epoch, ForkVersion, Root, parse_hex_bytes};
+use cc_types::primitives::{Epoch, ForkVersion, Root, Slot, parse_hex_bytes};
 use cc_types::{BeaconState, ForkName, SignedBeaconBlock};
 use futures::StreamExt;
 use serde::Deserialize;
+use ssz::Encode;
 use thiserror::Error;
 use tree_hash::TreeHash;
+
+use crate::import::ForkChoiceScalarsPayload;
 
 use crate::core::{CoreConfig, CoreThread, spawn_core_thread_with_epoch};
 use crate::epoch_context::EpochContextStore;
@@ -229,6 +237,190 @@ pub struct FetchedCheckpoint<P: Preset> {
     pub block_root: Root,
     /// Provider that served the successful triple.
     pub provider: String,
+}
+
+/// Which arm produced a [`VerifiedAnchor`]. Neither arm installs a core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorKind {
+    /// Checkpoint provider, after the state-root and expected-root checks.
+    Checkpoint,
+    /// Local genesis block and state. Parent stays the block's parent.
+    Genesis,
+}
+
+/// Verified anchor material. Storage is not written and no core is spawned.
+///
+/// [`VerifiedAnchor::trusted`] is the payload the composer passes to
+/// `commit_anchor`. This module does not call that op.
+#[derive(Debug)]
+pub struct VerifiedAnchor<P: Preset> {
+    /// Which [`AnchorSource`] arm verified.
+    pub kind: AnchorKind,
+    /// `hash_tree_root(block.message)`.
+    pub block_root: Root,
+    /// Block parent as signed. Genesis keeps [`Root::ZERO`]; it is not
+    /// rewritten to [`Self::block_root`].
+    pub parent_root: Root,
+    /// Anchor slot.
+    pub slot: u64,
+    /// `block.message.state_root` after the state-root check.
+    pub state_root: Root,
+    /// Genesis time and validators root used for signature domains.
+    pub genesis: GenesisInfo,
+    /// Provider base URL, or `"genesis"` for [`AnchorKind::Genesis`].
+    pub provider: String,
+    /// Finalized (or genesis) signed block.
+    pub signed_block: SignedBeaconBlock<P>,
+    /// Post-state at `signed_block.message.state_root`.
+    pub state: BeaconState<P>,
+    /// Opaque anchor for a later `commit_anchor`. Not submitted here.
+    pub trusted: cc_seam::TrustedAnchor,
+}
+
+/// Where a trusted anchor comes from.
+///
+/// Both arms verify in this crate. Neither builds a fork-choice core.
+/// `commit_anchor` stays the composer's one call, and
+/// [`crate::spawn_core_from_seed`] stays the only core-install path.
+pub enum AnchorSource<P: Preset> {
+    /// Fetch from `config.providers` through `provider`, then verify.
+    Checkpoint {
+        /// Provider list, timeouts, and the optional expected root.
+        config: CheckpointBootstrapConfig,
+        /// HTTP client or an injected double. Not constructed here.
+        provider: Arc<dyn CheckpointProvider>,
+    },
+    /// Already-decoded genesis block and state. No provider and no
+    /// self-parent remap: a zero parent stays zero.
+    ///
+    /// The block and state are boxed so this variant does not inflate
+    /// [`AnchorSource::Checkpoint`] (clippy::large_enum_variant).
+    Genesis {
+        /// Genesis post-state.
+        state: Box<BeaconState<P>>,
+        /// Genesis signed block (`parent_root` is typically [`Root::ZERO`]).
+        signed_block: Box<SignedBeaconBlock<P>>,
+        /// Local chain config. `seconds_per_slot` stamps anchor scalars.
+        chain_config: ChainConfig,
+        /// Optional operator block root. Same check as checkpoint sync.
+        expected_block_root: Option<Root>,
+    },
+}
+
+impl<P: Preset> std::fmt::Debug for AnchorSource<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Checkpoint { config, .. } => f
+                .debug_struct("Checkpoint")
+                .field("config", config)
+                .finish_non_exhaustive(),
+            Self::Genesis {
+                signed_block,
+                expected_block_root,
+                ..
+            } => f
+                .debug_struct("Genesis")
+                .field("slot", &signed_block.message.slot)
+                .field("expected_block_root", expected_block_root)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// Beacon API reads checkpoint sync needs. Implementors are injected;
+/// [`CheckpointClient`] is the HTTP one and [`InMemoryCheckpointProvider`]
+/// is the in-process double (no `reqwest` in the caller).
+#[async_trait]
+pub trait CheckpointProvider: Send + Sync {
+    /// `GET /eth/v1/beacon/genesis`.
+    async fn fetch_genesis(&self, base: &str) -> Result<GenesisInfo, CheckpointError>;
+
+    /// `GET /eth/v1/config/spec` as a flat string map.
+    async fn fetch_spec(&self, base: &str) -> Result<BTreeMap<String, String>, CheckpointError>;
+
+    /// `GET /eth/v2/beacon/blocks/finalized` as `(consensus version, SSZ)`.
+    async fn fetch_finalized_block_ssz(
+        &self,
+        base: &str,
+    ) -> Result<(String, Bytes), CheckpointError>;
+
+    /// `GET /eth/v2/debug/beacon/states/{state_id}` as `(consensus version, SSZ)`.
+    async fn fetch_state_ssz(
+        &self,
+        base: &str,
+        state_id: &str,
+    ) -> Result<(String, Bytes), CheckpointError>;
+}
+
+/// Preloaded checkpoint responses. No HTTP. Tests and the composer inject
+/// this instead of a `wiremock` server on `cc-beacon-core`.
+#[derive(Debug, Clone)]
+pub struct InMemoryCheckpointProvider {
+    inner: Arc<InMemoryCheckpoint>,
+}
+
+#[derive(Debug)]
+struct InMemoryCheckpoint {
+    genesis: GenesisInfo,
+    spec: BTreeMap<String, String>,
+    consensus_version: String,
+    block_ssz: Bytes,
+    state_ssz: Bytes,
+}
+
+impl InMemoryCheckpointProvider {
+    /// Serve one genesis, one spec map, and one finalized block/state pair
+    /// for every state id.
+    pub fn new(
+        genesis: GenesisInfo,
+        spec: BTreeMap<String, String>,
+        consensus_version: impl Into<String>,
+        block_ssz: Bytes,
+        state_ssz: Bytes,
+    ) -> Self {
+        Self {
+            inner: Arc::new(InMemoryCheckpoint {
+                genesis,
+                spec,
+                consensus_version: consensus_version.into(),
+                block_ssz,
+                state_ssz,
+            }),
+        }
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unused_async)]
+impl CheckpointProvider for InMemoryCheckpointProvider {
+    async fn fetch_genesis(&self, _base: &str) -> Result<GenesisInfo, CheckpointError> {
+        Ok(self.inner.genesis)
+    }
+
+    async fn fetch_spec(&self, _base: &str) -> Result<BTreeMap<String, String>, CheckpointError> {
+        Ok(self.inner.spec.clone())
+    }
+
+    async fn fetch_finalized_block_ssz(
+        &self,
+        _base: &str,
+    ) -> Result<(String, Bytes), CheckpointError> {
+        Ok((
+            self.inner.consensus_version.clone(),
+            Bytes::clone(&self.inner.block_ssz),
+        ))
+    }
+
+    async fn fetch_state_ssz(
+        &self,
+        _base: &str,
+        _state_id: &str,
+    ) -> Result<(String, Bytes), CheckpointError> {
+        Ok((
+            self.inner.consensus_version.clone(),
+            Bytes::clone(&self.inner.state_ssz),
+        ))
+    }
 }
 
 // ── verification (pure) ─────────────────────────────────────────────────────
@@ -651,6 +843,32 @@ impl CheckpointClient {
     }
 }
 
+#[async_trait]
+impl CheckpointProvider for CheckpointClient {
+    async fn fetch_genesis(&self, base: &str) -> Result<GenesisInfo, CheckpointError> {
+        CheckpointClient::fetch_genesis(self, base).await
+    }
+
+    async fn fetch_spec(&self, base: &str) -> Result<BTreeMap<String, String>, CheckpointError> {
+        CheckpointClient::fetch_spec(self, base).await
+    }
+
+    async fn fetch_finalized_block_ssz(
+        &self,
+        base: &str,
+    ) -> Result<(String, Bytes), CheckpointError> {
+        CheckpointClient::fetch_finalized_block_ssz(self, base).await
+    }
+
+    async fn fetch_state_ssz(
+        &self,
+        base: &str,
+        state_id: &str,
+    ) -> Result<(String, Bytes), CheckpointError> {
+        CheckpointClient::fetch_state_ssz(self, base, state_id).await
+    }
+}
+
 /// Read a response body with a hard byte ceiling (SEC-19a-2).
 ///
 /// Rejects oversized `Content-Length` before streaming; aborts mid-stream if the
@@ -873,23 +1091,38 @@ pub async fn fetch_checkpoint<P: Preset>(
         return Err(CheckpointError::AllProvidersFailed);
     }
     let client = CheckpointClient::new(cfg.connect_timeout, cfg.total_timeout)?;
+    fetch_checkpoint_with_provider(&client, cfg, metrics).await
+}
 
-    for provider in &cfg.providers {
-        let provider = provider.trim_end_matches('/').to_owned();
-        if let Err(e) = validate_provider_base(&provider) {
-            metrics.inc_bootstrap_attempt(&provider, BootstrapResult::Failure);
+/// [`fetch_checkpoint`] against an injected [`CheckpointProvider`].
+///
+/// The HTTP client is one implementor. A double serves the same fetch,
+/// state-root check, and expected-root match without binding a socket.
+pub async fn fetch_checkpoint_with_provider<P: Preset>(
+    checkpoint_provider: &dyn CheckpointProvider,
+    cfg: &CheckpointBootstrapConfig,
+    metrics: &ChainMetrics,
+) -> Result<FetchedCheckpoint<P>, CheckpointError> {
+    if cfg.providers.is_empty() {
+        return Err(CheckpointError::AllProvidersFailed);
+    }
+
+    for base in &cfg.providers {
+        let base = base.trim_end_matches('/').to_owned();
+        if let Err(e) = validate_provider_base(&base) {
+            metrics.inc_bootstrap_attempt(&base, BootstrapResult::Failure);
             tracing::warn!(
-                provider = %provider,
+                provider = %base,
                 error = %e,
                 "checkpoint provider URL rejected; advancing"
             );
             continue;
         }
-        match fetch_from_provider::<P>(&client, &provider, cfg).await {
+        match fetch_from_provider::<P>(checkpoint_provider, &base, cfg).await {
             Ok(fetched) => {
-                metrics.inc_bootstrap_attempt(&provider, BootstrapResult::Success);
+                metrics.inc_bootstrap_attempt(&base, BootstrapResult::Success);
                 tracing::info!(
-                    provider = %provider,
+                    provider = %base,
                     block_root = %fetched.block_root,
                     slot = fetched.signed_block.message.slot.as_u64(),
                     "checkpoint bootstrap succeeded"
@@ -897,9 +1130,9 @@ pub async fn fetch_checkpoint<P: Preset>(
                 return Ok(fetched);
             }
             Err(e) => {
-                metrics.inc_bootstrap_attempt(&provider, BootstrapResult::Failure);
+                metrics.inc_bootstrap_attempt(&base, BootstrapResult::Failure);
                 tracing::warn!(
-                    provider = %provider,
+                    provider = %base,
                     error = %e,
                     verification = e.is_verification_failure(),
                     "checkpoint provider failed; advancing"
@@ -911,7 +1144,7 @@ pub async fn fetch_checkpoint<P: Preset>(
 }
 
 async fn fetch_from_provider<P: Preset>(
-    client: &CheckpointClient,
+    client: &dyn CheckpointProvider,
     provider: &str,
     cfg: &CheckpointBootstrapConfig,
 ) -> Result<FetchedCheckpoint<P>, CheckpointError> {
@@ -945,7 +1178,7 @@ async fn fetch_from_provider<P: Preset>(
 }
 
 async fn fetch_from_provider_once<P: Preset>(
-    client: &CheckpointClient,
+    client: &dyn CheckpointProvider,
     provider: &str,
     cfg: &CheckpointBootstrapConfig,
 ) -> Result<FetchedCheckpoint<P>, CheckpointError> {
@@ -990,7 +1223,7 @@ async fn fetch_from_provider_once<P: Preset>(
 }
 
 async fn fetch_and_verify_triple<P: Preset>(
-    client: &CheckpointClient,
+    client: &dyn CheckpointProvider,
     provider: &str,
     cfg: &CheckpointBootstrapConfig,
     genesis: &GenesisInfo,
@@ -1066,6 +1299,128 @@ async fn fetch_and_verify_triple<P: Preset>(
         block_root,
         provider: provider.to_owned(),
     })
+}
+
+/// Verify [`AnchorSource`] into a [`VerifiedAnchor`].
+///
+/// Runs the fetch (checkpoint only), the state-root check, and the
+/// expected-root match. Does not build a fork-choice store, does not spawn
+/// a core, and does not call `commit_anchor`. A genesis block whose parent
+/// is [`Root::ZERO`] stays that parent — this path does not depend on the
+/// storage self-parent bypass.
+pub async fn verify_anchor<P: Preset>(
+    source: AnchorSource<P>,
+    metrics: &ChainMetrics,
+) -> Result<VerifiedAnchor<P>, CheckpointError> {
+    match source {
+        AnchorSource::Checkpoint { config, provider } => {
+            let fetched =
+                fetch_checkpoint_with_provider::<P>(provider.as_ref(), &config, metrics).await?;
+            Ok(verified_from_parts(
+                AnchorKind::Checkpoint,
+                fetched.provider,
+                fetched.genesis,
+                fetched.signed_block,
+                fetched.state,
+                fetched.block_root,
+                &config.chain_config,
+            ))
+        }
+        AnchorSource::Genesis {
+            state,
+            signed_block,
+            chain_config,
+            expected_block_root,
+        } => {
+            let block_root = verify_checkpoint(&signed_block, &state, expected_block_root)?;
+            let genesis = GenesisInfo {
+                genesis_time: state.genesis_time(),
+                genesis_validators_root: state.genesis_validators_root(),
+            };
+            Ok(verified_from_parts(
+                AnchorKind::Genesis,
+                "genesis".to_owned(),
+                genesis,
+                *signed_block,
+                *state,
+                block_root,
+                &chain_config,
+            ))
+        }
+    }
+}
+
+fn verified_from_parts<P: Preset>(
+    kind: AnchorKind,
+    provider: String,
+    genesis: GenesisInfo,
+    signed_block: SignedBeaconBlock<P>,
+    state: BeaconState<P>,
+    block_root: Root,
+    chain_config: &ChainConfig,
+) -> VerifiedAnchor<P> {
+    let parent_root = signed_block.message.parent_root;
+    let slot = signed_block.message.slot.as_u64();
+    let state_root = signed_block.message.state_root;
+    let trusted = cc_seam::TrustedAnchor {
+        block_root: seam_root(block_root),
+        parent_root: seam_root(parent_root),
+        slot,
+        state_root: seam_root(state_root),
+        block_ssz: Bytes::from(signed_block.as_ssz_bytes()),
+        state_ssz: Bytes::from(state.as_ssz_bytes()),
+        scalars: anchor_scalars::<P>(
+            block_root,
+            signed_block.message.slot,
+            state.genesis_time(),
+            chain_config.seconds_per_slot,
+        ),
+        da: cc_seam::DaVerdict::Available,
+    };
+    VerifiedAnchor {
+        kind,
+        block_root,
+        parent_root,
+        slot,
+        state_root,
+        genesis,
+        provider,
+        signed_block,
+        state,
+        trusted,
+    }
+}
+
+/// Anchor scalars a later `commit_anchor` persists. Mirrors the anchor
+/// `get_forkchoice_store` seeds (justified = finalized = the anchor
+/// checkpoint, store time = genesis + slot × seconds) without building a store.
+fn anchor_scalars<P: Preset>(
+    block_root: Root,
+    slot: Slot,
+    genesis_time: u64,
+    seconds_per_slot: u64,
+) -> Bytes {
+    let epoch = slot.epoch(P::SLOTS_PER_EPOCH.max(1));
+    let checkpoint = Checkpoint {
+        epoch,
+        root: block_root,
+    };
+    let time = genesis_time.saturating_add(slot.as_u64().saturating_mul(seconds_per_slot.max(1)));
+    let scalars = ForkChoiceScalarsPayload {
+        time,
+        proposer_boost_root: Root::ZERO,
+        justified: checkpoint,
+        finalized: checkpoint,
+        unrealized_justified: checkpoint,
+        unrealized_finalized: checkpoint,
+        head_root: block_root,
+        head_slot: slot,
+    };
+    Bytes::from(scalars.as_ssz_bytes())
+}
+
+fn seam_root(root: Root) -> cc_seam::Root {
+    *root.as_array()
 }
 
 // ── core spawn helper (CC-19b anchor store) ─────────────────────────────────
@@ -1243,6 +1598,7 @@ mod tests {
     use super::*;
     use std::convert::Infallible;
     use std::net::SocketAddr;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2324,6 +2680,277 @@ mod tests {
         assert!(
             !spawn_body.contains("PubkeyIndexMap::from_registry"),
             "checkpoint spawn must not scrape a throwaway from_registry length"
+        );
+    }
+
+    fn anchor_block_root(block: &SignedBeaconBlock<Minimal>) -> Root {
+        Root::from_hash256(TreeHash::tree_hash_root(&block.message))
+    }
+
+    fn memory_provider(
+        block: &SignedBeaconBlock<Minimal>,
+        state: &BeaconState<Minimal>,
+        cfg: &ChainConfig,
+        version: &str,
+    ) -> InMemoryCheckpointProvider {
+        InMemoryCheckpointProvider::new(
+            GenesisInfo {
+                genesis_time: state.genesis_time(),
+                genesis_validators_root: state.genesis_validators_root(),
+            },
+            local_spec_map(cfg),
+            version,
+            Bytes::from(block.as_ssz_bytes()),
+            Bytes::from(state.as_ssz_bytes()),
+        )
+    }
+
+    fn boot_for(cfg: ChainConfig, expected: Option<Root>) -> CheckpointBootstrapConfig {
+        CheckpointBootstrapConfig {
+            providers: vec!["http://127.0.0.1:9".into()],
+            expected_checkpoint_root: expected,
+            chain_config: cfg,
+            connect_timeout: Duration::from_millis(50),
+            total_timeout: Duration::from_millis(50),
+            network_retries: 0,
+            triple_attempts: 1,
+        }
+    }
+
+    struct CountingProvider {
+        inner: InMemoryCheckpointProvider,
+        hits: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl CheckpointProvider for CountingProvider {
+        async fn fetch_genesis(&self, base: &str) -> Result<GenesisInfo, CheckpointError> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            self.inner.fetch_genesis(base).await
+        }
+
+        async fn fetch_spec(
+            &self,
+            base: &str,
+        ) -> Result<BTreeMap<String, String>, CheckpointError> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            self.inner.fetch_spec(base).await
+        }
+
+        async fn fetch_finalized_block_ssz(
+            &self,
+            base: &str,
+        ) -> Result<(String, Bytes), CheckpointError> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            self.inner.fetch_finalized_block_ssz(base).await
+        }
+
+        async fn fetch_state_ssz(
+            &self,
+            base: &str,
+            state_id: &str,
+        ) -> Result<(String, Bytes), CheckpointError> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            self.inner.fetch_state_ssz(base, state_id).await
+        }
+    }
+
+    fn assert_anchor_not_self_parent(verified: &VerifiedAnchor<Minimal>, block_root: Root) {
+        assert_ne!(verified.parent_root, block_root);
+        assert_ne!(verified.trusted.parent_root, verified.trusted.block_root);
+        assert_eq!(
+            verified.trusted.parent_root,
+            *verified.parent_root.as_array()
+        );
+        assert_eq!(verified.trusted.block_root, *block_root.as_array());
+        assert_eq!(verified.trusted.da, cc_seam::DaVerdict::Available);
+        assert!(!verified.trusted.block_ssz.is_empty());
+        assert!(!verified.trusted.state_ssz.is_empty());
+        assert_eq!(
+            verified.trusted.scalars.len(),
+            crate::FORK_CHOICE_SCALARS_SSZ_LEN
+        );
+        let head_root = &verified.trusted.scalars[200..232];
+        assert_eq!(head_root, block_root.as_slice());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_arm_returns_verified_anchor_via_injected_double() {
+        let cfg = minimal_config();
+        let (mut block, state) = matching_pair(8);
+        let parent = Root::from_array([0x11; 32]);
+        block.message.parent_root = parent;
+        let block_root = anchor_block_root(&block);
+        let hits = Arc::new(AtomicU32::new(0));
+        let provider = Arc::new(CountingProvider {
+            inner: memory_provider(&block, &state, &cfg, "fulu"),
+            hits: Arc::clone(&hits),
+        });
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let verified = verify_anchor(
+            AnchorSource::Checkpoint {
+                config: boot_for(cfg, Some(block_root)),
+                provider,
+            },
+            &metrics,
+        )
+        .await
+        .expect("checkpoint double verifies");
+        assert_eq!(verified.kind, AnchorKind::Checkpoint);
+        assert_eq!(verified.block_root, block_root);
+        assert_eq!(verified.parent_root, parent);
+        assert_eq!(verified.slot, 8);
+        assert!(
+            hits.load(Ordering::SeqCst) >= 4,
+            "double must serve the fetch"
+        );
+        assert_anchor_not_self_parent(&verified, block_root);
+        let time = u64::from_le_bytes(verified.trusted.scalars[..8].try_into().unwrap());
+        assert_eq!(time, 1_000 + 8 * 6);
+        assert_eq!(
+            metrics.bootstrap_attempt_count("http://127.0.0.1:9", BootstrapResult::Success),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn genesis_arm_keeps_zero_parent_without_self_parent_remap() {
+        let cfg = minimal_config();
+        let (block, state) = matching_pair(0);
+        let block_root = anchor_block_root(&block);
+        assert_eq!(block.message.parent_root, Root::ZERO);
+        assert_ne!(block_root, Root::ZERO);
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let verified = verify_anchor(
+            AnchorSource::Genesis {
+                state: Box::new(state),
+                signed_block: Box::new(block),
+                chain_config: cfg,
+                expected_block_root: Some(block_root),
+            },
+            &metrics,
+        )
+        .await
+        .expect("genesis anchor is legal");
+        assert_eq!(verified.kind, AnchorKind::Genesis);
+        assert_eq!(verified.parent_root, Root::ZERO);
+        assert_eq!(verified.slot, 0);
+        assert_eq!(verified.provider, "genesis");
+        assert_anchor_not_self_parent(&verified, block_root);
+        let time = u64::from_le_bytes(verified.trusted.scalars[..8].try_into().unwrap());
+        assert_eq!(time, 1_000);
+    }
+
+    #[tokio::test]
+    async fn genesis_arm_rejects_state_root_mismatch() {
+        let cfg = minimal_config();
+        let (mut block, state) = matching_pair(0);
+        block.message.state_root = Root::from_array([0xCD; 32]);
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let err = verify_anchor::<Minimal>(
+            AnchorSource::Genesis {
+                state: Box::new(state),
+                signed_block: Box::new(block),
+                chain_config: cfg,
+                expected_block_root: None,
+            },
+            &metrics,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::StateRootMismatch { .. }),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_double_on_wrong_fork_does_not_verify() {
+        let cfg = minimal_config();
+        let (block, state) = matching_pair(8);
+        let provider = Arc::new(memory_provider(&block, &state, &cfg, "phase0"));
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let err = verify_anchor::<Minimal>(
+            AnchorSource::Checkpoint {
+                config: boot_for(cfg, None),
+                provider,
+            },
+            &metrics,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CheckpointError::AllProvidersFailed), "{err}");
+    }
+
+    #[test]
+    fn verify_anchor_does_not_install_a_core_or_commit() {
+        let src = include_str!("checkpoint_sync.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        let start = production
+            .find("pub async fn verify_anchor")
+            .expect("verify_anchor");
+        let rest = &production[start..];
+        let end = ["\nfn ", "\nasync fn ", "\npub "]
+            .iter()
+            .filter_map(|marker| rest[1..].find(marker))
+            .min()
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(!body.contains("spawn_core"), "{body}");
+        assert!(!body.contains("get_forkchoice_store"));
+        assert!(!body.contains("commit_anchor"));
+    }
+
+    #[test]
+    fn spawn_core_from_seed_has_one_non_test_caller() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut callers = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+                panic!("read {}: {e}", dir.display());
+            });
+            for entry in entries {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || name == "target" {
+                    continue;
+                }
+                if path.is_dir() {
+                    if name == "tests" {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                // Split so this test file does not match its own needle.
+                let needle = format!("spawn_core_from_{}(", "seed");
+                if text.contains(&needle) {
+                    let rel = path
+                        .strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    callers.push(rel);
+                }
+            }
+        }
+        callers.sort();
+        assert_eq!(
+            callers,
+            vec!["bin/beacon-core/src/boot.rs".to_owned()],
+            "spawn_core_from_seed is the only core-install path"
         );
     }
 }

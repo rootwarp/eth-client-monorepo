@@ -154,3 +154,13 @@ operations (`commit_anchor`, `commit_import`, `set_head`,
 `commit_snapshot` is P2 bound 256 drop-newest with a completion-marker
 exemption. Amends ADR-P4-06's scalar cadence (per-import, not
 per-finalization). Not a census row.
+
+S2R lands [`ADR-R-09.md`](ADR-R-09.md) — Status: accepted. The trusted
+anchor is verified in `cc-chain` from `AnchorSource::{Checkpoint, Genesis}`
+and returned as `VerifiedAnchor` without installing a core. Completes
+ADR-P4-07 (still superseded-by ADR-R-02: that record deletes
+`RestoreFromStore`; this one is the replacement's one-shot rule) and
+discharges R-15 as two properties: after `commit_anchor` the ordinary
+continuity check admits the first child with no bypass, and a second
+`commit_anchor` is `STORE_NOT_UNINITIALIZED`. The storage transaction is
+not this record. Not a census row.

@@ -54,14 +54,16 @@ pub mod run;
 
 pub use apply_attestations::MAX_APPLY_ATTESTATIONS;
 pub use checkpoint_sync::{
-    BlobScheduleFromSpecError, BootstrapSummary, CheckpointBootstrapConfig, CheckpointClient,
-    CheckpointError, FetchedCheckpoint, GenesisInfo, MAX_BLOCK_BYTES, MAX_JSON_BYTES,
+    AnchorKind, AnchorSource, BlobScheduleFromSpecError, BootstrapSummary,
+    CheckpointBootstrapConfig, CheckpointClient, CheckpointError, CheckpointProvider,
+    FetchedCheckpoint, GenesisInfo, InMemoryCheckpointProvider, MAX_BLOCK_BYTES, MAX_JSON_BYTES,
     MAX_STATE_BYTES, NETWORK_RETRIES, PROVIDER_CONNECT_TIMEOUT, PROVIDER_TOTAL_TIMEOUT,
-    REQUIRED_CONSENSUS_VERSION, TRIPLE_ATTEMPTS, blob_schedule_from_spec,
+    REQUIRED_CONSENSUS_VERSION, TRIPLE_ATTEMPTS, VerifiedAnchor, blob_schedule_from_spec,
     blob_schedule_from_spec_map, bootstrap_core_from_providers,
     bootstrap_core_from_providers_with_epoch, cross_check_spec, fetch_checkpoint,
-    parse_optional_root, spawn_core_from_checkpoint, spawn_core_from_checkpoint_with_epoch,
-    validate_provider_base, verify_checkpoint, warm_canonical_root,
+    fetch_checkpoint_with_provider, parse_optional_root, spawn_core_from_checkpoint,
+    spawn_core_from_checkpoint_with_epoch, validate_provider_base, verify_anchor,
+    verify_checkpoint, warm_canonical_root,
 };
 pub use core::{
     AttestationEnqueue, AttestationSender, AttestationWork, CoreCommand, CoreConfig, CoreHandle,
