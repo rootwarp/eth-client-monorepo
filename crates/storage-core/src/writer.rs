@@ -30,7 +30,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use cc_store::engine::Engine;
+use cc_store::engine::{Engine, ReadTxn};
 use cc_store::keys::BlockRegion;
 use cc_store::meta::{KEY_FC_SCALARS, KEY_WRITE_CURSOR, TABLE_META, WriteCursor};
 use cc_store::{
@@ -86,6 +86,18 @@ pub(crate) struct StagedForkChoiceScalars {
     pub ssz: Vec<u8>,
 }
 
+/// Anchor rows that ride the same P0 batch as the body.
+///
+/// The body itself is [`CommitUnit::blocks`]. These are the snapshot,
+/// its completion marker, `AnchorInfo`, and `Split`.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedAnchor {
+    pub snapshot_ssz: Vec<u8>,
+    pub completion_ssz: Vec<u8>,
+    pub anchor_info_ssz: Vec<u8>,
+    pub split_ssz: Vec<u8>,
+}
+
 /// P0 write-behind commit unit — **one write transaction** (§4.4).
 ///
 /// Contains the slot's data rows **and** the durable [`WriteCursor`] for the
@@ -99,6 +111,8 @@ pub(crate) struct CommitUnit {
     pub cursor: WriteCursor,
     /// Optional reply (tests inject commit-failure / wait for durable).
     pub done: Option<oneshot::Sender<Result<(), WriterError>>>,
+    /// When set, this unit is `commit_anchor`: one transaction, cold body.
+    pub anchor: Option<StagedAnchor>,
 }
 
 impl CommitUnit {
@@ -111,6 +125,7 @@ impl CommitUnit {
             fork_choice: None,
             cursor,
             done: None,
+            anchor: None,
         }
     }
 }
@@ -170,6 +185,9 @@ pub(crate) enum WriterError {
     ShutDown,
     #[error("injected commit failure (test)")]
     InjectedFailure,
+    /// `commit_anchor` saw a store that is no longer uninitialized.
+    #[error("store is not uninitialized")]
+    NotUninitialized,
 }
 
 // ── mailbox ─────────────────────────────────────────────────────────────────
@@ -542,10 +560,24 @@ fn commit_p0(
     let mut batch = engine.batch();
     let mut written_blocks: u64 = 0;
     let mut written_columns: u64 = 0;
+    let mut written_snapshots: u64 = 0;
     let mut written_meta: u64 = 0;
 
     {
         let rt = engine.read()?;
+        // Re-check inside this read so a second anchor cannot land after
+        // the caller's pre-check. Failure returns before `engine.commit`.
+        if unit.anchor.is_some() && !txn_is_uninitialized(engine, &rt)? {
+            return Err(WriterError::NotUninitialized);
+        }
+        // Anchor body is cold: Split.slot is the anchor slot, and I-split-fin
+        // forbids a hot row at or below that slot. I-ring needs the snapshot
+        // slot ≤ Split.slot, so the two meet at the anchor slot.
+        let region = if unit.anchor.is_some() {
+            BlockRegion::Cold
+        } else {
+            BlockRegion::Hot
+        };
         // Blocks (+ optional canonical walk).
         for b in &unit.blocks {
             let put_result = if b.update_canonical {
@@ -555,7 +587,7 @@ fn commit_p0(
                     b.slot,
                     &b.root,
                     &b.ssz,
-                    BlockRegion::Hot,
+                    region,
                     b.write_state_root,
                 )
                 .map(|(o, _)| o)
@@ -566,7 +598,7 @@ fn commit_p0(
                     b.slot,
                     &b.root,
                     &b.ssz,
-                    BlockRegion::Hot,
+                    region,
                     b.write_state_root,
                 )
             };
@@ -588,6 +620,39 @@ fn commit_p0(
             if let Some(status) = b.da_status {
                 put_da_status(&rt, &mut batch, &b.root, status, b.slot)?;
             }
+        }
+
+        if let Some(anchor) = &unit.anchor {
+            let slot = unit.blocks.first().map(|b| b.slot).ok_or_else(|| {
+                WriterError::Store(StoreError::Codec(
+                    "commit_anchor requires the anchor body in the same unit".into(),
+                ))
+            })?;
+            batch.put(
+                cc_store::snapshots::TABLE_SNAPSHOTS,
+                &cc_store::snapshots::encode_snapshot_key(slot),
+                &anchor.snapshot_ssz,
+            );
+            written_snapshots = written_snapshots.saturating_add(anchor.snapshot_ssz.len() as u64);
+            batch.put(
+                TABLE_META,
+                cc_store::meta::KEY_SNAPSHOT_COMPLETION.as_bytes(),
+                &anchor.completion_ssz,
+            );
+            batch.put(
+                TABLE_META,
+                cc_store::meta::KEY_ANCHOR_INFO.as_bytes(),
+                &anchor.anchor_info_ssz,
+            );
+            batch.put(
+                TABLE_META,
+                cc_store::meta::KEY_SPLIT.as_bytes(),
+                &anchor.split_ssz,
+            );
+            written_meta = written_meta
+                .saturating_add(anchor.completion_ssz.len() as u64)
+                .saturating_add(anchor.anchor_info_ssz.len() as u64)
+                .saturating_add(anchor.split_ssz.len() as u64);
         }
 
         // Columns.
@@ -648,6 +713,14 @@ fn commit_p0(
                 class: StorageClass::Columns.as_str().to_owned(),
             })
             .inc_by(written_columns);
+    }
+    if written_snapshots > 0 {
+        metrics
+            .written_bytes
+            .get_or_create(&ClassLabels {
+                class: StorageClass::Snapshots.as_str().to_owned(),
+            })
+            .inc_by(written_snapshots);
     }
     if written_meta > 0 {
         metrics
@@ -808,6 +881,39 @@ pub(crate) fn load_write_cursor(engine: &Engine) -> Result<Option<WriteCursor>, 
     Ok(Some(cursor))
 }
 
+/// `Uninitialized`: no `AnchorInfo` and no block row.
+///
+/// Tolerates everything `open_and_stamp` writes (schema, digest, node id,
+/// write cursor). This is the `commit_anchor` precondition, not the
+/// restart tri-state.
+pub(crate) fn store_is_uninitialized(engine: &Engine) -> Result<bool, StoreError> {
+    let rt = engine.read()?;
+    txn_is_uninitialized(engine, &rt)
+}
+
+fn txn_is_uninitialized(engine: &Engine, rt: &ReadTxn) -> Result<bool, StoreError> {
+    if rt
+        .get(TABLE_META, cc_store::meta::KEY_ANCHOR_INFO.as_bytes())?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    if rt.has_any(cc_store::blocks::TABLE_BLOCKS_HOT)? {
+        return Ok(false);
+    }
+    if rt.has_any(cc_store::blocks::TABLE_BLOCK_SLOT_BY_ROOT)? {
+        return Ok(false);
+    }
+    for name in engine.table_names()? {
+        if let Some(("blocks", _)) = cc_store::schema::parse_shard_table(&name)
+            && rt.has_any(&name)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Whether a block body is present for `root` (cursor consistency checks).
 pub(crate) fn block_present(engine: &Engine, root: &Root) -> Result<bool, StoreError> {
     let rt = engine.read()?;
@@ -909,6 +1015,7 @@ mod tests {
                 }],
                 columns: vec![],
                 fork_choice: None,
+                anchor: None,
                 cursor: cursor(7, 1, root),
                 done: Some(done_tx),
             })
@@ -960,6 +1067,7 @@ mod tests {
                 }],
                 columns: vec![],
                 fork_choice: None,
+                anchor: None,
                 cursor: cursor(1, 2, root),
                 done: Some(done_tx),
             })
@@ -1003,6 +1111,7 @@ mod tests {
                     }],
                     columns: vec![],
                     fork_choice: None,
+                    anchor: None,
                     cursor: cursor(seq, 3, root),
                     done: Some(done_tx),
                 })
@@ -1102,6 +1211,7 @@ mod tests {
                 blocks: vec![],
                 columns: vec![],
                 fork_choice: None,
+                anchor: None,
                 cursor: cursor(0, 0, Root::ZERO),
                 done: Some(done_tx),
             })
@@ -1145,6 +1255,7 @@ mod tests {
                 blocks: vec![],
                 columns: vec![],
                 fork_choice: None,
+                anchor: None,
                 cursor: cursor(0, 0, Root::ZERO),
                 done: Some(done_tx),
             })

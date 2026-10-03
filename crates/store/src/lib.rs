@@ -95,9 +95,10 @@ pub use schema::{
 };
 pub use snapshots::{
     DEFAULT_SNAPSHOT_EPOCHS, MAX_SNAPSHOT_BYTES, SnapshotPlan, TABLE_SNAPSHOTS,
-    apply_snapshot_plan, check_snapshot_len, encode_snapshot_key,
-    epoch_of_slot as snapshot_epoch_of_slot, get_snapshot, list_snapshot_slots, newest_snapshot,
-    oldest_snapshot_slot, plan_snapshot_put, put_snapshot, ring_depth, snapshot_due,
+    apply_snapshot_plan, check_snapshot_len, completed_snapshot, encode_snapshot_key,
+    epoch_of_slot as snapshot_epoch_of_slot, get_snapshot, list_snapshot_slots,
+    load_snapshot_completion, newest_snapshot, oldest_snapshot_slot, plan_snapshot_put,
+    put_snapshot, put_snapshot_completion, ring_depth, snapshot_due,
 };
 pub use split::{
     DEFAULT_EPOCHS_PER_MIGRATION, MAX_MIGRATION_SLOTS_PER_BATCH, MigrationPlan, MigrationStats,

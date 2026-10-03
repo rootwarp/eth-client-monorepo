@@ -184,6 +184,7 @@ mod tests {
                 }],
                 columns: Vec::new(),
                 fork_choice: None,
+                anchor: None,
                 cursor: WriteCursor {
                     session_id: CURSOR_SESSION,
                     seq: CURSOR_SEQ,

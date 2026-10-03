@@ -8,10 +8,13 @@
 //! - Ring eviction is staged as puts + deletes for the single-writer P2 path;
 //!   production never calls [`Engine::commit`] from the replay task.
 
+use ssz::{Decode, Encode};
+
 use cc_types::Slot;
 
 use crate::engine::{Batch, Engine, ReadTxn, StoreError};
 use crate::keys::{decode_snapshot_key, encode_cold_block_key};
+use crate::meta::{KEY_SNAPSHOT_COMPLETION, SnapshotCompletion, TABLE_META};
 
 /// Snapshot table name (Architecture §2.2).
 pub const TABLE_SNAPSHOTS: &str = "snapshots";
@@ -89,6 +92,45 @@ pub fn newest_snapshot(rt: &ReadTxn) -> Result<Option<(Slot, Vec<u8>)>, StoreErr
         ))
     })?;
     Ok(Some((slot, ssz)))
+}
+
+/// Read [`SnapshotCompletion`], if the marker key is present.
+pub fn load_snapshot_completion(rt: &ReadTxn) -> Result<Option<SnapshotCompletion>, StoreError> {
+    let Some(bytes) = rt.get(TABLE_META, KEY_SNAPSHOT_COMPLETION.as_bytes())? else {
+        return Ok(None);
+    };
+    SnapshotCompletion::from_ssz_bytes(&bytes)
+        .map(Some)
+        .map_err(|e| StoreError::Codec(format!("snap_complete: {e:?}")))
+}
+
+/// Snapshot named by the completion marker, when the stored length matches.
+///
+/// A ring row with no marker, or a value whose length differs from
+/// [`SnapshotCompletion::bytes`], is not complete. This does not scan for
+/// a higher `snapshots` key — a partial chunk above the marker stays invisible.
+pub fn completed_snapshot(
+    rt: &ReadTxn,
+) -> Result<Option<(SnapshotCompletion, Vec<u8>)>, StoreError> {
+    let Some(marker) = load_snapshot_completion(rt)? else {
+        return Ok(None);
+    };
+    let Some(ssz) = get_snapshot(rt, marker.slot)? else {
+        return Ok(None);
+    };
+    if ssz.len() as u64 != marker.bytes {
+        return Ok(None);
+    }
+    Ok(Some((marker, ssz)))
+}
+
+/// Stage the completion marker. The caller commits it with the snapshot bytes.
+pub fn put_snapshot_completion(batch: &mut Batch, marker: &SnapshotCompletion) {
+    batch.put(
+        TABLE_META,
+        KEY_SNAPSHOT_COMPLETION.as_bytes(),
+        &marker.as_ssz_bytes(),
+    );
 }
 
 /// Oldest (lowest-slot) snapshot slot, if any.
@@ -220,6 +262,7 @@ mod tests {
 
     use super::*;
     use crate::engine::{Durability, Engine, EngineOptions};
+    use cc_types::Root;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn open_engine(tag: &str) -> Engine {
@@ -349,5 +392,43 @@ mod tests {
             "{msg}"
         );
         check_snapshot_len(Slot::new(0), MAX_SNAPSHOT_BYTES).unwrap();
+    }
+
+    #[test]
+    fn completion_marker_hides_a_partial_ring_row() {
+        let engine = open_engine("marker");
+        let slot = Slot::new(32);
+        put_snapshot(&engine, slot, b"partial-chunk", 4).unwrap();
+        {
+            let rt = engine.read().unwrap();
+            assert!(load_snapshot_completion(&rt).unwrap().is_none());
+            assert!(completed_snapshot(&rt).unwrap().is_none());
+            assert!(newest_snapshot(&rt).unwrap().is_some());
+        }
+
+        let full = b"full-state-ssz-bytes".to_vec();
+        put_snapshot(&engine, slot, &full, 4).unwrap();
+        let marker = SnapshotCompletion {
+            slot,
+            state_root: Root::from_array([0xAB; 32]),
+            bytes: full.len() as u64,
+        };
+        let mut batch = engine.batch();
+        put_snapshot_completion(&mut batch, &marker);
+        engine.commit(batch).unwrap();
+        {
+            let rt = engine.read().unwrap();
+            let (got, ssz) = completed_snapshot(&rt).unwrap().unwrap();
+            assert_eq!(got, marker);
+            assert_eq!(ssz, full);
+        }
+
+        let short = SnapshotCompletion { bytes: 1, ..marker };
+        let mut batch = engine.batch();
+        put_snapshot_completion(&mut batch, &short);
+        engine.commit(batch).unwrap();
+        let rt = engine.read().unwrap();
+        assert!(completed_snapshot(&rt).unwrap().is_none());
+        assert_eq!(load_snapshot_completion(&rt).unwrap(), Some(short));
     }
 }

@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cc_beacon_inproc::{BootConfig, boot_in_process};
 use cc_crypto::INFINITY_SIGNATURE;
 use cc_fork_choice::{HarnessAvailability, get_forkchoice_store, on_block, on_tick};
-use cc_seam::{ArchiveWrite, Bytes, IngestBlock};
+use cc_seam::{ArchiveWrite, Bytes, DaVerdict, IngestBlock, TrustedAnchor};
 use cc_state_transition::{
     BlockSignatureStrategy, ExecutionEngine, NewPayloadRequest, PayloadStatus, TransitionContext,
     get_beacon_proposer_index, get_current_epoch, get_expected_withdrawals, get_randao_mix,
@@ -21,9 +21,11 @@ use cc_state_transition::{
 use cc_storage_core::{StorageMetrics, start_writer_from_store};
 use cc_store::canonical::get_canonical;
 use cc_store::get_block_by_root;
-use cc_store::meta::{KEY_WRITE_CURSOR, TABLE_META, WriteCursor};
+use cc_store::meta::{ForkChoiceScalars, KEY_WRITE_CURSOR, TABLE_META, WriteCursor};
 use cc_types::config::{BlobParameters, BlobSchedule, ChainConfig, PresetName};
-use cc_types::containers::{BeaconBlockHeader, SyncAggregate, SyncCommittee, Validator};
+use cc_types::containers::{
+    BeaconBlockHeader, Checkpoint, SyncAggregate, SyncCommittee, Validator,
+};
 use cc_types::execution::ExecutionPayload;
 use cc_types::preset::{Minimal, Preset};
 use cc_types::primitives::{
@@ -219,6 +221,42 @@ fn seam_root(root: Root) -> cc_seam::Root {
     arr
 }
 
+async fn commit_genesis_anchor(
+    archive: &impl ArchiveWrite,
+    state: &BeaconState<Minimal>,
+    signed: &SignedBeaconBlock<Minimal>,
+    anchor_root: Root,
+    state_root: Root,
+) {
+    let checkpoint = Checkpoint {
+        epoch: Epoch::new(0),
+        root: anchor_root,
+    };
+    let scalars = ForkChoiceScalars {
+        time: 0,
+        proposer_boost_root: Root::ZERO,
+        justified: checkpoint,
+        finalized: checkpoint,
+        unrealized_justified: checkpoint,
+        unrealized_finalized: checkpoint,
+        head_root: anchor_root,
+        head_slot: Slot::new(0),
+    };
+    archive
+        .commit_anchor(TrustedAnchor {
+            block_root: seam_root(anchor_root),
+            parent_root: seam_root(Root::ZERO),
+            slot: 0,
+            state_root: seam_root(state_root),
+            block_ssz: Bytes::from(signed.as_ssz_bytes()),
+            state_ssz: Bytes::from(state.as_ssz_bytes()),
+            scalars: Bytes::from(scalars.as_ssz_bytes()),
+            da: DaVerdict::Available,
+        })
+        .await
+        .expect("commit genesis anchor");
+}
+
 fn read_cursor(engine: &cc_store::engine::Engine) -> Option<WriteCursor> {
     use cc_store::SszDecode;
     let rt = engine.read().unwrap();
@@ -288,15 +326,7 @@ async fn import_on_block_then_ingest_writes_durable_rows() {
         message: anchor_block,
         signature: Default::default(),
     };
-    archive
-        .ingest_block(IngestBlock {
-            parent_root: seam_root(anchor_root),
-            slot: 0,
-            block_root: seam_root(anchor_root),
-            ssz: Bytes::from(anchor_signed.as_ssz_bytes()),
-        })
-        .await
-        .expect("persist genesis");
+    commit_genesis_anchor(&archive, &state, &anchor_signed, anchor_root, state_root).await;
 
     let parent_state = fc.block_state(&anchor_root).unwrap().clone();
     let (child, _) = make_next_block(&parent_state, anchor_root, &config);
@@ -435,15 +465,7 @@ async fn reimport_ancestor_keeps_durable_head() {
         message: anchor_block,
         signature: Default::default(),
     };
-    archive
-        .ingest_block(IngestBlock {
-            parent_root: seam_root(genesis_root),
-            slot: 0,
-            block_root: seam_root(genesis_root),
-            ssz: Bytes::from(genesis_signed.as_ssz_bytes()),
-        })
-        .await
-        .expect("persist genesis");
+    commit_genesis_anchor(&archive, &state, &genesis_signed, genesis_root, state_root).await;
 
     let parent_state = fc.block_state(&genesis_root).unwrap().clone();
     let (block_a, _) = make_next_block(&parent_state, genesis_root, &config);

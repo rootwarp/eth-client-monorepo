@@ -10,23 +10,28 @@
 //! "progress optional" path and no empty-progress bypass.
 //!
 //! A batch may only extend the durable frontier, never jump it.
+//! `commit_anchor` is the only op that may write a body whose parent is
+//! not durable, and only on an uninitialized store, once.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cc_seam::{ArchiveWrite, ColumnBatch, IngestBlock, SeamError};
-use cc_store::blocks::{parent_root_at_offset, slot_at_offset};
+use cc_seam::{
+    ArchiveWrite, ColumnBatch, DaVerdict, FailedPreconditionReason, IngestBlock, SeamError,
+    TrustedAnchor,
+};
+use cc_store::blocks::{parent_root_at_offset, slot_at_offset, state_root_at_offset};
 use cc_store::columns::{
     COLUMN_HEADER_PARENT_ROOT_SSZ_OFFSET, MIN_COLUMN_SSZ_LEN, NUMBER_OF_COLUMNS,
     column_parent_root_at_offset,
 };
 use cc_store::engine::{Engine, StoreError};
-use cc_store::meta::WriteCursor;
-use cc_store::{Root, Slot, SszEncode, TABLE_BLOCKS_HOT, TABLE_CANONICAL};
+use cc_store::meta::{AnchorInfo, KEY_NODE_ID, SnapshotCompletion, Split, TABLE_META, WriteCursor};
+use cc_store::{DaStatus, Root, Slot, SszDecode, SszEncode};
 
 use crate::writer::{
-    CommitUnit, StagedBlock, StagedColumn, WriterError, WriterHandle, block_present,
-    load_write_cursor,
+    CommitUnit, StagedAnchor, StagedBlock, StagedColumn, StagedForkChoiceScalars, WriterError,
+    WriterHandle, block_present, load_write_cursor, store_is_uninitialized,
 };
 
 /// Typed ingest adapter. Holds the live writer handle — no second mailbox.
@@ -103,6 +108,9 @@ fn map_writer_err(err: WriterError) -> SeamError {
         }
         WriterError::Store(e) => SeamError::Unavailable(e.to_string()),
         WriterError::InjectedFailure => SeamError::Unavailable("injected commit failure".into()),
+        WriterError::NotUninitialized => SeamError::FailedPrecondition {
+            reason: FailedPreconditionReason::StoreNotUninitialized,
+        },
     }
 }
 
@@ -175,6 +183,7 @@ impl ArchiveWriter {
             fork_choice: None,
             cursor,
             done: None,
+            anchor: None,
         })
     }
 
@@ -254,14 +263,30 @@ impl ArchiveWrite for ArchiveWriter {
         block_present(&self.engine, &Root::from_array(root))
             .map_err(|e| SeamError::Unavailable(e.to_string()))
     }
+
+    async fn commit_anchor(&self, anchor: TrustedAnchor) -> Result<(), SeamError> {
+        if !store_is_uninitialized(&self.engine)
+            .map_err(|e| SeamError::Unavailable(e.to_string()))?
+        {
+            return Err(SeamError::FailedPrecondition {
+                reason: FailedPreconditionReason::StoreNotUninitialized,
+            });
+        }
+        let unit = anchor_unit(&self.engine, anchor)?;
+        self.writer
+            .submit_p0_committed(unit)
+            .await
+            .map_err(map_writer_err)
+    }
 }
 
 /// Bind caller `(slot, parent_root, block_root)` to the SSZ header.
 ///
 /// Slot and parent_root are fixed-offset peeks. `block_root` is the caller's
 /// value — storage does not decode the body to recompute it. Continuity is
-/// `block_present` on that parent (or the parent row is first in this batch).
-/// Self-parent is first-seed only.
+/// `block_present` on that parent (or a distinct parent row is first in this
+/// batch). A body whose parent is not durable is refused; that write is
+/// `commit_anchor` only.
 fn bind_ingest_block(
     engine: &Engine,
     block: IngestBlock,
@@ -282,18 +307,16 @@ fn bind_ingest_block(
     let claimed_parent = Root::from_array(block.parent_root);
     let claimed_root = Root::from_array(block.block_root);
 
-    let genesis_remap = ssz_parent == Root::ZERO && claimed_parent == claimed_root;
-    if ssz_parent != claimed_parent && !genesis_remap {
+    if ssz_parent != claimed_parent {
         return Err(SeamError::InvalidArgument(format!(
             "parent_root mismatch: caller != SSZ header parent_root at offset {}",
             cc_store::PARENT_ROOT_SSZ_OFFSET
         )));
     }
 
-    if claimed_parent == claimed_root && durable_head_present(engine)? {
+    if claimed_parent == claimed_root {
         return Err(SeamError::InvalidArgument(
-            "self-parent is only allowed as the first seed (empty store / no canonical head)"
-                .into(),
+            "self-parent is not admitted; genesis is committed as an anchor".into(),
         ));
     }
 
@@ -320,24 +343,118 @@ fn bind_ingest_block(
     }))
 }
 
-fn durable_head_present(engine: &Engine) -> Result<bool, SeamError> {
+fn anchor_unit(engine: &Engine, anchor: TrustedAnchor) -> Result<CommitUnit, SeamError> {
+    let ssz = anchor.block_ssz.as_ref();
+    let ssz_slot = slot_at_offset(ssz).map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
+    let slot = Slot::new(anchor.slot);
+    if ssz_slot != slot {
+        return Err(SeamError::InvalidArgument(format!(
+            "slot mismatch: caller {} != SSZ header slot {}",
+            slot.as_u64(),
+            ssz_slot.as_u64()
+        )));
+    }
+
+    let ssz_parent =
+        parent_root_at_offset(ssz).map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
+    let parent = Root::from_array(anchor.parent_root);
+    if ssz_parent != parent {
+        return Err(SeamError::InvalidArgument(format!(
+            "parent_root mismatch: caller != SSZ header parent_root at offset {}",
+            cc_store::PARENT_ROOT_SSZ_OFFSET
+        )));
+    }
+
+    let ssz_state =
+        state_root_at_offset(ssz).map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
+    let state_root = Root::from_array(anchor.state_root);
+    if ssz_state != state_root {
+        return Err(SeamError::InvalidArgument(format!(
+            "state_root mismatch: caller != SSZ header state_root at offset {}",
+            cc_store::STATE_ROOT_SSZ_OFFSET
+        )));
+    }
+
+    cc_store::check_snapshot_len(slot, anchor.state_ssz.len() as u64).map_err(|e| match e {
+        StoreError::Codec(msg) | StoreError::Limit(msg) => SeamError::InvalidArgument(msg),
+        other => SeamError::Unavailable(other.to_string()),
+    })?;
+
+    let root = Root::from_array(anchor.block_root);
+    let node_id = load_node_id(engine)?;
+    let info = AnchorInfo {
+        anchor_slot: slot,
+        anchor_root: root,
+        anchor_state_root: state_root,
+        node_id,
+        oldest_block_slot: slot,
+        oldest_block_parent: parent,
+    };
+    let split = Split {
+        slot,
+        state_root,
+        block_root: root,
+    };
+    let completion = SnapshotCompletion {
+        slot,
+        state_root,
+        bytes: anchor.state_ssz.len() as u64,
+    };
+    let prev = load_write_cursor(engine)
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?
+        .ok_or_else(|| {
+            SeamError::Unavailable("no durable write cursor; refuse to invent a zero cursor".into())
+        })?;
+    let cursor = WriteCursor {
+        session_id: prev.session_id,
+        seq: prev.seq.saturating_add(1),
+        slot,
+        root,
+    };
+    let da_status = match anchor.da {
+        DaVerdict::Available => DaStatus::Available,
+        DaVerdict::Deferred => DaStatus::Deferred,
+    };
+
+    Ok(CommitUnit {
+        blocks: vec![StagedBlock {
+            slot,
+            root,
+            ssz: anchor.block_ssz.to_vec(),
+            update_canonical: true,
+            write_state_root: true,
+            da_status: Some(da_status),
+        }],
+        columns: Vec::new(),
+        fork_choice: Some(StagedForkChoiceScalars {
+            ssz: anchor.scalars.to_vec(),
+        }),
+        cursor,
+        done: None,
+        anchor: Some(StagedAnchor {
+            snapshot_ssz: anchor.state_ssz.to_vec(),
+            completion_ssz: completion.as_ssz_bytes(),
+            anchor_info_ssz: info.as_ssz_bytes(),
+            split_ssz: split.as_ssz_bytes(),
+        }),
+    })
+}
+
+fn load_node_id(engine: &Engine) -> Result<Root, SeamError> {
     let rt = engine
         .read()
         .map_err(|e| SeamError::Unavailable(e.to_string()))?;
-    let lo = cc_store::keys::encode_cold_block_key(Slot::ZERO);
-    let hi = cc_store::keys::encode_cold_block_key(Slot::new(u64::MAX));
-    let mut canon = rt
-        .range_max(TABLE_CANONICAL, &lo, &hi, 1)
-        .map_err(|e| SeamError::Unavailable(e.to_string()))?;
-    if canon.next().is_some() {
-        return Ok(true);
-    }
-    let blo = [0u8; 40];
-    let bhi = [0xffu8; 40];
-    let mut blocks = rt
-        .range_max(TABLE_BLOCKS_HOT, &blo, &bhi, 1)
-        .map_err(|e| SeamError::Unavailable(e.to_string()))?;
-    Ok(blocks.next().is_some())
+    let Some(bytes) = rt
+        .get(TABLE_META, KEY_NODE_ID.as_bytes())
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?
+    else {
+        return Ok(Root::ZERO);
+    };
+    Root::from_ssz_bytes(&bytes).map_err(|e| {
+        SeamError::Unavailable(format!(
+            "node_id SSZ decode failed ({e:?}); anchor not written"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -346,20 +463,30 @@ mod tests {
 
     use super::*;
     use crate::metrics::StorageMetrics;
-    use crate::writer::{WriterBounds, WriterFaults, WriterHandle, spawn_writer};
-    use cc_seam::Bytes;
+    use crate::writer::{
+        WriterBounds, WriterFaults, WriterHandle, load_write_cursor, spawn_writer,
+        store_is_uninitialized,
+    };
+    use cc_seam::{Bytes, DaVerdict, FailedPreconditionReason, SeamError, TrustedAnchor};
     use cc_store::blocks::{
         MIN_BLOCK_SSZ_LEN, PARENT_ROOT_SSZ_OFFSET, SLOT_SSZ_OFFSET, STATE_ROOT_SSZ_OFFSET,
+        get_state_root, slot_by_root,
     };
     use cc_store::canonical::get_canonical;
     use cc_store::columns::{
         COLUMN_HEADER_PARENT_ROOT_SSZ_OFFSET, COLUMN_HEADER_SLOT_SSZ_OFFSET,
         COLUMN_INDEX_SSZ_OFFSET, DATA_COLUMN_SIDECAR_FIXED_BYTES, get_column_by_root,
+        get_da_status,
     };
     use cc_store::engine::{Durability, EngineOptions};
     use cc_store::keys::BlockRegion;
-    use cc_store::meta::WriteCursor;
+    use cc_store::meta::{
+        AnchorInfo, ForkChoiceScalars, KEY_ANCHOR_INFO, KEY_FC_SCALARS, KEY_NODE_ID,
+        KEY_SNAPSHOT_COMPLETION, KEY_SPLIT, SnapshotCompletion, TABLE_META, WriteCursor,
+    };
+    use cc_store::{SszDecode, completed_snapshot, get_snapshot, load_split};
     use cc_store::{get_block_by_root, put_block};
+    use cc_types::{Checkpoint, Epoch};
     use prometheus_client::registry::Registry;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -446,6 +573,7 @@ mod tests {
                 blocks: vec![staged_parent_block(parent, 19)],
                 columns: vec![],
                 fork_choice: None,
+                anchor: None,
                 cursor: WriteCursor {
                     session_id: 7,
                     seq: 11,
@@ -824,20 +952,23 @@ mod tests {
     async fn ingest_block_rejects_self_parent_after_head_exists() {
         let (dir, engine, archive, shutdown_tx) = block_archive("self-parent");
         let g_root = Root::from_array([0x01; 32]);
-        let g_ssz = synth_block(0, &Root::ZERO, &Root::from_array([0xF0; 32]));
+        let state = Root::from_array([0xF0; 32]);
+        let g_ssz = synth_block(0, &Root::ZERO, &state);
         archive
-            .ingest_block(IngestBlock {
-                parent_root: g_root.into_array(),
-                slot: 0,
-                block_root: g_root.into_array(),
-                ssz: Bytes::from(g_ssz),
-            })
+            .commit_anchor(trusted_anchor(
+                &g_root,
+                &Root::ZERO,
+                &state,
+                0,
+                g_ssz,
+                b"genesis-state".to_vec(),
+            ))
             .await
             .unwrap();
-        assert!(durable_head_present(&engine).unwrap());
+        assert!(archive.block_is_durable(g_root.into_array()).unwrap());
 
         let fake_root = Root::from_array([0x02; 32]);
-        let fake_ssz = synth_block(3, &Root::ZERO, &Root::from_array([0xF1; 32]));
+        let fake_ssz = synth_block(3, &fake_root, &Root::from_array([0xF1; 32]));
         let err = archive
             .ingest_block(IngestBlock {
                 parent_root: fake_root.into_array(),
@@ -864,12 +995,14 @@ mod tests {
         let state = Root::from_array([0xF0; 32]);
         let g_ssz = synth_block(0, &Root::ZERO, &state);
         archive
-            .ingest_block(IngestBlock {
-                parent_root: g_root.into_array(),
-                slot: 0,
-                block_root: g_root.into_array(),
-                ssz: Bytes::from(g_ssz),
-            })
+            .commit_anchor(trusted_anchor(
+                &g_root,
+                &Root::ZERO,
+                &state,
+                0,
+                g_ssz,
+                b"genesis-state".to_vec(),
+            ))
             .await
             .unwrap();
         let a_ssz = synth_block(1, &g_root, &state);
@@ -925,12 +1058,26 @@ mod tests {
     #[tokio::test]
     async fn ingest_block_persists_caller_block_root_without_decode() {
         let (dir, engine, archive, shutdown_tx) = block_archive("caller-root");
+        let anchor_root = Root::from_array([0x41; 32]);
+        let state = Root::from_array([0xF0; 32]);
+        let anchor_ssz = synth_block(0, &Root::ZERO, &state);
+        archive
+            .commit_anchor(trusted_anchor(
+                &anchor_root,
+                &Root::ZERO,
+                &state,
+                0,
+                anchor_ssz.clone(),
+                b"genesis-state".to_vec(),
+            ))
+            .await
+            .unwrap();
         let root = Root::from_array([0x42; 32]);
-        let ssz = synth_block(0, &Root::ZERO, &Root::from_array([0xF0; 32]));
+        let ssz = synth_block(1, &anchor_root, &state);
         archive
             .ingest_block(IngestBlock {
-                parent_root: root.into_array(),
-                slot: 0,
+                parent_root: anchor_root.into_array(),
+                slot: 1,
                 block_root: root.into_array(),
                 ssz: Bytes::from(ssz.clone()),
             })
@@ -938,10 +1085,468 @@ mod tests {
             .expect("caller block_root is the bind; storage must not decode the body");
         let rt = engine.read().unwrap();
         assert_eq!(
+            get_block_by_root(&rt, &anchor_root).unwrap().as_deref(),
+            Some(anchor_ssz.as_slice()),
+            "anchor key must be the caller's block_root"
+        );
+        assert_eq!(
             get_block_by_root(&rt, &root).unwrap().as_deref(),
             Some(ssz.as_slice()),
             "stored key must be the caller's block_root"
         );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scalars_ssz(head: &Root, slot: u64) -> Vec<u8> {
+        let checkpoint = Checkpoint {
+            epoch: Epoch::new(slot / 32),
+            root: *head,
+        };
+        ForkChoiceScalars {
+            time: slot,
+            proposer_boost_root: Root::ZERO,
+            justified: checkpoint,
+            finalized: checkpoint,
+            unrealized_justified: checkpoint,
+            unrealized_finalized: checkpoint,
+            head_root: *head,
+            head_slot: Slot::new(slot),
+        }
+        .as_ssz_bytes()
+    }
+
+    fn trusted_anchor(
+        root: &Root,
+        parent: &Root,
+        state: &Root,
+        slot: u64,
+        block: Vec<u8>,
+        state_ssz: Vec<u8>,
+    ) -> TrustedAnchor {
+        TrustedAnchor {
+            block_root: root.into_array(),
+            parent_root: parent.into_array(),
+            slot,
+            state_root: state.into_array(),
+            block_ssz: Bytes::from(block),
+            state_ssz: Bytes::from(state_ssz),
+            scalars: Bytes::from(scalars_ssz(root, slot)),
+            da: DaVerdict::Available,
+        }
+    }
+
+    /// Non-genesis anchor: `ArchiveWrite` ingest cannot seed it. `commit_anchor`
+    /// does, once, and the ordinary continuity check then admits the child.
+    #[tokio::test]
+    async fn non_genesis_anchor_ingest_fails_commit_anchor_admits_child() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("nongenesis-anchor");
+        let parent = Root::from_array([0x11; 32]);
+        let root = Root::from_array([0x42; 32]);
+        let state = Root::from_array([0xF0; 32]);
+        let slot = 64u64;
+        let block = synth_block(slot, &parent, &state);
+        let state_ssz = b"anchor-state-ssz".to_vec();
+
+        let err = archive
+            .ingest_block(IngestBlock {
+                parent_root: parent.into_array(),
+                slot,
+                block_root: root.into_array(),
+                ssz: Bytes::from(block.clone()),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeamError::InvalidArgument(_)),
+            "non-genesis anchor must not seed through ingest: {err}"
+        );
+        assert!(!archive.block_is_durable(root.into_array()).unwrap());
+
+        let node_id = Root::from_array([0x5A; 32]);
+        {
+            let mut batch = engine.batch();
+            batch.put(TABLE_META, KEY_NODE_ID.as_bytes(), &node_id.as_ssz_bytes());
+            engine.commit(batch).unwrap();
+        }
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        let scalars = scalars_ssz(&root, slot);
+
+        archive
+            .commit_anchor(trusted_anchor(
+                &root,
+                &parent,
+                &state,
+                slot,
+                block.clone(),
+                state_ssz.clone(),
+            ))
+            .await
+            .expect("commit_anchor seeds a non-genesis anchor");
+        assert!(
+            archive.block_is_durable(root.into_array()).unwrap(),
+            "anchor body is durable after commit_anchor"
+        );
+        assert_anchor_rows(&ExpectedAnchor {
+            engine: &engine,
+            root: &root,
+            parent: &parent,
+            state: &state,
+            node_id: &node_id,
+            slot,
+            block: &block,
+            state_ssz: &state_ssz,
+            scalars: &scalars,
+            cursor_seq: before.seq.saturating_add(1),
+            session_id: before.session_id,
+        });
+
+        let child_root = Root::from_array([0x43; 32]);
+        let child = synth_block(slot + 1, &root, &state);
+        archive
+            .ingest_block(IngestBlock {
+                parent_root: root.into_array(),
+                slot: slot + 1,
+                block_root: child_root.into_array(),
+                ssz: Bytes::from(child),
+            })
+            .await
+            .expect("unchanged continuity check admits the anchor's first child");
+        assert!(archive.block_is_durable(child_root.into_array()).unwrap());
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct ExpectedAnchor<'a> {
+        engine: &'a Engine,
+        root: &'a Root,
+        parent: &'a Root,
+        state: &'a Root,
+        node_id: &'a Root,
+        slot: u64,
+        block: &'a [u8],
+        state_ssz: &'a [u8],
+        scalars: &'a [u8],
+        cursor_seq: u64,
+        session_id: u64,
+    }
+
+    fn assert_anchor_rows(expected: &ExpectedAnchor<'_>) {
+        let engine = expected.engine;
+        let root = *expected.root;
+        let parent = *expected.parent;
+        let state = *expected.state;
+        let node_id = *expected.node_id;
+        let block = expected.block;
+        let state_ssz = expected.state_ssz;
+        let scalars = expected.scalars;
+        let cursor_seq = expected.cursor_seq;
+        let session_id = expected.session_id;
+        let rt = engine.read().unwrap();
+        let slot = Slot::new(expected.slot);
+        assert_eq!(
+            get_block_by_root(&rt, &root).unwrap().as_deref(),
+            Some(block),
+            "body"
+        );
+        assert_eq!(get_canonical(&rt, slot).unwrap(), Some(root), "canonical");
+        assert_eq!(
+            slot_by_root(&rt, &root).unwrap(),
+            Some((slot, BlockRegion::Cold)),
+            "block_slot_by_root"
+        );
+        assert_eq!(
+            get_state_root(&rt, slot).unwrap(),
+            Some(state),
+            "state_roots"
+        );
+        assert_eq!(
+            get_da_status(&rt, &root).unwrap(),
+            Some((cc_store::DaStatus::Available, slot)),
+            "da_status"
+        );
+        assert_eq!(
+            get_snapshot(&rt, slot).unwrap().as_deref(),
+            Some(state_ssz),
+            "snapshot"
+        );
+        let info = AnchorInfo::from_ssz_bytes(
+            &rt.get(TABLE_META, KEY_ANCHOR_INFO.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            info,
+            AnchorInfo {
+                anchor_slot: slot,
+                anchor_root: root,
+                anchor_state_root: state,
+                node_id,
+                oldest_block_slot: slot,
+                oldest_block_parent: parent,
+            }
+        );
+        assert_eq!(
+            load_split(&rt).unwrap(),
+            Some(cc_store::Split {
+                slot,
+                state_root: state,
+                block_root: root,
+            })
+        );
+        assert_eq!(
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                .unwrap()
+                .unwrap(),
+            scalars,
+            "scalars"
+        );
+        let cursor = WriteCursor::from_ssz_bytes(
+            &rt.get(TABLE_META, cc_store::meta::KEY_WRITE_CURSOR.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cursor.session_id, session_id);
+        assert_eq!(cursor.seq, cursor_seq);
+        assert_eq!(cursor.slot, slot);
+        assert_eq!(cursor.root, root);
+        let marker = SnapshotCompletion::from_ssz_bytes(
+            &rt.get(TABLE_META, KEY_SNAPSHOT_COMPLETION.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker,
+            SnapshotCompletion {
+                slot,
+                state_root: state,
+                bytes: state_ssz.len() as u64,
+            }
+        );
+        let (completed, completed_ssz) = completed_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(completed, marker);
+        assert_eq!(completed_ssz, state_ssz);
+    }
+
+    #[tokio::test]
+    async fn second_commit_anchor_is_refused() {
+        let (dir, _engine, archive, shutdown_tx) = block_archive("second-anchor");
+        let parent = Root::from_array([0x11; 32]);
+        let root = Root::from_array([0x42; 32]);
+        let state = Root::from_array([0xF0; 32]);
+        let slot = 64u64;
+        let block = synth_block(slot, &parent, &state);
+        let anchor = trusted_anchor(
+            &root,
+            &parent,
+            &state,
+            slot,
+            block,
+            b"anchor-state".to_vec(),
+        );
+        archive.commit_anchor(anchor.clone()).await.unwrap();
+        let err = archive.commit_anchor(anchor).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreNotUninitialized,
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "seam failed precondition: STORE_NOT_UNINITIALIZED"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn commit_anchor_on_incomplete_store_is_refused() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("incomplete-anchor");
+        let planted = Root::from_array([0x77; 32]);
+        let planted_ssz = synth_block(
+            3,
+            &Root::from_array([0x10; 32]),
+            &Root::from_array([0xF2; 32]),
+        );
+        {
+            let rt = engine.read().unwrap();
+            let mut batch = engine.batch();
+            put_block(
+                &rt,
+                &mut batch,
+                Slot::new(3),
+                &planted,
+                &planted_ssz,
+                BlockRegion::Hot,
+                false,
+            )
+            .unwrap();
+            drop(rt);
+            engine.commit(batch).unwrap();
+        }
+        let parent = Root::from_array([0x11; 32]);
+        let root = Root::from_array([0x42; 32]);
+        let state = Root::from_array([0xF0; 32]);
+        let err = archive
+            .commit_anchor(trusted_anchor(
+                &root,
+                &parent,
+                &state,
+                64,
+                synth_block(64, &parent, &state),
+                b"anchor-state".to_vec(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreNotUninitialized,
+                }
+            ),
+            "block row without AnchorInfo is not Uninitialized: {err}"
+        );
+        let rt = engine.read().unwrap();
+        assert!(
+            rt.get(TABLE_META, KEY_ANCHOR_INFO.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(get_block_by_root(&rt, &root).unwrap().is_none());
+        assert_eq!(
+            get_block_by_root(&rt, &planted).unwrap().as_deref(),
+            Some(planted_ssz.as_slice())
+        );
+        drop(rt);
+
+        let (dir_only, engine_only, archive_only, shutdown_only) =
+            block_archive("anchor-info-only");
+        let stray = AnchorInfo {
+            anchor_slot: Slot::new(1),
+            anchor_root: Root::from_array([0x01; 32]),
+            ..AnchorInfo::default()
+        };
+        {
+            let mut batch = engine_only.batch();
+            batch.put(
+                TABLE_META,
+                KEY_ANCHOR_INFO.as_bytes(),
+                &stray.as_ssz_bytes(),
+            );
+            engine_only.commit(batch).unwrap();
+        }
+        let err = archive_only
+            .commit_anchor(trusted_anchor(
+                &root,
+                &parent,
+                &state,
+                64,
+                synth_block(64, &parent, &state),
+                b"anchor-state".to_vec(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreNotUninitialized,
+                }
+            ),
+            "AnchorInfo without a body is not Uninitialized: {err}"
+        );
+        assert!(!archive_only.block_is_durable(root.into_array()).unwrap());
+
+        let _ = shutdown_tx.send(true);
+        let _ = shutdown_only.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_only);
+    }
+
+    #[tokio::test]
+    async fn commit_anchor_failure_leaves_store_uninitialized() {
+        let (dir, engine) = eng("anchor-crash");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let faults = WriterFaults {
+            fail_next_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            panic_next: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let handle = spawn_writer(
+            std::sync::Arc::clone(&engine),
+            metrics(),
+            WriterBounds::default(),
+            faults,
+            shutdown_rx,
+            false,
+        );
+        ArchiveWriter::ensure_write_cursor(&engine).unwrap();
+        let archive = ArchiveWriter::new(handle, std::sync::Arc::clone(&engine));
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+
+        let parent = Root::from_array([0x11; 32]);
+        let root = Root::from_array([0x42; 32]);
+        let state = Root::from_array([0xF0; 32]);
+        let slot = 64u64;
+        let block = synth_block(slot, &parent, &state);
+        let state_ssz = b"anchor-state-ssz".to_vec();
+        let anchor = trusted_anchor(
+            &root,
+            &parent,
+            &state,
+            slot,
+            block.clone(),
+            state_ssz.clone(),
+        );
+        let err = archive.commit_anchor(anchor.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, SeamError::Unavailable(_)),
+            "injected failure before commit: {err}"
+        );
+        assert!(!archive.block_is_durable(root.into_array()).unwrap());
+        {
+            let rt = engine.read().unwrap();
+            assert!(
+                rt.get(TABLE_META, KEY_ANCHOR_INFO.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(rt.get(TABLE_META, KEY_SPLIT.as_bytes()).unwrap().is_none());
+            assert!(
+                rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                rt.get(TABLE_META, KEY_SNAPSHOT_COMPLETION.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(get_snapshot(&rt, Slot::new(slot)).unwrap().is_none());
+            assert!(get_state_root(&rt, Slot::new(slot)).unwrap().is_none());
+            assert!(get_da_status(&rt, &root).unwrap().is_none());
+            assert!(get_canonical(&rt, Slot::new(slot)).unwrap().is_none());
+        }
+        let cursor = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(cursor.seq, before.seq);
+        assert_eq!(cursor.root, before.root);
+        assert!(
+            store_is_uninitialized(&engine).unwrap(),
+            "a failed anchor leaves the store Uninitialized"
+        );
+
+        archive.commit_anchor(anchor).await.unwrap();
+        assert!(archive.block_is_durable(root.into_array()).unwrap());
+        assert!(!store_is_uninitialized(&engine).unwrap());
+
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&dir);
     }

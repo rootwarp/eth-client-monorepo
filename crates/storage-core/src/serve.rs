@@ -1261,6 +1261,7 @@ fn writer_status(err: WriterError) -> Status {
     match err {
         WriterError::InjectedFailure => Status::aborted("injected commit failure"),
         WriterError::ShutDown => Status::unavailable("writer shut down"),
+        WriterError::NotUninitialized => Status::failed_precondition("STORE_NOT_UNINITIALIZED"),
         WriterError::Store(e) => store_status(e),
     }
 }

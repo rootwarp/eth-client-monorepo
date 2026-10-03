@@ -1,7 +1,10 @@
 //! Singleton SSZ meta records (Architecture §2.5).
 //!
 //! Ten containers live in the `meta` table under short ASCII keys (≤ 16 B),
-//! plus `node_id` for I-node-id identity (S2-J-01; not an origin floor).
+//! plus `node_id` for I-node-id identity (S2-J-01; not an origin floor),
+//! plus [`SnapshotCompletion`] (`snap_complete`) — the one snapshot
+//! completion marker. Chunked snapshot writes reuse this key; they do
+//! not add a second marker.
 //! Each is **defined** here and **populated** by its owning issue:
 //! `Split` / CC-41, `ServeWindow` / CC-48, `WriteCursor` / CC-44b,
 //! `ForkChoiceScalars` / CC-45b, `PruneMarks` / CC-46a, `BackfillProgress` / CC-47a.
@@ -42,6 +45,8 @@ pub const KEY_PRUNE_MARKS: &str = "prune_marks";
 pub const KEY_BACKFILL_PROG: &str = "backfill_prog";
 /// Key for the I-node-id identity `Root` (S2-J-01). Not an `AnchorInfo` origin.
 pub const KEY_NODE_ID: &str = "node_id";
+/// Key for [`SnapshotCompletion`]. One marker for the anchor and for chunked snapshots.
+pub const KEY_SNAPSHOT_COMPLETION: &str = "snap_complete";
 
 /// All meta singleton keys (for inventory / docs).
 pub const META_KEYS: &[&str] = &[
@@ -56,6 +61,7 @@ pub const META_KEYS: &[&str] = &[
     KEY_PRUNE_MARKS,
     KEY_BACKFILL_PROG,
     KEY_NODE_ID,
+    KEY_SNAPSHOT_COMPLETION,
 ];
 
 // ---------------------------------------------------------------------------
@@ -102,6 +108,22 @@ pub struct AnchorInfo {
     pub oldest_block_slot: Slot,
     /// Parent of the oldest retained block.
     pub oldest_block_parent: Root,
+}
+
+/// Newest snapshot whose bytes are complete.
+///
+/// A `snapshots` row is not the newest snapshot until this record names
+/// its slot and byte length. The anchor writes it in the same transaction
+/// as the first snapshot. A later chunked snapshot updates this same key
+/// in the final chunk's transaction — not a second marker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
+pub struct SnapshotCompletion {
+    /// Slot of the completed snapshot.
+    pub slot: Slot,
+    /// Caller-supplied state root. Storage does not hash the snapshot SSZ.
+    pub state_root: Root,
+    /// Length of the completed value at `snapshots[slot]`.
+    pub bytes: u64,
 }
 
 /// Column custody watermark info.
