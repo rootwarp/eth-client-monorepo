@@ -11,8 +11,9 @@ use crate::codec::SszLimits;
 /// Fixed SSZ length of `Status v2` (4+32+8+32+8+8).
 pub const STATUS_V2_SSZ_LEN: usize = 92;
 
-/// SSZ length of `BeaconBlocksByRange` request: two `uint64`.
-pub const BY_RANGE_BLOCKS_SSZ_LEN: usize = 16;
+/// SSZ length of `BeaconBlocksByRange` request: three `uint64`
+/// (`start_slot`, `count`, `step`). `step` is deprecated but required.
+pub const BY_RANGE_BLOCKS_SSZ_LEN: usize = 24;
 
 /// Fixed prefix of a column by-range SSZ container before the columns list body.
 pub const COLUMNS_BY_RANGE_FIXED_PREFIX: usize = 20;
@@ -205,6 +206,9 @@ impl StatusV2 {
 }
 
 /// `BeaconBlocksByRange v2` request body.
+///
+/// `step` is not a field: the encoder always writes 1 and the decoder
+/// rejects any other value (phase0 p2p-interface: deprecated, must be 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlocksByRangeRequest {
     /// First slot (inclusive).
@@ -214,16 +218,20 @@ pub struct BlocksByRangeRequest {
 }
 
 impl BlocksByRangeRequest {
-    /// SSZ-encode `(start_slot, count)`.
+    /// Spec-deprecated `step`. The p2p-interface requires this value.
+    const STEP: u64 = 1;
+
+    /// SSZ-encode `(start_slot, count, step = 1)`.
     #[must_use]
     pub fn to_ssz_bytes(self) -> [u8; BY_RANGE_BLOCKS_SSZ_LEN] {
         let mut out = [0u8; BY_RANGE_BLOCKS_SSZ_LEN];
         out[0..8].copy_from_slice(&self.start_slot.as_u64().to_le_bytes());
         out[8..16].copy_from_slice(&self.count.to_le_bytes());
+        out[16..24].copy_from_slice(&Self::STEP.to_le_bytes());
         out
     }
 
-    /// SSZ-decode; length must be exactly 16.
+    /// SSZ-decode; length must be exactly 24 and `step` must be 1.
     pub fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, io::Error> {
         if bytes.len() != BY_RANGE_BLOCKS_SSZ_LEN {
             return Err(io::Error::new(
@@ -244,6 +252,17 @@ impl BlocksByRangeRequest {
                 .try_into()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "count"))?,
         );
+        let step = u64::from_le_bytes(
+            bytes[16..24]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "step"))?,
+        );
+        if step != Self::STEP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("by_range step {step} != {}", Self::STEP),
+            ));
+        }
         Ok(Self {
             start_slot: Slot::new(start),
             count,
@@ -473,7 +492,71 @@ mod tests {
             count: 1,
         };
         let bytes = r.to_ssz_bytes();
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(&bytes[16..24], &1u64.to_le_bytes());
         assert_eq!(BlocksByRangeRequest::from_ssz_bytes(&bytes).unwrap(), r);
+    }
+
+    /// consensus-specs `v1.7.0-alpha.13` `specs/phase0/p2p-interface.md`
+    /// defines the `BeaconBlocksByRange` request (unchanged in Altair; Fulu
+    /// does not touch it) as the fixed tuple
+    /// `(start_slot: Slot, count: uint64, step: uint64)` with step
+    /// "Deprecated, must be set to 1".
+    ///
+    /// A fixed-size container serializes as the concatenation of its fields:
+    /// three little-endian `uint64`s, no offset table. The definition sits in
+    /// a bare fence, not `class BeaconBlocksByRangeRequest(Container)`, so
+    /// `consensus-spec-tests` ships no `ssz_static/BeaconBlocksByRangeRequest`.
+    /// Bytes below are hand-pinned from that derivation. Agreement of copied
+    /// `request_limits` tables (min = max = 24) is not this check.
+    ///
+    /// `start_slot = 1, count = 2, step = 1` →
+    /// `01 00 00 00 00 00 00 00 | 02 00 00 00 00 00 00 00 | 01 00 00 00 00 00 00 00`
+    #[test]
+    fn blocks_by_range_matches_hand_pinned_bytes() {
+        const FIXTURE: [u8; 24] = [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // start_slot = 1
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // count = 2
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // step = 1
+        ];
+        let req = BlocksByRangeRequest {
+            start_slot: Slot::new(1),
+            count: 2,
+        };
+        assert_eq!(BY_RANGE_BLOCKS_SSZ_LEN, FIXTURE.len());
+        assert_eq!(req.to_ssz_bytes(), FIXTURE);
+        assert_eq!(BlocksByRangeRequest::from_ssz_bytes(&FIXTURE).unwrap(), req);
+    }
+
+    /// Spec: `step` is deprecated and must be 1. A 16-byte `(start_slot, count)`
+    /// body is the pre-fix shape and is not the v2 request.
+    #[test]
+    fn blocks_by_range_rejects_step_not_one() {
+        let bad_step: [u8; 24] = [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // start_slot = 1
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // count = 1
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // step = 2
+        ];
+        let err = BlocksByRangeRequest::from_ssz_bytes(&bad_step).expect_err("step != 1");
+        let msg = err.to_string();
+        assert!(msg.contains("step"), "expected step rejection, got {msg}");
+
+        let zero_step: [u8; 24] = [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // start_slot = 1
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // count = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // step = 0
+        ];
+        let err0 = BlocksByRangeRequest::from_ssz_bytes(&zero_step).expect_err("step == 0");
+        assert!(
+            err0.to_string().contains("step"),
+            "expected step rejection, got {err0}"
+        );
+
+        let err16 = BlocksByRangeRequest::from_ssz_bytes(&[0u8; 16]).expect_err("16-byte body");
+        assert!(
+            err16.to_string().contains("16"),
+            "expected length rejection, got {err16}"
+        );
     }
 
     #[test]
