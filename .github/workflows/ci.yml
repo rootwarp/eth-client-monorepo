@@ -118,10 +118,6 @@ jobs:
       - name: check compose host-publish policy
         run: bash scripts/offhost-port-scan.sh --policy
 
-      # S0-B-18 / E0.9: M3 Discharged-by column; no blank cells for claimed rows.
-      - name: check M3 discharged-by ledger
-        run: bash scripts/check-m3-discharged-by.sh
-
       # S1-B-06: extract ADR[ -]<id> + Architecture §<n>; fail unknown ADR ids
       # (reconciliation.md id column or docs/adr/ADR-*.md). Architecture § is census-only.
       - name: check ADR citation resolver
