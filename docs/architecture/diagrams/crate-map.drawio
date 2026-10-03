@@ -1,0 +1,582 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mxfile host="drawio">
+  <diagram id="crate-map" name="crate-map">
+    <mxGraphModel grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="0" page="0" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="implied" parent="0" value="implied edges" visible="0" />
+        <mxCell id="cc-attestation" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;" value="&lt;b&gt;cc-attestation&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;services/attestation&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="186" x="2434.31" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-beacon-api" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;" value="&lt;b&gt;cc-beacon-api&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;services/beacon-api&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="194" x="2210.31" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-beacon-core" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" value="&lt;b&gt;cc-beacon-core&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;bin/beacon-core&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="181" x="1861.83" y="78" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-beacon-import" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" value="&lt;b&gt;cc-beacon-import&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/beacon-import&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="217" x="629.83" y="294" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-beacon-inproc" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" value="&lt;b&gt;cc-beacon-inproc&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/beacon-inproc&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="216" x="222" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-bootstrap" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" value="&lt;b&gt;cc-bootstrap&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/bootstrap&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1939.64" y="574" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-chain" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;" value="&lt;b&gt;cc-chain&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;services/chain&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1892.5" y="186" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-chain-core" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" value="&lt;b&gt;cc-chain-core&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/chain-core&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1892.5" y="294" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-config" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" value="&lt;b&gt;cc-config&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/config&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1450.5" y="694" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-crypto" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" value="&lt;b&gt;cc-crypto&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/crypto&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1009.5" y="694" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-devnet-gen" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" value="&lt;b&gt;cc-devnet-gen&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;bin/devnet-gen&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="889" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-engine" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;" value="&lt;b&gt;cc-engine&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;services/engine&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1642.5" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-engine-api" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" value="&lt;b&gt;cc-engine-api&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/engine-api&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1370.5" y="574" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-fork-choice" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" value="&lt;b&gt;cc-fork-choice&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/fork-choice&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="181" x="678" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-libp2p" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" value="&lt;b&gt;cc-libp2p&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/libp2p&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1240.5" y="694" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-p2p" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;" value="&lt;b&gt;cc-p2p&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;services/p2p&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1441.5" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-proto" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" value="&lt;b&gt;cc-proto&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/proto&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1660.5" y="694" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-scheduler" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" value="&lt;b&gt;cc-scheduler&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/scheduler&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1852.5" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-seam" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" value="&lt;b&gt;cc-seam&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/seam&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1110.5" y="574" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-serve-probe" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" value="&lt;b&gt;cc-serve-probe&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;bin/serve-probe&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="2149.64" y="574" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-spec-tests" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" value="&lt;b&gt;cc-spec-tests&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/spec-tests&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1226.155" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-state-transition" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" value="&lt;b&gt;cc-state-transition&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/state-transition&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="221" x="868.5" y="574" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-storage" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;" value="&lt;b&gt;cc-storage&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;services/storage&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="2102.5" y="294" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-storage-core" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" value="&lt;b&gt;cc-storage-core&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/storage-core&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="199" x="1221.5" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-store" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" value="&lt;b&gt;cc-store&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/store&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="450" y="574" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-store-bench" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" value="&lt;b&gt;cc-store-bench&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;bin/store-bench&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="468" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-store-tool" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" value="&lt;b&gt;cc-store-tool&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;bin/cc-store&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="12" y="414" as="geometry" />
+        </mxCell>
+        <mxCell id="cc-types" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" value="&lt;b&gt;cc-types&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;crates/types&lt;/font&gt;" vertex="1">
+          <mxGeometry height="48" width="180" x="1009.5" y="802" as="geometry" />
+        </mxCell>
+        <mxCell id="e:cc-attestation:cc-bootstrap" edge="1" parent="1" source="cc-attestation" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.3333;exitY=1;entryX=0.8572;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-bootstrap">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2496.31" y="488" />
+              <mxPoint x="2093.93" y="488" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-attestation:cc-proto" edge="1" parent="1" source="cc-attestation" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.6667;exitY=1;entryX=0.8;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-proto">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2558.31" y="598" />
+              <mxPoint x="2558.31" y="678" />
+              <mxPoint x="1804.5" y="678" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-beacon-api:cc-bootstrap" edge="1" parent="1" source="cc-beacon-api" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.3334;exitY=1;entryX=0.7143;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-bootstrap">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2274.98" y="478" />
+              <mxPoint x="2068.21" y="478" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-beacon-api:cc-proto" edge="1" parent="1" source="cc-beacon-api" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.6666;exitY=1;entryX=0.6;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-proto">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2339.64" y="598" />
+              <mxPoint x="2339.64" y="668" />
+              <mxPoint x="1768.5" y="668" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-beacon-core:cc-chain" edge="1" parent="1" source="cc-beacon-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.6667;exitY=1;entryX=0.5;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-chain">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1982.5" y="156" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-beacon-core:cc-storage-core" edge="1" parent="1" source="cc-beacon-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.3334;exitY=1;entryX=0.5;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-storage-core">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1922.17" y="142" />
+              <mxPoint x="1321" y="142" />
+              <mxPoint x="1321" y="318" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-beacon-import:cc-beacon-inproc" edge="1" parent="1" source="cc-beacon-import" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.25;exitY=1;entryX=0.5;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-beacon-inproc">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="684.08" y="358" />
+              <mxPoint x="330" y="358" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-beacon-import:cc-fork-choice" edge="1" parent="1" source="cc-beacon-import" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.3333;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-fork-choice">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="738.33" y="378" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-beacon-import:cc-storage-core" edge="1" parent="1" source="cc-beacon-import" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.75;exitY=1;entryX=0.25;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-storage-core">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="792.58" y="368" />
+              <mxPoint x="1271.25" y="368" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-beacon-inproc:cc-store" edge="1" parent="1" source="cc-beacon-inproc" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.4;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-store">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="330" y="478" />
+              <mxPoint x="522" y="478" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-bootstrap:cc-config" edge="1" parent="1" source="cc-bootstrap" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.3333;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-config">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2029.64" y="638" />
+              <mxPoint x="1510.5" y="638" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-chain:cc-chain-core" edge="1" parent="1" source="cc-chain" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.5;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-chain-core">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1982.5" y="264" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-chain-core:cc-bootstrap" edge="1" parent="1" source="cc-chain-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.8333;exitY=1;entryX=0.5714;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-bootstrap">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2042.5" y="438" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-chain-core:cc-engine-api" edge="1" parent="1" source="cc-chain-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.3333;exitY=1;entryX=0.3333;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-engine-api">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1952.5" y="368" />
+              <mxPoint x="1430.5" y="368" />
+              <mxPoint x="1430.5" y="438" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-chain-core:cc-fork-choice" edge="1" parent="1" source="cc-chain-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.1667;exitY=1;entryX=0.6667;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-fork-choice">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1922.5" y="358" />
+              <mxPoint x="798.67" y="358" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-chain-core:cc-scheduler" edge="1" parent="1" source="cc-chain-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.6667;exitY=1;entryX=0.5;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-scheduler">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2012.5" y="398" />
+              <mxPoint x="1942.5" y="398" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-chain-core:cc-seam" edge="1" parent="1" source="cc-chain-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.75;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-seam">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1982.5" y="378" />
+              <mxPoint x="1631.5" y="378" />
+              <mxPoint x="1631.5" y="528" />
+              <mxPoint x="1245.5" y="528" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-crypto:cc-types" edge="1" parent="1" source="cc-crypto" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.5;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-types">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1099.5" y="772" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-devnet-gen:cc-state-transition" edge="1" parent="1" source="cc-devnet-gen" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.5;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-state-transition">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="979" y="518" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-engine:cc-bootstrap" edge="1" parent="1" source="cc-engine" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.75;exitY=1;entryX=0.4286;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-bootstrap">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1777.5" y="478" />
+              <mxPoint x="2016.79" y="478" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-engine:cc-engine-api" edge="1" parent="1" source="cc-engine" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.25;exitY=1;entryX=0.6667;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-engine-api">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1687.5" y="548" />
+              <mxPoint x="1490.5" y="548" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-engine:cc-proto" edge="1" parent="1" source="cc-engine" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.4;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-proto">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1732.5" y="598" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-engine-api:cc-crypto" edge="1" parent="1" source="cc-engine-api" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.75;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-crypto">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1460.5" y="638" />
+              <mxPoint x="1144.5" y="638" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-fork-choice:cc-state-transition" edge="1" parent="1" source="cc-fork-choice" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.25;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-state-transition">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="768.5" y="488" />
+              <mxPoint x="923.75" y="488" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-p2p:cc-bootstrap" edge="1" parent="1" source="cc-p2p" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.8;exitY=1;entryX=0.2857;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-bootstrap">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1585.5" y="538" />
+              <mxPoint x="1991.07" y="538" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-p2p:cc-crypto" edge="1" parent="1" source="cc-p2p" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.2;exitY=1;entryX=0.5;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-crypto">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1477.5" y="498" />
+              <mxPoint x="1099.5" y="498" />
+              <mxPoint x="1099.5" y="598" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-p2p:cc-libp2p" edge="1" parent="1" source="cc-p2p" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.6;exitY=1;entryX=0.3333;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-libp2p">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1549.5" y="538" />
+              <mxPoint x="1300.5" y="538" />
+              <mxPoint x="1300.5" y="598" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-p2p:cc-seam" edge="1" parent="1" source="cc-p2p" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.4;exitY=1;entryX=0.5;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-seam">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1513.5" y="518" />
+              <mxPoint x="1200.5" y="518" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-seam:cc-proto" edge="1" parent="1" source="cc-seam" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.2;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-proto">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1200.5" y="668" />
+              <mxPoint x="1696.5" y="668" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-serve-probe:cc-config" edge="1" parent="1" source="cc-serve-probe" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.6667;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-config">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2239.64" y="658" />
+              <mxPoint x="1570.5" y="658" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-serve-probe:cc-libp2p" edge="1" parent="1" source="cc-serve-probe" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.25;exitY=1;entryX=0.6667;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-libp2p">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2194.64" y="648" />
+              <mxPoint x="1360.5" y="648" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-serve-probe:cc-types" edge="1" parent="1" source="cc-serve-probe" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.75;exitY=1;entryX=0.75;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-types">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2284.64" y="718" />
+              <mxPoint x="2284.64" y="758" />
+              <mxPoint x="1144.5" y="758" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-state-transition:cc-crypto" edge="1" parent="1" source="cc-state-transition" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.25;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-crypto">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="979" y="638" />
+              <mxPoint x="1054.5" y="638" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-storage:cc-storage-core" edge="1" parent="1" source="cc-storage" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.75;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-storage-core">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="2192.5" y="388" />
+              <mxPoint x="1370.75" y="388" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-storage-core:cc-bootstrap" edge="1" parent="1" source="cc-storage-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.8;exitY=1;entryX=0.1429;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-bootstrap">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1380.7" y="558" />
+              <mxPoint x="1965.36" y="558" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-storage-core:cc-seam" edge="1" parent="1" source="cc-storage-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.6;exitY=1;entryX=0.25;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-seam">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1340.9" y="508" />
+              <mxPoint x="1155.5" y="508" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-storage-core:cc-state-transition" edge="1" parent="1" source="cc-storage-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.4;exitY=1;entryX=0.75;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-state-transition">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1301.1" y="488" />
+              <mxPoint x="1034.25" y="488" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-storage-core:cc-store" edge="1" parent="1" source="cc-storage-core" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.2;exitY=1;entryX=0.8;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-store">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1261.3" y="478" />
+              <mxPoint x="594" y="478" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-store:cc-types" edge="1" parent="1" source="cc-store" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.25;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-types">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="540" y="718" />
+              <mxPoint x="540" y="758" />
+              <mxPoint x="1054.5" y="758" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-store-bench:cc-store" edge="1" parent="1" source="cc-store-bench" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.6;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-store">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="558" y="518" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e:cc-store-tool:cc-store" edge="1" parent="1" source="cc-store-tool" style="rounded=1;html=1;endArrow=block;endSize=6;strokeColor=#555555;curved=0;exitX=0.5;exitY=1;entryX=0.2;entryY=0;edgeStyle=orthogonalEdgeStyle;" target="cc-store">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="102" y="488" />
+              <mxPoint x="486" y="488" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="title" parent="1" vertex="1" value="&lt;b&gt;Workspace crate map&lt;/b&gt; (28 crates, 83 normal dependency edges; 41 drawn)" style="text;html=1;align=left;verticalAlign=middle;fontSize=16;">
+          <mxGeometry as="geometry" x="12.0" y="-50.0" width="640" height="30" />
+        </mxCell>
+        <mxCell id="legend" parent="1" vertex="1" value="Layers (bands of 02-crate-map.md)" style="swimlane;startSize=26;html=1;fillColor=#ffffff;strokeColor=#999999;fontStyle=1;">
+          <mxGeometry as="geometry" x="2680.31" y="0.0" width="230" height="356" />
+        </mxCell>
+        <mxCell id="legend:bins" parent="legend" vertex="1" value="bins" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;">
+          <mxGeometry as="geometry" x="12" y="34" width="206" height="26" />
+        </mxCell>
+        <mxCell id="legend:test-tooling" parent="legend" vertex="1" value="test tooling" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;">
+          <mxGeometry as="geometry" x="12" y="68" width="206" height="26" />
+        </mxCell>
+        <mxCell id="legend:services" parent="legend" vertex="1" value="services" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;">
+          <mxGeometry as="geometry" x="12" y="102" width="206" height="26" />
+        </mxCell>
+        <mxCell id="legend:storage" parent="legend" vertex="1" value="storage" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;">
+          <mxGeometry as="geometry" x="12" y="136" width="206" height="26" />
+        </mxCell>
+        <mxCell id="legend:host-libs" parent="legend" vertex="1" value="host libs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;">
+          <mxGeometry as="geometry" x="12" y="170" width="206" height="26" />
+        </mxCell>
+        <mxCell id="legend:seams" parent="legend" vertex="1" value="seams / contracts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;">
+          <mxGeometry as="geometry" x="12" y="204" width="206" height="26" />
+        </mxCell>
+        <mxCell id="legend:pure-consensus" parent="legend" vertex="1" value="pure consensus" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;">
+          <mxGeometry as="geometry" x="12" y="238" width="206" height="26" />
+        </mxCell>
+        <mxCell id="legend:note" parent="legend" vertex="1" value="Arrow = depends on (Cargo normal deps). Transitive reduction shown; turn on layer &quot;implied edges&quot; for the rest. Generated by scripts/gen-crate-map.sh." style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;fontSize=10;">
+          <mxGeometry as="geometry" x="12" y="272" width="206" height="86" />
+        </mxCell>
+        <mxCell id="i:cc-attestation:cc-config" edge="1" parent="implied" source="cc-attestation" target="cc-config" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-api:cc-config" edge="1" parent="implied" source="cc-beacon-api" target="cc-config" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-core:cc-bootstrap" edge="1" parent="implied" source="cc-beacon-core" target="cc-bootstrap" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-core:cc-chain-core" edge="1" parent="implied" source="cc-beacon-core" target="cc-chain-core" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-core:cc-config" edge="1" parent="implied" source="cc-beacon-core" target="cc-config" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-core:cc-engine-api" edge="1" parent="implied" source="cc-beacon-core" target="cc-engine-api" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-core:cc-proto" edge="1" parent="implied" source="cc-beacon-core" target="cc-proto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-core:cc-types" edge="1" parent="implied" source="cc-beacon-core" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-import:cc-crypto" edge="1" parent="implied" source="cc-beacon-import" target="cc-crypto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-import:cc-seam" edge="1" parent="implied" source="cc-beacon-import" target="cc-seam" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-import:cc-state-transition" edge="1" parent="implied" source="cc-beacon-import" target="cc-state-transition" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-import:cc-store" edge="1" parent="implied" source="cc-beacon-import" target="cc-store" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-import:cc-types" edge="1" parent="implied" source="cc-beacon-import" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-beacon-inproc:cc-types" edge="1" parent="implied" source="cc-beacon-inproc" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-bootstrap" edge="1" parent="implied" source="cc-chain" target="cc-bootstrap" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-config" edge="1" parent="implied" source="cc-chain" target="cc-config" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-crypto" edge="1" parent="implied" source="cc-chain" target="cc-crypto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-engine-api" edge="1" parent="implied" source="cc-chain" target="cc-engine-api" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-fork-choice" edge="1" parent="implied" source="cc-chain" target="cc-fork-choice" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-proto" edge="1" parent="implied" source="cc-chain" target="cc-proto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-scheduler" edge="1" parent="implied" source="cc-chain" target="cc-scheduler" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-seam" edge="1" parent="implied" source="cc-chain" target="cc-seam" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-state-transition" edge="1" parent="implied" source="cc-chain" target="cc-state-transition" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain:cc-types" edge="1" parent="implied" source="cc-chain" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain-core:cc-crypto" edge="1" parent="implied" source="cc-chain-core" target="cc-crypto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain-core:cc-proto" edge="1" parent="implied" source="cc-chain-core" target="cc-proto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain-core:cc-state-transition" edge="1" parent="implied" source="cc-chain-core" target="cc-state-transition" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-chain-core:cc-types" edge="1" parent="implied" source="cc-chain-core" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-devnet-gen:cc-crypto" edge="1" parent="implied" source="cc-devnet-gen" target="cc-crypto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-devnet-gen:cc-types" edge="1" parent="implied" source="cc-devnet-gen" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-engine:cc-config" edge="1" parent="implied" source="cc-engine" target="cc-config" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-engine:cc-crypto" edge="1" parent="implied" source="cc-engine" target="cc-crypto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-engine:cc-types" edge="1" parent="implied" source="cc-engine" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-engine-api:cc-types" edge="1" parent="implied" source="cc-engine-api" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-fork-choice:cc-types" edge="1" parent="implied" source="cc-fork-choice" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-p2p:cc-config" edge="1" parent="implied" source="cc-p2p" target="cc-config" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-p2p:cc-proto" edge="1" parent="implied" source="cc-p2p" target="cc-proto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-p2p:cc-types" edge="1" parent="implied" source="cc-p2p" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-state-transition:cc-types" edge="1" parent="implied" source="cc-state-transition" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-storage-core:cc-config" edge="1" parent="implied" source="cc-storage-core" target="cc-config" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-storage-core:cc-proto" edge="1" parent="implied" source="cc-storage-core" target="cc-proto" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+        <mxCell id="i:cc-storage-core:cc-types" edge="1" parent="implied" source="cc-storage-core" target="cc-types" style="html=1;endArrow=block;endSize=6;dashed=1;strokeColor=#aaaaaa;">
+          <mxGeometry as="geometry" relative="1" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

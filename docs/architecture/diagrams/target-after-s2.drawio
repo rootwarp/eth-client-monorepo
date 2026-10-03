@@ -1,0 +1,32 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mxfile host="drawio">
+  <diagram id="target-after-s2" name="target-after-s2">
+    <mxGraphModel background="#ffffff">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="c1" value="&lt;b&gt;Target after S2&lt;/b&gt; (plan/architecture.md &amp;#167;0) &amp;#8212; design, not deployed; arrows carry no status" style="text;html=1;align=left;verticalAlign=middle;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="40" y="10" width="1100" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="p2p" value="&lt;b&gt;p2p&lt;/b&gt;&lt;br&gt;libp2p host" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#f5f5f5;strokeColor=#666666;fillColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="60" y="90" width="220" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="core" value="&lt;b&gt;beacon-core&lt;/b&gt;&lt;br&gt;chain + storage + engine&lt;br&gt;one redb" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#f5f5f5;strokeColor=#666666;fillColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="620" y="70" width="280" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="geth" value="&lt;b&gt;geth&lt;/b&gt; (EL)" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1140" y="110" width="160" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="c2" value="E1 / E2 / E8 typed handles&lt;br&gt;ChainIngress / P2pEgress&lt;br&gt;transport impl UNDECIDED:&lt;br&gt;in-proc mpsc | unix socket | gRPC&lt;br&gt;([PRD] &amp;#167;9 X1-X5)" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#444444;strokeWidth=2;endArrow=block;startArrow=block;startSize=7;" edge="1" parent="1" source="p2p" target="core">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c3" value="Engine API, JWT:&lt;br&gt;the one external&lt;br&gt;trust edge" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#444444;strokeWidth=2;endArrow=block;startArrow=none;" edge="1" parent="1" source="core" target="geth">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c4" value="Already DELETED at 7d8833d: E3, E4, E7. The plan also deletes E5 and E6; E8 folds into E1's egress half (P2pEgress). TRANSITIONAL today: cc-chain, cc-storage, cc-engine (see the topology diagram). S2 exit gate E2.2 is still open (plan/issues/s2-exit-note.md)." style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="60" y="260" width="1240" height="60" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

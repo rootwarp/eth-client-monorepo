@@ -1,0 +1,149 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mxfile host="drawio">
+  <diagram id="topology-shapes" name="topology-shapes">
+    <mxGraphModel background="#ffffff">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="c1" value="&lt;b&gt;Process topology&lt;/b&gt; &amp;#8212; shape A and shape B as built at &lt;code&gt;7d8833d&lt;/code&gt;" style="text;html=1;align=left;verticalAlign=middle;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="20" y="15" width="1100" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="A" value="Shape A: docker-compose.yml (deployed) &amp;#8212; six CC containers + el" style="swimlane;startSize=28;html=1;fillColor=#f7f9fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="20" y="60" width="1000" height="620" as="geometry" />
+        </mxCell>
+        <mxCell id="p2p" value="&lt;b&gt;cc-p2p :9002&lt;/b&gt;&lt;br&gt;swarm task, discv5, peer manager&lt;br&gt;Status handshake: LIVE&lt;br&gt;gossip: 0 topics subscribed&lt;br&gt;validation pool: IDLE&lt;br&gt;KZG verify pool: DEAD-AS-WIRED" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;spacingTop=6;" vertex="1" parent="A">
+          <mxGeometry x="30" y="50" width="220" height="330" as="geometry" />
+        </mxCell>
+        <mxCell id="chain" value="&lt;b&gt;cc-chain :9001&lt;/b&gt; (TRANSITIONAL)&lt;br&gt;core-absent by default&lt;br&gt;(checkpoint_providers = [])&lt;br&gt;archive = None: never persists&lt;br&gt;EngineApi (DirectEngine iff core)" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;spacingTop=6;" vertex="1" parent="A">
+          <mxGeometry x="560" y="50" width="260" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="storage" value="&lt;b&gt;cc-storage :9006&lt;/b&gt; (TRANSITIONAL)&lt;br&gt;redb + storage-core writer&lt;br&gt;prune LIVE, replay IDLE&lt;br&gt;ArchiveWriter built and dropped" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;spacingTop=6;" vertex="1" parent="A">
+          <mxGeometry x="560" y="250" width="260" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="engine" value="&lt;b&gt;cc-engine :9004&lt;/b&gt; (TRANSITIONAL)&lt;br&gt;EngineService: served, never dialed&lt;br&gt;second, independent EngineApi" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;spacingTop=6;" vertex="1" parent="A">
+          <mxGeometry x="300" y="430" width="220" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="att" value="cc-attestation :9003&lt;br&gt;GetInfo STUB" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#f2f2f2;strokeColor=#8a8a8a;fontColor=#555555;dashed=1;" vertex="1" parent="A">
+          <mxGeometry x="560" y="400" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="bapi" value="cc-beacon-api :9005&lt;br&gt;GetInfo STUB" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#f2f2f2;strokeColor=#8a8a8a;fontColor=#555555;dashed=1;" vertex="1" parent="A">
+          <mxGeometry x="700" y="400" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="c2" value="DELETED (not drawn): E3 chain -&amp;gt; engine gRPC (631994c), E4 RestoreFromStore (60c6200), E7 storage event feed (78a90e1).&lt;br&gt;N3 grpc.health.v1 probes between [peers] are LIVE and not drawn. Edge ids: docs/architecture/03-internal-contracts.md." style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;fontSize=11;" vertex="1" parent="A">
+          <mxGeometry x="30" y="540" width="960" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="elA" value="&lt;b&gt;el&lt;/b&gt;&lt;br&gt;geth v1.17.5&lt;br&gt;authrpc :8551&lt;br&gt;HS256 JWT&lt;br&gt;cc network only" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="110" width="170" height="490" as="geometry" />
+        </mxCell>
+        <mxCell id="c3" value="E1 session + ChainView (p2p dials)" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;startArrow=none;exitX=0;exitY=0.133;exitDx=0;exitDy=0;entryX=1;entryY=0.0606;entryDx=0;entryDy=0;" edge="1" parent="1" source="chain" target="p2p">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c4" value="E1 object / verdict" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#e08a00;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=block;startArrow=block;startSize=7;exitX=1;exitY=0.1667;exitDx=0;exitDy=0;entryX=0;entryY=0.3667;entryDx=0;entryDy=0;" edge="1" parent="1" source="p2p" target="chain">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c5" value="N2 GetValidatorRecords" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#e08a00;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=block;startArrow=none;exitX=1;exitY=0.2727;exitDx=0;exitDy=0;entryX=0;entryY=0.6;entryDx=0;entryDy=0;" edge="1" parent="1" source="p2p" target="chain">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c6" value="E1 publish, E1 column, E2 DataAvailable" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#c62828;strokeWidth=2;dashed=1;dashPattern=2 3;endArrow=cross;startArrow=cross;startSize=7;exitX=1;exitY=0.3788;exitDx=0;exitDy=0;entryX=0;entryY=0.8333;entryDx=0;entryDy=0;" edge="1" parent="1" source="p2p" target="chain">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c7" value="E6 WatchServeWindow (p2p dials;&lt;br&gt;static: eas = u64::MAX)" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;startArrow=none;exitX=0;exitY=0.1923;exitDx=0;exitDy=0;entryX=1;entryY=0.6818;entryDx=0;entryDy=0;" edge="1" parent="1" source="storage" target="p2p">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c8" value="E6 serve reads, E5 PutBackfillBatch" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#c62828;strokeWidth=2;dashed=1;dashPattern=2 3;endArrow=cross;startArrow=none;exitX=1;exitY=0.8333;exitDx=0;exitDy=0;entryX=0;entryY=0.5769;entryDx=0;entryDy=0;" edge="1" parent="1" source="p2p" target="storage">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c9" value="E8 EngineStream:&lt;br&gt;p2p serves, engine never dials" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#8a8a8a;strokeWidth=2;dashed=1;dashPattern=1 4;endArrow=block;startArrow=none;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="engine" target="p2p">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c10" value="eth_syncing upcheck" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;startArrow=none;exitX=1;exitY=0.2;exitDx=0;exitDy=0;entryX=0;entryY=0.0612;entryDx=0;entryDy=0;" edge="1" parent="1" source="chain" target="elA">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c11" value="newPayloadV4 / fcUV3&lt;br&gt;IDLE (iff core)" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#e08a00;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=block;startArrow=none;exitX=1;exitY=0.4667;exitDx=0;exitDy=0;entryX=0;entryY=0.1429;entryDx=0;entryDy=0;" edge="1" parent="1" source="chain" target="elA">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c12" value="eth_syncing upcheck (2nd client, same JWT)" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;startArrow=none;exitX=1;exitY=0.7778;exitDx=0;exitDy=0;entryX=0;entryY=0.9184;entryDx=0;entryDy=0;" edge="1" parent="1" source="engine" target="elA">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="B" value="Shape B: bin/beacon-core (not deployed) &amp;#8212; one process, ChainService :9001 only" style="swimlane;startSize=28;html=1;fillColor=#fbfbfb;strokeColor=#6c8ebf;dashed=1;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="20" y="720" width="1000" height="320" as="geometry" />
+        </mxCell>
+        <mxCell id="core" value="&lt;b&gt;chain-core thread&lt;/b&gt;*&lt;br&gt;owns Store&amp;lt;P&amp;gt;" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;spacingTop=6;verticalAlign=middle;" vertex="1" parent="B">
+          <mxGeometry x="40" y="60" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="ps" value="&lt;b&gt;P2pStream server&lt;/b&gt;&lt;br&gt;no p2p dials shape B" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;spacingTop=6;verticalAlign=middle;" vertex="1" parent="B">
+          <mxGeometry x="40" y="160" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="writer" value="&lt;b&gt;storage-core writer task&lt;/b&gt;&lt;br&gt;P0 32 / P1 64 / P2 256&lt;br&gt;(P1, P2: DEAD-AS-WIRED)" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;spacingTop=6;verticalAlign=middle;" vertex="1" parent="B">
+          <mxGeometry x="480" y="100" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="redb" value="store.redb" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;size=10;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="B">
+          <mxGeometry x="820" y="100" width="120" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="upB" value="&lt;b&gt;EngineApi upcheck driver&lt;/b&gt;&lt;br&gt;spawned even core-absent" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;spacingTop=6;verticalAlign=middle;" vertex="1" parent="B">
+          <mxGeometry x="480" y="210" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="c13" value="* exists only with an installed core; by default B is core-absent (durable set always empty, checkpoint_providers = []).&lt;br&gt;Not hosted: StorageService, prune, replay, migrator, p2p." style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;fontSize=11;" vertex="1" parent="B">
+          <mxGeometry x="40" y="240" width="340" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="elB" value="&lt;b&gt;EL&lt;/b&gt; (geth)&lt;br&gt;authrpc :8551&lt;br&gt;HS256 JWT" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="780" width="170" height="210" as="geometry" />
+        </mxCell>
+        <mxCell id="c14" value="N1 blocks&lt;br&gt;IDLE (iff core)" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#e08a00;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=block;startArrow=none;exitX=1;exitY=0.7857;exitDx=0;exitDy=0;entryX=0;entryY=0.1875;entryDx=0;entryDy=0;" edge="1" parent="1" source="core" target="writer">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c15" value="N1 columns:&lt;br&gt;never injected" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#c62828;strokeWidth=2;dashed=1;dashPattern=2 3;endArrow=cross;startArrow=none;exitX=1;exitY=0.1667;exitDx=0;exitDy=0;entryX=0;entryY=0.875;entryDx=0;entryDy=0;" edge="1" parent="1" source="ps" target="writer">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c16" value="" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#e08a00;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=block;startArrow=none;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="writer" target="redb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c17" value="I5 DirectEngine: newPayloadV4 / fcUV3, IDLE (iff core)" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#e08a00;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=block;startArrow=none;exitX=1;exitY=0.1429;exitDx=0;exitDy=0;entryX=0;entryY=0.05;entryDx=0;entryDy=0;" edge="1" parent="1" source="core" target="elB">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="c18" value="eth_syncing upcheck" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;startArrow=none;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.8095;entryDx=0;entryDy=0;" edge="1" parent="1" source="upB" target="elB">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="legend18" value="Legend (status at 7d8833d; README.md#status-labels)" style="swimlane;startSize=22;html=1;fillColor=#ffffff;strokeColor=#999999;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="20" y="1070" width="1230" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="c19" value="" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;" edge="1" parent="legend18">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="12" y="43" as="sourcePoint" />
+            <mxPoint x="62" y="43" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="c20" value="LIVE: runs and does its job" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;fontSize=11;verticalAlign=middle;" vertex="1" parent="legend18">
+          <mxGeometry x="70" y="30" width="237" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="c21" value="" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#e08a00;strokeWidth=2;dashed=1;dashPattern=8 4;endArrow=block;" edge="1" parent="legend18">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="319" y="43" as="sourcePoint" />
+            <mxPoint x="369" y="43" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="c22" value="IDLE: wired, no input at 7d8833d" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;fontSize=11;verticalAlign=middle;" vertex="1" parent="legend18">
+          <mxGeometry x="377" y="30" width="237" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="c23" value="" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#c62828;strokeWidth=2;dashed=1;dashPattern=2 3;endArrow=cross;" edge="1" parent="legend18">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="626" y="43" as="sourcePoint" />
+            <mxPoint x="676" y="43" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="c24" value="DEAD-AS-WIRED: no producer / caller" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;fontSize=11;verticalAlign=middle;" vertex="1" parent="legend18">
+          <mxGeometry x="684" y="30" width="237" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="c25" value="" style="html=1;rounded=1;edgeStyle=orthogonalEdgeStyle;endSize=7;fontSize=11;labelBackgroundColor=#ffffff;strokeColor=#8a8a8a;strokeWidth=2;dashed=1;dashPattern=1 4;endArrow=block;" edge="1" parent="legend18">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="933" y="43" as="sourcePoint" />
+            <mxPoint x="983" y="43" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="c26" value="served, never dialed in-tree" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;fontSize=11;verticalAlign=middle;" vertex="1" parent="legend18">
+          <mxGeometry x="991" y="30" width="237" height="26" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
