@@ -549,6 +549,8 @@ pub struct BootedNode {
     core: Option<CoreConfig>,
     storage: Arc<StorageRuntime>,
     chain: ChainServiceImpl,
+    /// Core thread joined by [`BootedNode::drain_and_shutdown`] and by serve.
+    core_owner: Arc<Mutex<CoreJoinOwner>>,
 }
 
 impl BootedNode {
@@ -568,6 +570,8 @@ impl BootedNode {
             core: _core,
             storage,
             chain: _chain,
+            // Pre-drain holds the join clone. This Arc is the direct drain path.
+            core_owner: _core_owner,
         } = self;
         let served =
             serve_with_options(bootstrap, spec, routes, options, SignalTrigger::UnixSignals).await;
@@ -588,6 +592,26 @@ impl BootedNode {
     #[must_use]
     pub fn archive(&self) -> cc_storage_core::ArchiveWriter {
         self.storage.archive()
+    }
+
+    /// Join the core thread, then drain the storage mailbox.
+    ///
+    /// Does not listen. [`Self::serve`] is a different exit. `Ok` only when
+    /// the writer stops drained. Dropping [`BootedNode`] is not this drain.
+    pub async fn drain_and_shutdown(self) -> anyhow::Result<()> {
+        let Self {
+            core_owner,
+            storage,
+            ..
+        } = self;
+        let core = {
+            let mut guard = core_owner.lock().unwrap_or_else(|err| err.into_inner());
+            guard.take_for_shutdown()
+        };
+        if let Some(core) = core {
+            core.shutdown_and_join().await;
+        }
+        storage.drain_and_shutdown().await
     }
 
     /// Store head, cursor, and canonical rows. No fcU or event spy.
@@ -653,7 +677,15 @@ async fn boot_with_preset<P: Preset + 'static>(
         }
     };
 
-    let mut bs = cc_bootstrap::init(SERVICE, TelemetrySettings::from(&cfg.service))?;
+    // The first boot installs the process subscriber. A later `boot` in the
+    // same process (this harness's second call) keeps that subscriber.
+    let mut bs = match cc_bootstrap::init(SERVICE, TelemetrySettings::from(&cfg.service)) {
+        Ok(bs) => bs,
+        Err(cc_bootstrap::Error::TracingInit(_)) => {
+            cc_bootstrap::bootstrap_without_tracing(SERVICE)
+        }
+        Err(err) => return Err(err.into()),
+    };
     let chain_metrics = ChainMetrics::register(&mut bs.registry);
     let storage_metrics = StorageMetrics::register(&mut bs.registry);
 
@@ -854,6 +886,7 @@ async fn boot_with_preset<P: Preset + 'static>(
         core,
         storage,
         chain,
+        core_owner,
     })
 }
 
