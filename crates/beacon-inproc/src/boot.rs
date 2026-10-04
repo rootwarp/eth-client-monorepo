@@ -1,7 +1,7 @@
 //! Proto-free twin of `bin/beacon-core/src/boot.rs` `boot_in_process`.
 //!
 //! ```text
-//! open redb  →  durable_set (empty | present)  —  no writer, no Server
+//! open redb  →  uninitialized?  —  no writer, no Server
 //! ```
 //!
 //! Fail-closed gates match storage-core `open` (schema / digest / `I-node-id`).
@@ -9,8 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use cc_store::engine::{Durability, Engine, EngineOptions};
-use cc_store::meta::{AnchorInfo, KEY_ANCHOR_INFO, KEY_FC_SCALARS, KEY_NODE_ID, TABLE_META};
-use cc_store::snapshots::newest_snapshot;
+use cc_store::meta::{AnchorInfo, KEY_ANCHOR_INFO, KEY_NODE_ID, TABLE_META};
 use cc_store::{
     Root, SszDecode, SszEncode, Store, StoreOpenOptions, legacy_config_digest,
     refuse_populated_legacy_open,
@@ -21,7 +20,7 @@ use cc_store::{
 pub enum BootPhase {
     /// `Store::open` returned. No writer / core yet.
     Open,
-    /// Durable set probed (`None` = empty store).
+    /// Restart class probed. A body with no scalars is not uninitialized.
     DurableSet,
 }
 
@@ -62,7 +61,8 @@ pub struct Booted {
     pub store: Store,
     /// Ordered phases. First element is always [`BootPhase::Open`] on success.
     pub phases: Vec<BootPhase>,
-    /// `true` when the store has no fork-choice scalars and no snapshot.
+    /// `true` only when the store is uninitialized: no anchor record and no block row.
+    /// A body with no scalars is not uninitialized.
     pub durable_empty: bool,
 }
 
@@ -74,7 +74,7 @@ pub fn boot_in_process(cfg: &BootConfig) -> anyhow::Result<Booted> {
     let opened = open_and_stamp(cfg)?;
     phases.push(BootPhase::Open);
 
-    let durable_empty = is_store_empty(opened.store.engine())?;
+    let durable_empty = uninitialized_store(opened.store.engine())?;
     phases.push(BootPhase::DurableSet);
 
     Ok(Booted {
@@ -190,17 +190,46 @@ fn persist_anchor_node_id(engine: &Engine, node_id: Root) -> anyhow::Result<()> 
         .map_err(|e| anyhow::anyhow!("persist node_id: {e}"))
 }
 
-/// Empty when no fork-choice scalars and no snapshot (fresh store after open).
-fn is_store_empty(engine: &Engine) -> anyhow::Result<bool> {
+/// Uninitialized: no anchor record and no block row.
+///
+/// A body with no scalars is not uninitialized. Schema and side-key stamps
+/// written by open do not count.
+fn uninitialized_store(engine: &Engine) -> anyhow::Result<bool> {
     let rt = engine
         .read()
-        .map_err(|e| anyhow::anyhow!("read empty-check: {e}"))?;
-    let has_fc = rt
-        .get(TABLE_META, KEY_FC_SCALARS.as_bytes())
-        .map_err(|e| anyhow::anyhow!("read fc_scalars: {e}"))?
-        .is_some();
-    let has_snap = newest_snapshot(&rt).map_err(|e| anyhow::anyhow!("newest snapshot: {e}"))?;
-    Ok(!has_fc && has_snap.is_none())
+        .map_err(|e| anyhow::anyhow!("read restart class: {e}"))?;
+    if rt
+        .get(TABLE_META, KEY_ANCHOR_INFO.as_bytes())
+        .map_err(|e| anyhow::anyhow!("read anchor: {e}"))?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    if rt
+        .has_any(cc_store::TABLE_BLOCKS_HOT)
+        .map_err(|e| anyhow::anyhow!("read hot blocks: {e}"))?
+    {
+        return Ok(false);
+    }
+    if rt
+        .has_any(cc_store::TABLE_BLOCK_SLOT_BY_ROOT)
+        .map_err(|e| anyhow::anyhow!("read block index: {e}"))?
+    {
+        return Ok(false);
+    }
+    for name in engine
+        .table_names()
+        .map_err(|e| anyhow::anyhow!("list tables: {e}"))?
+    {
+        if let Some(("blocks", _)) = cc_store::parse_shard_table(&name)
+            && rt
+                .has_any(&name)
+                .map_err(|e| anyhow::anyhow!("read shard {name}: {e}"))?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn legacy_node_id_from_file(path: Option<&Path>) -> Result<Option<Root>, String> {
@@ -275,4 +304,41 @@ fn parse_gvr(s: Option<&str>) -> anyhow::Result<Option<Root>> {
             .map_err(|e| anyhow::anyhow!("genesis_validators_root hex: {e}"))?;
     }
     Ok(Some(Root::from_array(arr)))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use cc_store::engine::{Durability, EngineOptions};
+    use cc_store::{Store, StoreOpenOptions, legacy_config_digest};
+
+    #[test]
+    fn body_without_scalars_is_not_uninitialized() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("inproc-body-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = StoreOpenOptions::with_digest(
+            EngineOptions::default().with_durability(Durability::None),
+            legacy_config_digest(),
+        )
+        .with_check_invariants(false);
+        let store = Store::open(&dir, opts).unwrap();
+        assert!(uninitialized_store(store.engine()).unwrap());
+        let engine = store.engine();
+        let mut batch = engine.batch();
+        batch.put(cc_store::TABLE_BLOCKS_HOT, b"body-only", b"not-an-anchor");
+        engine.commit(batch).unwrap();
+        assert!(
+            !uninitialized_store(engine).unwrap(),
+            "a body with no scalars is not uninitialized"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

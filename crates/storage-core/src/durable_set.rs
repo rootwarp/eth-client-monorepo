@@ -54,7 +54,7 @@ use crate::node_id::NodeIdExpectation;
 ///
 /// A thirteenth item cannot be added without touching the arity test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum DurableItem {
+pub enum DurableItem {
     /// 1. Anchor state + block + slot/root (immutable). Missing → named failure at open.
     Anchor,
     /// 2. Latest snapshot + slot/root. Missing → degradation (replay from next-older ring member).
@@ -184,7 +184,7 @@ pub(crate) enum MissingBehaviour {
 
 /// Result of assessing one durable item against a seeded (or live) store.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ItemAssessment {
+pub enum ItemAssessment {
     /// Item is present and usable.
     Present,
     /// Named failure: detail always contains [`DurableItem::as_str`].

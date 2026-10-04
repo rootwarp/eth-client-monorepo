@@ -44,7 +44,7 @@ mod writer;
 pub use archive_write::{ArchiveWriter, ServedCanonicalBlock};
 #[cfg(feature = "grpc")]
 pub use boot::{LoadedNodeKey, load_or_create_node_key, run};
-pub use durable_set::{DurableBlock, DurableDaStatus};
+pub use durable_set::{DurableBlock, DurableDaStatus, DurableItem, ItemAssessment};
 pub use metrics::StorageMetrics;
 pub use node_id::{NodeIdExpectation, NodeIdScheme};
 pub use open::{
@@ -52,6 +52,7 @@ pub use open::{
     StorageRuntime, durable_frontier, durable_set, open, reopen_durable_frontier, start_writer,
     start_writer_from_store,
 };
+pub use resume::{RestartState, classify};
 
 #[cfg(test)]
 mod s2_a_09_tests {

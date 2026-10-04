@@ -188,28 +188,9 @@ fn schema_check(engine: &Engine, ctx: &DurableSetContext) -> Result<(), ResumeEr
     }
 }
 
-/// `!has_fc && !has_snap`. A body with no scalars still reports empty.
-///
-/// Not the restart decision. [`classify`] is. No production caller.
-#[cfg_attr(not(test), allow(dead_code))]
-#[deprecated(note = "use classify")]
-pub(crate) fn is_store_empty(engine: &Engine) -> Result<bool, ResumeError> {
-    let rt = engine
-        .read()
-        .map_err(|e| ResumeError::Store(e.to_string()))?;
-    let has_fc = rt
-        .get(TABLE_META, KEY_FC_SCALARS.as_bytes())
-        .map_err(|e| ResumeError::Store(e.to_string()))?
-        .is_some();
-    let has_snap = newest_snapshot(&rt)
-        .map_err(|e| ResumeError::Store(e.to_string()))?
-        .is_some();
-    Ok(!has_fc && !has_snap)
-}
-
 /// Restart classification. Not derived from whether scalars are absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RestartState {
+pub enum RestartState {
     /// No `AnchorInfo` and no block row.
     ///
     /// Schema, digest, side keys, node id, and a seeded write cursor do not
@@ -227,7 +208,7 @@ pub(crate) enum RestartState {
 /// `Uninitialized` is [`crate::writer::store_is_uninitialized`]. `Complete`
 /// reads the snapshot completion marker, not a partial ring entry. The
 /// `da_status` walk includes `snap_slot`.
-pub(crate) fn classify(engine: &Engine) -> Result<RestartState, StoreError> {
+pub fn classify(engine: &Engine) -> Result<RestartState, StoreError> {
     if crate::writer::store_is_uninitialized(engine)? {
         return Ok(RestartState::Uninitialized);
     }
@@ -718,10 +699,9 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn empty_store_detected() {
         let (dir, engine) = open_empty_store("empty");
-        assert!(is_store_empty(&engine).unwrap());
+        assert_eq!(classify(&engine).unwrap(), RestartState::Uninitialized);
         let mut registry = Registry::default();
         let metrics = StorageMetrics::register(&mut registry);
         let outcome = run_resume_sequence(
@@ -737,11 +717,7 @@ mod tests {
     }
 
     /// Bodies and no scalars are `Incomplete`, and the error names the item.
-    ///
-    /// The deprecated predicate still reports this fixture empty. Classification
-    /// does not.
     #[test]
-    #[allow(deprecated)]
     fn bodies_without_scalars_are_incomplete() {
         let (dir, engine) = open_empty_store("bodies-no-scalars");
         let slot = Slot::new(3);
@@ -753,10 +729,6 @@ mod tests {
         drop(rt);
         engine.commit(batch).unwrap();
 
-        assert!(
-            is_store_empty(&engine).unwrap(),
-            "deprecated predicate still classifies bodies without scalars as empty"
-        );
         match classify(&engine).unwrap() {
             RestartState::Incomplete(failure) => {
                 assert!(

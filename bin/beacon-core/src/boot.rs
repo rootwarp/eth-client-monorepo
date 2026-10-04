@@ -2,11 +2,13 @@
 //!
 //! ```text
 //! load_or_create node key
-//!   → open (schema + config-digest; I-node-id pending)
-//!   → peek_node_id → pair (I-node-id; refuse aborts)
-//!   → durable_set → seed_from_durable
-//!        | empty: AnchorSource → verify_anchor → commit_anchor
-//!   → start_writer + chain-core → serve
+//!   → open → peek_node_id → pair
+//!   → classify
+//!        Incomplete → refuse, naming the DurableItem (no subsystem)
+//!        else → start_writer
+//!             Uninitialized: AnchorSource → verify_anchor → commit_anchor → seed
+//!             Complete: resume → seed_from_durable → set_head
+//!   → serve exit → drain_and_shutdown
 //! ```
 //!
 //! [`boot`] runs that sequence and returns. [`run`] is the only env-config
@@ -14,6 +16,7 @@
 //! two-process synchronisation device.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,9 +43,10 @@ use cc_chain_core::seed::{
 use cc_chain_core::service::ChainServiceImpl;
 use cc_config::ServiceConfig;
 use cc_proto::chain::chain_service_server::ChainServiceServer;
+use cc_seam::{Bytes, HeadCause, HeadChange};
 use cc_storage_core::{
-    NodeIdExpectation, OpenOpts, OpenedStore, StorageMetrics, StorageRuntime, durable_set,
-    load_or_create_node_key, open,
+    ItemAssessment, NodeIdExpectation, OpenOpts, OpenedStore, RestartState, StorageMetrics,
+    StorageRuntime, classify, durable_set, load_or_create_node_key, open,
 };
 use cc_types::config::ChainConfig as NetworkChainConfig;
 use cc_types::config::PresetName;
@@ -68,6 +72,73 @@ const KNOWN_METHODS: &[&str] = &[
     "/eth.chain.v1.ChainService/GetCanonicalRoots",
 ];
 
+/// SSZ layout of fork-choice scalars: time, proposer-boost root, four
+/// checkpoints, head root, head slot. The head root starts at byte 200.
+const SCALAR_HEAD_ROOT_OFFSET: usize = 8 + 32 + (4 * 40);
+const SCALAR_HEAD_SLOT_OFFSET: usize = SCALAR_HEAD_ROOT_OFFSET + 32;
+
+const _: () =
+    assert!(SCALAR_HEAD_SLOT_OFFSET + 8 == cc_chain_core::import::FORK_CHOICE_SCALARS_SSZ_LEN);
+
+/// One observed step of the Complete arm. Order is the assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerStep {
+    /// `seed_from_durable` returned.
+    SeedFromDurable,
+    /// `set_head` returned after that seed.
+    SetHead,
+}
+
+static COMPOSER_STEPS: Mutex<Vec<ComposerStep>> = Mutex::new(Vec::new());
+static SERVE_PRE_DRAIN_DRAINED: AtomicBool = AtomicBool::new(false);
+static SERVE_EXIT_DRAINED: AtomicBool = AtomicBool::new(false);
+
+/// Steps recorded by the Complete arm since the last [`boot`].
+#[must_use]
+pub fn composer_steps() -> Vec<ComposerStep> {
+    COMPOSER_STEPS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+fn clear_composer_steps() {
+    COMPOSER_STEPS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clear();
+}
+
+fn record_composer_step(step: ComposerStep) {
+    COMPOSER_STEPS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(step);
+}
+
+fn clear_serve_drain_flags() {
+    SERVE_PRE_DRAIN_DRAINED.store(false, Ordering::SeqCst);
+    SERVE_EXIT_DRAINED.store(false, Ordering::SeqCst);
+}
+
+/// `true` after the pre-drain hook's mailbox drain returned `Ok`.
+#[must_use]
+pub fn serve_pre_drain_drained() -> bool {
+    SERVE_PRE_DRAIN_DRAINED.load(Ordering::SeqCst)
+}
+
+/// `true` after [`BootedNode::serve`]'s exit drain returned `Ok`.
+#[must_use]
+pub fn serve_exit_drained() -> bool {
+    SERVE_EXIT_DRAINED.load(Ordering::SeqCst)
+}
+
+/// Post-pair restart arm. `Incomplete` has already returned.
+enum RestartArm {
+    Uninitialized,
+    Complete,
+}
+
 /// Ordered boot phases. [`BootPhase::Open`] is always first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootPhase {
@@ -75,7 +146,7 @@ pub enum BootPhase {
     Open,
     /// `I-node-id` compared. Nothing starts between [`Open`](Self::Open) and this.
     Pair,
-    /// Durable set loaded (`None` = empty store).
+    /// Durable payload loaded. `Incomplete` is an error, not an empty store.
     DurableSet,
     /// Single writer started.
     Writer,
@@ -476,23 +547,33 @@ pub struct BootedNode {
     routes: Routes,
     options: ServeOptions,
     core: Option<CoreConfig>,
-    storage: StorageRuntime,
+    storage: Arc<StorageRuntime>,
     chain: ChainServiceImpl,
 }
 
 impl BootedNode {
     /// Bind gRPC and metrics and block until SIGTERM/SIGINT.
+    ///
+    /// SIGTERM runs the pre-drain hook (core join, then
+    /// [`StorageRuntime::drain_and_shutdown`]) before the listener returns.
+    /// This method awaits that drain again on the way out. The second call
+    /// is `Ok` when the mailbox drain already finished.
     pub async fn serve(self) -> anyhow::Result<()> {
+        clear_serve_drain_flags();
         let Self {
             bootstrap,
             spec,
             routes,
             options,
             core: _core,
-            storage: _storage,
+            storage,
             chain: _chain,
         } = self;
-        serve_with_options(bootstrap, spec, routes, options, SignalTrigger::UnixSignals).await?;
+        let served =
+            serve_with_options(bootstrap, spec, routes, options, SignalTrigger::UnixSignals).await;
+        storage.drain_and_shutdown().await?;
+        SERVE_EXIT_DRAINED.store(true, Ordering::SeqCst);
+        served?;
         Ok(())
     }
 
@@ -562,13 +643,21 @@ async fn boot_with_preset<P: Preset + 'static>(
     )?;
     let _peek = pending.peek_node_id()?;
     let opened = pending.pair(node_id)?;
-    let mut durable = durable_set(&opened, &network)?;
+    clear_composer_steps();
+    // Incomplete refuses before telemetry, the writer, or chain-core.
+    let arm = match classify(opened.engine()).map_err(|e| anyhow::anyhow!("classify: {e}"))? {
+        RestartState::Uninitialized => RestartArm::Uninitialized,
+        RestartState::Complete => RestartArm::Complete,
+        RestartState::Incomplete(assessment) => {
+            anyhow::bail!("restart incomplete: {}", restart_detail(&assessment));
+        }
+    };
 
     let mut bs = cc_bootstrap::init(SERVICE, TelemetrySettings::from(&cfg.service))?;
     let chain_metrics = ChainMetrics::register(&mut bs.registry);
     let storage_metrics = StorageMetrics::register(&mut bs.registry);
 
-    let storage = cc_storage_core::start_writer(opened, storage_metrics, true);
+    let storage = Arc::new(cc_storage_core::start_writer(opened, storage_metrics, true));
     tracing::info!(
         writers = storage.writer_count(),
         "storage-core writer started (one handle)"
@@ -606,32 +695,70 @@ async fn boot_with_preset<P: Preset + 'static>(
     );
     let core_owner: Arc<Mutex<CoreJoinOwner>> = Arc::new(Mutex::new(CoreJoinOwner::default()));
 
-    // Empty store: one verify, one commit, then the same durable seed arm.
-    // Checkpoint and genesis are the two `AnchorSource` arms; the call below
-    // is the only non-test `commit_anchor` call site.
-    if durable.is_none()
-        && let Some(source) = anchor_source::<P>(&cfg, &network)?
-    {
-        let verified = verify_anchor(source, &chain_metrics)
-            .await
-            .map_err(|e| anyhow::anyhow!("verify_anchor: {e}"))?;
-        archive
-            .commit_anchor(verified.trusted.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("commit_anchor: {e}"))?;
-        tracing::info!(
-            slot = verified.slot,
-            root = %verified.block_root,
-            kind = ?verified.kind,
-            "anchor committed"
-        );
-        durable = Some(durable_set_from_verified::<P>(&verified, &network));
-    }
-
-    let core = match durable {
-        Some(d) => {
+    let core = match arm {
+        RestartArm::Uninitialized => {
+            // Empty store: one verify, one commit, then the durable seed.
+            // Checkpoint and genesis are the two `AnchorSource` arms; the call
+            // below is the only non-test `commit_anchor` call site.
+            let seeded = if let Some(source) = anchor_source::<P>(&cfg, &network)? {
+                let verified = verify_anchor(source, &chain_metrics)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("verify_anchor: {e}"))?;
+                archive
+                    .commit_anchor(verified.trusted.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("commit_anchor: {e}"))?;
+                tracing::info!(
+                    slot = verified.slot,
+                    root = %verified.block_root,
+                    kind = ?verified.kind,
+                    "anchor committed"
+                );
+                Some(durable_set_from_verified::<P>(&verified, &network))
+            } else {
+                None
+            };
+            if let Some(plan) = seeded {
+                let applied = seed_from_durable::<P>(
+                    map_durable(plan),
+                    network.clone(),
+                    core_cfg
+                        .engine
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("in-process engine not configured"))?,
+                    chain_metrics.clone(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("seed_from_durable: {e}"))?;
+                let install = spawn_core_from_seed(
+                    applied,
+                    network.clone(),
+                    head.clone(),
+                    epoch.clone(),
+                    events.event_sender(),
+                    chain_metrics.clone(),
+                    core_cfg.clone(),
+                );
+                install_core(&svc, &core_owner, install)?;
+            } else {
+                tracing::info!(
+                    "empty store and no anchor source; core remains absent (NOT_BOOTSTRAPPED)"
+                );
+            }
+            Some(core_cfg)
+        }
+        RestartArm::Complete => {
+            // [ARCH] §4.6.1: the replay window ends at `scalars.head_slot`.
+            // Restart drops non-canonical branches above the selected head.
+            // Scalars carry no vote table and no proposer-boost window, so
+            // the recomputed head may differ. `set_head` writes that head
+            // after the seed. Restart does not preserve the previous head.
+            let Some(plan) = storage.resume(&network).await? else {
+                anyhow::bail!("complete store resumed uninitialized");
+            };
+            let scalar_bytes = plan.fork_choice_scalars_ssz.clone();
             let applied = seed_from_durable::<P>(
-                map_durable(d),
+                map_durable(plan),
                 network.clone(),
                 core_cfg
                     .engine
@@ -641,6 +768,21 @@ async fn boot_with_preset<P: Preset + 'static>(
             )
             .await
             .map_err(|e| anyhow::anyhow!("seed_from_durable: {e}"))?;
+            record_composer_step(ComposerStep::SeedFromDurable);
+            let stamped =
+                stamp_recomputed_head(scalar_bytes, &applied.head_root, applied.head_slot)?;
+            archive
+                .set_head(
+                    HeadChange {
+                        head_root: *applied.head_root.as_array(),
+                        head_slot: applied.head_slot,
+                        cause: HeadCause::Import,
+                    },
+                    Bytes::from(stamped),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("set_head: {e}"))?;
+            record_composer_step(ComposerStep::SetHead);
             let install = spawn_core_from_seed(
                 applied,
                 network.clone(),
@@ -651,12 +793,6 @@ async fn boot_with_preset<P: Preset + 'static>(
                 core_cfg.clone(),
             );
             install_core(&svc, &core_owner, install)?;
-            Some(core_cfg)
-        }
-        None => {
-            tracing::info!(
-                "empty store and no anchor source; core remains absent (NOT_BOOTSTRAPPED)"
-            );
             Some(core_cfg)
         }
     };
@@ -679,6 +815,7 @@ async fn boot_with_preset<P: Preset + 'static>(
     });
 
     let core_owner_shutdown = Arc::clone(&core_owner);
+    let storage_for_drain = Arc::clone(&storage);
     let options = ServeOptions {
         require_local_ready: true,
         local_ready_tx: Some(ready_tx),
@@ -692,6 +829,15 @@ async fn boot_with_preset<P: Preset + 'static>(
                 };
                 if let Some(core) = core {
                     core.shutdown_and_join().await;
+                }
+                match storage_for_drain.drain_and_shutdown().await {
+                    Ok(()) => SERVE_PRE_DRAIN_DRAINED.store(true, Ordering::SeqCst),
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            "pre-drain storage mailbox drain failed"
+                        );
+                    }
                 }
             })
         })),
@@ -798,4 +944,29 @@ fn install_core(
         anyhow::bail!("pre-drain already active; late core not installed");
     }
     Ok(())
+}
+
+fn restart_detail(assessment: &ItemAssessment) -> String {
+    match assessment {
+        ItemAssessment::NamedFailure { detail, .. }
+        | ItemAssessment::Degradation { detail, .. } => detail.clone(),
+        ItemAssessment::Present => "restart classification incomplete".to_owned(),
+    }
+}
+
+/// Stamp the recomputed head into a copy of the durable scalar blob.
+fn stamp_recomputed_head(
+    mut scalars: Vec<u8>,
+    head_root: &Root,
+    head_slot: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let len = cc_chain_core::import::FORK_CHOICE_SCALARS_SSZ_LEN;
+    if scalars.len() != len {
+        anyhow::bail!("fork-choice scalars len {} want {len}", scalars.len());
+    }
+    let root_end = SCALAR_HEAD_ROOT_OFFSET + 32;
+    scalars[SCALAR_HEAD_ROOT_OFFSET..root_end].copy_from_slice(head_root.as_array());
+    scalars[SCALAR_HEAD_SLOT_OFFSET..SCALAR_HEAD_SLOT_OFFSET + 8]
+        .copy_from_slice(&head_slot.to_le_bytes());
+    Ok(scalars)
 }
