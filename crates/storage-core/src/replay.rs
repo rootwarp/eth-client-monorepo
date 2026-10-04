@@ -38,7 +38,9 @@ use cc_store::{
     DEFAULT_SNAPSHOT_EPOCHS, DEFAULT_SNAPSHOT_RING, Root, Slot, SplitLock, epoch_of_slot,
     epoch_start_slot, newest_snapshot, plan_snapshot_put, ring_depth, snapshot_due,
 };
-use cc_types::{BeaconState, ChainConfig, ForkName, Mainnet, SignedBeaconBlock};
+use cc_types::{
+    BeaconState, ChainConfig, ForkName, Mainnet, Minimal, PresetName, SignedBeaconBlock,
+};
 use ssz::Encode;
 use tokio::sync::{oneshot, watch};
 use tracing::{error, info, warn};
@@ -607,6 +609,24 @@ fn resolve_expected_root(engine: &Engine, slot: Slot, fallback: Root) -> Result<
 fn decode_mainnet_state(ssz: &[u8]) -> Result<BeaconState<Mainnet>, ReplayError> {
     BeaconState::<Mainnet>::from_ssz_bytes_hydrated(ForkName::Fulu, ssz)
         .map_err(|e| ReplayError::Ssz(format!("BeaconState decode failed: {e:?}")))
+}
+
+/// ADR-R-11 anchor witness. The only stored cross-check is this accessor.
+///
+/// `None` means the bytes are not a beacon state for `preset`. Callers that
+/// need the root of a snapshot use this instead of naming the container.
+pub(crate) fn genesis_validators_root_from_state_ssz(
+    preset: PresetName,
+    ssz: &[u8],
+) -> Option<Root> {
+    match preset {
+        PresetName::Mainnet => BeaconState::<Mainnet>::from_ssz_bytes_hydrated(ForkName::Fulu, ssz)
+            .ok()
+            .map(|state| state.genesis_validators_root()),
+        PresetName::Minimal => BeaconState::<Minimal>::from_ssz_bytes_hydrated(ForkName::Fulu, ssz)
+            .ok()
+            .map(|state| state.genesis_validators_root()),
+    }
 }
 
 fn observe_phase(metrics: &StorageMetrics, phase: SnapshotPhase, secs: f64) {

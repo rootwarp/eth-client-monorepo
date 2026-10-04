@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cc_store::engine::{Durability, Engine, EngineOptions};
+use cc_store::snapshots::newest_snapshot;
 use cc_store::{
-    Store, StoreOpenOptions, compute_identity_digest, compute_schedule_digest,
-    legacy_config_digest, refuse_populated_legacy_open,
+    AnchorGenesisValidatorsRoot, Store, StoreOpenOptions, compute_identity_digest,
+    compute_schedule_digest, legacy_config_digest, legacy_open_needs_anchor_witness,
+    reconcile_config_side_keys,
 };
 use cc_types::{ChainConfig, Root};
 use tokio::sync::watch;
@@ -290,7 +292,10 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
         Store::open(data_dir, store_opts).map_err(|e| anyhow::anyhow!("store open: {e}"))?;
     refuse_missing_key_if_anchor_present(store.engine(), opts.node_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    refuse_populated_legacy_open(store.engine(), gvr.is_some())
+    // ADR-R-11. This runs inside `open`, before `start_writer` or any subsystem.
+    let anchor_gvr = anchor_genesis_validators_root(store.engine(), opts.chain.as_ref(), gvr)
+        .map_err(|e| anyhow::anyhow!("store open: {e}"))?;
+    reconcile_config_side_keys(store.engine(), opts.chain.as_ref(), gvr, anchor_gvr)
         .map_err(|e| anyhow::anyhow!("store open: {e}"))?;
     let (identity_digest, schedule_digest) = match &opts.chain {
         Some(chain) => {
@@ -302,7 +307,7 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
                     identity = %identity,
                     schedule = %schedule,
                     config_name = %chain.config_name,
-                    "running config digests (side-key comparison is later)"
+                    "running config digests compared under side keys (ADR-R-11)"
                 );
             } else {
                 tracing::debug!(
@@ -404,6 +409,35 @@ fn map_resume(e: ResumeError) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
+/// Decode the anchor witness only when a populated store lacks both side keys
+/// and still holds the legacy constant. The result cannot authorize a stamp.
+fn anchor_genesis_validators_root(
+    engine: &Engine,
+    chain: Option<&ChainConfig>,
+    gvr: Option<Root>,
+) -> Result<AnchorGenesisValidatorsRoot, cc_store::StoreError> {
+    if gvr.is_none() {
+        return Ok(AnchorGenesisValidatorsRoot::Missing);
+    }
+    let Some(chain) = chain else {
+        return Ok(AnchorGenesisValidatorsRoot::Missing);
+    };
+    if !legacy_open_needs_anchor_witness(engine)? {
+        return Ok(AnchorGenesisValidatorsRoot::Missing);
+    }
+    let rt = engine.read()?;
+    let Some((_, ssz)) = newest_snapshot(&rt)? else {
+        return Ok(AnchorGenesisValidatorsRoot::Missing);
+    };
+    drop(rt);
+    Ok(
+        match crate::replay::genesis_validators_root_from_state_ssz(chain.preset_base, &ssz) {
+            Some(root) => AnchorGenesisValidatorsRoot::Value(root),
+            None => AnchorGenesisValidatorsRoot::Undecodable,
+        },
+    )
+}
+
 fn parse_gvr(s: Option<&str>) -> anyhow::Result<Option<Root>> {
     let Some(raw) = s.filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -429,6 +463,7 @@ mod tests {
 
     use super::*;
     use crate::test_tmpdir::unique_temp_dir;
+    use cc_store::schedule_side_key_bytes;
     use prometheus_client::registry::Registry;
 
     fn test_opts(node_key: Option<PathBuf>) -> OpenOpts {
@@ -942,15 +977,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An empty open with a network stamps the side keys. History written
+    /// after that stamp reopens by comparing them. `meta.config_digest`
+    /// staying the legacy constant is not the permission (ADR-R-11).
     #[test]
-    fn populated_store_with_gvr_is_not_opened_on_the_legacy_constant() {
+    fn populated_store_reopens_on_matching_side_keys_not_the_legacy_constant() {
         let dir = unique_temp_dir("populated-with-gvr");
         std::fs::create_dir_all(&dir).unwrap();
         let mut opts = test_opts(None);
         opts.check_invariants = false;
         opts.chain = Some(fixture_chain("hoodi-config.yaml"));
         opts.genesis_validators_root = Some(gvr_hex(0xab));
-        let opened = open(&dir, opts.clone()).expect("empty open");
+        let opened = open(&dir, opts.clone()).expect("empty open stamps side keys");
         {
             use cc_store::Slot;
             use cc_store::canonical::put_canonical;
@@ -962,12 +1000,566 @@ mod tests {
         }
         drop(opened);
 
-        let err = open(&dir, opts).expect_err("populated store must not open on the constant");
+        let reopened = open(&dir, opts.clone()).expect("matching side keys reopen");
+        let gvr = parse_gvr(opts.genesis_validators_root.as_deref())
+            .unwrap()
+            .unwrap();
+        let chain = opts.chain.as_ref().unwrap();
+        assert_eq!(
+            reopened.identity_digest,
+            Some(compute_identity_digest(chain, gvr))
+        );
+        assert_ne!(reopened.identity_digest, Some(legacy_config_digest()));
+        assert_eq!(stored_config_digest(&reopened), legacy_config_digest());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-R-11: an empty store takes the running config under the two side keys.
+    /// `meta.config_digest` stays the legacy constant. `SCHEMA_VERSION` stays 1.
+    #[test]
+    fn empty_store_stamps_side_keys_and_keeps_legacy_digest() {
+        use cc_store::SszDecode;
+        use cc_store::meta::{
+            KEY_CONFIG_DIGEST_V2, KEY_SCHEDULE_DIGEST, KEY_SCHEMA_VERSION, SchemaVersion,
+            TABLE_META,
+        };
+        use cc_store::{identity_side_key_bytes, schedule_side_key_bytes};
+
+        let dir = unique_temp_dir("side-key-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opts = test_opts(None);
+        opts.check_invariants = false;
+        let chain = fixture_chain("hoodi-config.yaml");
+        let gvr = gvr_hex(0x11);
+        opts.chain = Some(chain.clone());
+        opts.genesis_validators_root = Some(gvr.clone());
+        let opened = open(&dir, opts).expect("empty store stamps side keys");
+        let rt = opened.engine().read().unwrap();
+        let version = SchemaVersion::from_ssz_bytes(
+            &rt.get(TABLE_META, KEY_SCHEMA_VERSION.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(version.version, 1, "SCHEMA_VERSION is not bumped");
+        assert_eq!(stored_config_digest(&opened), legacy_config_digest());
+        let gvr_root = parse_gvr(Some(&gvr)).unwrap().unwrap();
+        assert_eq!(
+            rt.get(TABLE_META, KEY_CONFIG_DIGEST_V2.as_bytes())
+                .unwrap()
+                .unwrap(),
+            identity_side_key_bytes(&chain, gvr_root)
+        );
+        assert_eq!(
+            rt.get(TABLE_META, KEY_SCHEDULE_DIGEST.as_bytes())
+                .unwrap()
+                .unwrap(),
+            schedule_side_key_bytes(&chain).unwrap()
+        );
+        assert_ne!(KEY_SCHEDULE_DIGEST, "config_schedule_digest");
+        assert!(KEY_SCHEDULE_DIGEST.len() <= 16);
+        assert_eq!(KEY_CONFIG_DIGEST_V2, "config_digest_v2");
+        drop(rt);
+        drop(opened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `open` is the gate before `start_writer`. A populated store whose identity
+    /// bucket changed never returns an [`OpenedStore`], so no subsystem starts.
+    fn assert_identity_field_refuses(label: &str, mutate: impl FnOnce(&mut ChainConfig)) {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated(label, chain, &gvr, None);
+        let identity_before = read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2);
+        let legacy_before = read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST);
+        mutate(opts.chain.as_mut().unwrap());
+        let err = open(&dir, opts).expect_err("identity mismatch must refuse inside open");
         let msg = err.to_string();
         assert!(
-            msg.contains("populated store refused"),
-            "legacy equality must not be the success path: {msg}"
+            msg.contains("store open") && msg.contains("identity digest mismatch"),
+            "refusal must come from open, before any subsystem: {msg}"
+        );
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2),
+            identity_before,
+            "a refusal must not rewrite the identity side key"
+        );
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST),
+            legacy_before
+        );
+        assert_eq!(schema_version_of(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_genesis_fork_version_refuses_populated_store() {
+        assert_identity_field_refuses("id-gfv", |chain| {
+            chain.genesis_fork_version =
+                cc_types::ForkVersion::from_array([0x11, 0x22, 0x33, 0x44]);
+        });
+    }
+
+    #[test]
+    fn identity_deposit_contract_address_refuses_populated_store() {
+        assert_identity_field_refuses("id-deposit-addr", |chain| {
+            chain.deposit_contract_address = cc_types::ExecutionAddress::from_array([0xAB; 20]);
+        });
+    }
+
+    #[test]
+    fn identity_deposit_chain_id_refuses_populated_store() {
+        assert_identity_field_refuses("id-deposit-chain", |chain| {
+            chain.deposit_chain_id = chain.deposit_chain_id.saturating_add(1);
+        });
+    }
+
+    #[test]
+    fn identity_seconds_per_slot_refuses_populated_store() {
+        assert_identity_field_refuses("id-slot-seconds", |chain| {
+            chain.seconds_per_slot = 6;
+        });
+    }
+
+    #[test]
+    fn identity_genesis_validators_root_refuses_populated_store() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated("id-gvr", chain, &gvr, None);
+        opts.genesis_validators_root = Some(gvr_hex(0x45));
+        let err = open(&dir, opts).expect_err("gvr mismatch must refuse inside open");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store open") && msg.contains("identity digest mismatch"),
+            "{msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renaming_config_name_does_not_refuse_populated_store() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated("id-name", chain, &gvr, None);
+        let identity_before = read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2);
+        opts.chain.as_mut().unwrap().config_name = "renamed-hoodi".into();
+        let opened = open(&dir, opts).expect("config_name is not identity");
+        drop(opened);
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2),
+            identity_before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn churn_limit_quotient_is_not_an_identity_or_schedule_refusal() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated("id-churn", chain, &gvr, None);
+        opts.chain.as_mut().unwrap().churn_limit_quotient = 1;
+        open(&dir, opts).expect("the live-payload scalars are in neither bucket");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fork_epoch_above_finalized_warns_and_restamps_schedule() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated("sched-above", chain, &gvr, Some(1_000));
+        let identity_before = read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2);
+        let legacy_before = read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST);
+        let schedule_before = read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST);
+        opts.chain.as_mut().unwrap().fulu_fork_epoch = cc_types::Epoch::new(80_000);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opened = capture_schedule_restamp(std::sync::Arc::clone(&flag), || {
+            open(&dir, opts.clone()).expect("a future fork epoch must not refuse")
+        });
+        drop(opened);
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "a move above finalized must log at WARN and say it is re-stamping"
+        );
+        let expected = schedule_side_key_bytes(opts.chain.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            expected
+        );
+        assert_ne!(
+            read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            schedule_before
+        );
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2),
+            identity_before
+        );
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST),
+            legacy_before
+        );
+        assert_eq!(schema_version_of(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schedule_move_above_decoded_epoch_zero_restamps() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated("sched-epoch-zero", chain, &gvr, Some(0));
+        opts.chain.as_mut().unwrap().fulu_fork_epoch = cc_types::Epoch::new(80_000);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opened = capture_schedule_restamp(std::sync::Arc::clone(&flag), || {
+            open(&dir, opts.clone())
+                .expect("a decoded finalized epoch of 0 still proves a later move")
+        });
+        drop(opened);
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            schedule_side_key_bytes(opts.chain.as_ref().unwrap()).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schedule_move_without_fc_scalars_is_not_restamped() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated("sched-no-fc", chain, &gvr, None);
+        let schedule_before = read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST);
+        opts.chain.as_mut().unwrap().fulu_fork_epoch = cc_types::Epoch::new(80_000);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err = capture_schedule_restamp(std::sync::Arc::clone(&flag), || {
+            open(&dir, opts).expect_err("a missing finalized epoch must not re-stamp")
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store open") && msg.contains("fc_scalars") && msg.contains("missing"),
+            "{msg}"
+        );
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            schedule_before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schedule_move_with_undecodable_fc_scalars_is_not_restamped() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated("sched-bad-fc", chain, &gvr, None);
+        let schedule_before = read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST);
+        {
+            use cc_store::engine::{Engine, EngineOptions};
+            use cc_store::meta::{KEY_FC_SCALARS, TABLE_META};
+            let engine = Engine::open(&dir, EngineOptions::default()).unwrap();
+            let mut batch = engine.batch();
+            batch.put(TABLE_META, KEY_FC_SCALARS.as_bytes(), &[0xFF, 0x00]);
+            engine.commit(batch).unwrap();
+        }
+        opts.chain.as_mut().unwrap().fulu_fork_epoch = cc_types::Epoch::new(80_000);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err = capture_schedule_restamp(std::sync::Arc::clone(&flag), || {
+            open(&dir, opts).expect_err("undecodable fc_scalars must not re-stamp")
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store open")
+                && msg.contains("fc_scalars")
+                && msg.contains("did not decode"),
+            "{msg}"
+        );
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            schedule_before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fork_epoch_at_or_below_finalized_refuses() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        // Hoodi fulu is 50688, which is at or below a finalized epoch of 60_000.
+        let (dir, mut opts) = stamped_populated("sched-below", chain, &gvr, Some(60_000));
+        let schedule_before = read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST);
+        opts.chain.as_mut().unwrap().fulu_fork_epoch = cc_types::Epoch::new(70_000);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err = capture_schedule_restamp(std::sync::Arc::clone(&flag), || {
+            open(&dir, opts).expect_err("retroactive fork epoch must refuse inside open")
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.contains("store open") && msg.contains("at or below finalized epoch"),
+            "{msg}"
+        );
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::SeqCst),
+            "a refusal must not re-stamp or log the forward update"
+        );
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            schedule_before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blob_schedule_above_finalized_restamps() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated("blob-above", chain, &gvr, Some(1_000));
+        let chain = opts.chain.as_mut().unwrap();
+        let mut entries = chain.blob_schedule.entries().to_vec();
+        entries.last_mut().unwrap().max_blobs_per_block = 22;
+        chain.blob_schedule = cc_types::BlobSchedule::try_from_entries(entries).unwrap();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opened = capture_schedule_restamp(std::sync::Arc::clone(&flag), || {
+            open(&dir, opts.clone()).expect("future BLOB_SCHEDULE edit must not refuse")
+        });
+        drop(opened);
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            schedule_side_key_bytes(opts.chain.as_ref().unwrap()).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blob_schedule_at_or_below_finalized_refuses() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) = stamped_populated("blob-below", chain, &gvr, Some(60_000));
+        let schedule_before = read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST);
+        let chain = opts.chain.as_mut().unwrap();
+        let mut entries = chain.blob_schedule.entries().to_vec();
+        entries.last_mut().unwrap().max_blobs_per_block = 22;
+        chain.blob_schedule = cc_types::BlobSchedule::try_from_entries(entries).unwrap();
+        let err = open(&dir, opts).expect_err("historical BLOB_SCHEDULE edit must refuse");
+        assert!(
+            err.to_string().contains("at or below finalized epoch"),
+            "{}",
+            err
+        );
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            schedule_before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_one_side_key_does_not_restamp() {
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, opts) = stamped_populated("one-key", chain, &gvr, None);
+        let identity_before = read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2);
+        delete_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST);
+        let err = open(&dir, opts).expect_err("one side key must not open a second stamp");
+        assert!(
+            err.to_string().contains("does not open a second stamp"),
+            "{err}"
+        );
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2),
+            identity_before
+        );
+        assert!(meta_is_absent(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn populated_store_whose_legacy_digest_is_not_the_constant_is_refused() {
+        let dir = unique_temp_dir("non-legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opts = test_opts(None);
+        opts.check_invariants = false;
+        let opened = open(&dir, opts.clone()).expect("empty open without a network");
+        drop(opened);
+        overwrite_config_digest(&dir, Root::from_array([0xEE; 32]));
+        {
+            use cc_store::Slot;
+            use cc_store::canonical::put_canonical;
+            use cc_store::engine::{Engine, EngineOptions};
+            let engine = Engine::open(&dir, EngineOptions::default()).unwrap();
+            let rt = engine.read().unwrap();
+            let mut batch = engine.batch();
+            put_canonical(&rt, &mut batch, Slot::new(3), &Root::from_array([5; 32])).unwrap();
+            engine.commit(batch).unwrap();
+        }
+        opts.chain = Some(fixture_chain("hoodi-config.yaml"));
+        opts.genesis_validators_root = Some(gvr_hex(0x44));
+        let err = open(&dir, opts).expect_err("a non-legacy digest must not be re-stamped");
+        assert!(err.to_string().contains("config digest mismatch"), "{err}");
+        assert!(meta_is_absent(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2));
+        assert!(meta_is_absent(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_constant_without_anchor_state_is_not_restamped() {
+        let dir = unique_temp_dir("legacy-no-anchor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opts = test_opts(None);
+        opts.check_invariants = false;
+        let opened = open(&dir, opts.clone()).expect("empty");
+        {
+            use cc_store::Slot;
+            use cc_store::canonical::put_canonical;
+            let engine = opened.engine();
+            let rt = engine.read().unwrap();
+            let mut batch = engine.batch();
+            put_canonical(&rt, &mut batch, Slot::new(8), &Root::from_array([6; 32])).unwrap();
+            engine.commit(batch).unwrap();
+        }
+        drop(opened);
+        opts.chain = Some(fixture_chain("hoodi-config.yaml"));
+        opts.genesis_validators_root = Some(gvr_hex(0x44));
+        let err = open(&dir, opts).expect_err("no anchor witness, no re-stamp");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("populated store refused") && msg.contains("cross-check"),
+            "{msg}"
+        );
+        assert!(meta_is_absent(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn stamped_populated(
+        label: &str,
+        chain: ChainConfig,
+        gvr: &str,
+        finalized_epoch: Option<u64>,
+    ) -> (PathBuf, OpenOpts) {
+        let dir = unique_temp_dir(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opts = test_opts(None);
+        opts.check_invariants = false;
+        opts.chain = Some(chain);
+        opts.genesis_validators_root = Some(gvr.to_owned());
+        let opened = open(&dir, opts.clone()).expect("stamp empty store");
+        {
+            use cc_store::Slot;
+            use cc_store::SszEncode;
+            use cc_store::canonical::put_canonical;
+            use cc_store::meta::{ForkChoiceScalars, KEY_FC_SCALARS, TABLE_META};
+            use cc_types::{Checkpoint, Epoch};
+            let engine = opened.engine();
+            let rt = engine.read().unwrap();
+            let mut batch = engine.batch();
+            put_canonical(&rt, &mut batch, Slot::new(32), &Root::from_array([4; 32])).unwrap();
+            if let Some(epoch) = finalized_epoch {
+                let scalars = ForkChoiceScalars {
+                    finalized: Checkpoint {
+                        epoch: Epoch::new(epoch),
+                        root: Root::from_array([1; 32]),
+                    },
+                    ..ForkChoiceScalars::default()
+                };
+                batch.put(
+                    TABLE_META,
+                    KEY_FC_SCALARS.as_bytes(),
+                    &scalars.as_ssz_bytes(),
+                );
+            }
+            engine.commit(batch).unwrap();
+        }
+        drop(opened);
+        (dir, opts)
+    }
+
+    fn read_meta(dir: &Path, key: &str) -> Vec<u8> {
+        use cc_store::engine::{Engine, EngineOptions};
+        use cc_store::meta::TABLE_META;
+        let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+        let rt = engine.read().unwrap();
+        rt.get(TABLE_META, key.as_bytes()).unwrap().expect(key)
+    }
+
+    fn meta_is_absent(dir: &Path, key: &str) -> bool {
+        use cc_store::engine::{Engine, EngineOptions};
+        use cc_store::meta::TABLE_META;
+        let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+        let rt = engine.read().unwrap();
+        rt.get(TABLE_META, key.as_bytes()).unwrap().is_none()
+    }
+
+    fn schema_version_of(dir: &Path) -> u32 {
+        use cc_store::SszDecode;
+        use cc_store::meta::SchemaVersion;
+        let bytes = read_meta(dir, cc_store::meta::KEY_SCHEMA_VERSION);
+        SchemaVersion::from_ssz_bytes(&bytes).unwrap().version
+    }
+
+    fn delete_meta(dir: &Path, key: &str) {
+        use cc_store::engine::{Engine, EngineOptions};
+        use cc_store::meta::TABLE_META;
+        let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+        let mut batch = engine.batch();
+        batch.delete(TABLE_META, key.as_bytes());
+        engine.commit(batch).unwrap();
+    }
+
+    fn overwrite_config_digest(dir: &Path, digest: Root) {
+        use cc_store::SszEncode;
+        use cc_store::engine::{Engine, EngineOptions};
+        use cc_store::meta::{ConfigDigest, KEY_CONFIG_DIGEST, TABLE_META};
+        let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+        let record = ConfigDigest { digest };
+        let mut batch = engine.batch();
+        batch.put(
+            TABLE_META,
+            KEY_CONFIG_DIGEST.as_bytes(),
+            &record.as_ssz_bytes(),
+        );
+        engine.commit(batch).unwrap();
+    }
+
+    fn capture_schedule_restamp<T>(
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        tracing::subscriber::with_default(ScheduleWarn(flag), body)
+    }
+
+    struct ScheduleWarn(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl tracing::Subscriber for ScheduleWarn {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_non_zero_u64(std::num::NonZeroU64::MIN)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut ScheduleWarnVisit(&self.0));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    struct ScheduleWarnVisit<'a>(&'a std::sync::atomic::AtomicBool);
+
+    impl tracing::field::Visit for ScheduleWarnVisit<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                let text = format!("{value:?}");
+                if text.contains("re-stamping schedule digest") {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
     }
 }

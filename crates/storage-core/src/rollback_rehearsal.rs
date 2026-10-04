@@ -276,4 +276,73 @@ mod tests {
             db.display()
         );
     }
+
+    /// Same gates as [`s2_b_14_current_writer_files_open_via_previous_topology_gates`].
+    /// Side keys are unknown to that opener. `SCHEMA_VERSION` stays 1 and
+    /// `meta.config_digest` stays the legacy constant, so it still opens.
+    #[test]
+    fn side_keys_still_open_under_previous_topology_gates() {
+        use cc_store::meta::{KEY_CONFIG_DIGEST_V2, KEY_SCHEDULE_DIGEST, TABLE_META};
+        use cc_store::{SszDecode, legacy_config_digest};
+
+        let dir = unique_temp_dir("s2r-b08-rollback");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("node_key");
+        let node_id = Root::from_array([0x51u8; 32]);
+        std::fs::write(&key_path, node_id.as_slice()).unwrap();
+
+        let mut opts = current_writer_opts(key_path.clone());
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/types/tests/fixtures/hoodi-config.yaml");
+        opts.chain = Some(ChainConfig::from_yaml_file(&fixture).unwrap());
+        opts.genesis_validators_root = Some(format!("0x{}", "ab".repeat(32)));
+        let opened = open(&dir, opts).expect("current open stamps side keys");
+        opened.persist_anchor_node_id(node_id).unwrap();
+        {
+            let rt = opened.engine().read().unwrap();
+            assert!(
+                rt.get(TABLE_META, KEY_CONFIG_DIGEST_V2.as_bytes())
+                    .unwrap()
+                    .is_some(),
+                "identity side key must be written before the rollback open"
+            );
+            assert!(
+                rt.get(TABLE_META, KEY_SCHEDULE_DIGEST.as_bytes())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        drop(opened);
+
+        let prev = previous_topology_open(&dir, &key_path).unwrap_or_else(|msg| {
+            assert_not_refuse("e854b1d open_store gates with side keys", &msg);
+            panic!("previous-topology Store::open failed: {msg}");
+        });
+        let rt = prev.engine().read().unwrap();
+        let sv = SchemaVersion::from_ssz_bytes(
+            &rt.get(TABLE_META, KEY_SCHEMA_VERSION.as_bytes())
+                .unwrap()
+                .expect("schema_version"),
+        )
+        .unwrap();
+        assert_eq!(sv.version, 1, "SCHEMA_VERSION is not bumped");
+        let digest = cc_store::meta::ConfigDigest::from_ssz_bytes(
+            &rt.get(TABLE_META, cc_store::meta::KEY_CONFIG_DIGEST.as_bytes())
+                .unwrap()
+                .expect("config_digest"),
+        )
+        .unwrap();
+        assert_eq!(digest.digest, legacy_config_digest());
+        assert!(
+            rt.get(TABLE_META, KEY_CONFIG_DIGEST_V2.as_bytes())
+                .unwrap()
+                .is_some(),
+            "the rollback open must leave the identity side key in place"
+        );
+        assert!(
+            rt.get(TABLE_META, KEY_SCHEDULE_DIGEST.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+    }
 }

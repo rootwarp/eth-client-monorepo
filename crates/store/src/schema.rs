@@ -14,6 +14,11 @@
 //!
 //! Naming the list in source stops the digest from silently widening to a
 //! runtime knob and refusing every restart.
+//!
+//! Running-config comparison is two side keys. The policy is ADR-R-11
+//! (`docs/adr/ADR-R-11.md`): identity is fatal, schedule refuses only a move
+//! at or below the store's finalized epoch, and this file does not choose a
+//! different split. The legacy payload stays under `meta.config_digest`.
 
 use std::fmt;
 use std::path::Path;
@@ -33,7 +38,10 @@ use crate::keys::{
     BLOCK_SHARD_EPOCHS, COLUMN_SHARD_EPOCHS, blocks_shard_table, columns_shard_table,
     parse_shard_suffix,
 };
-use crate::meta::{ConfigDigest, KEY_CONFIG_DIGEST, KEY_SCHEMA_VERSION, SchemaVersion, TABLE_META};
+use crate::meta::{
+    ConfigDigest, ForkChoiceScalars, KEY_CONFIG_DIGEST, KEY_CONFIG_DIGEST_V2, KEY_FC_SCALARS,
+    KEY_SCHEDULE_DIGEST, KEY_SCHEMA_VERSION, SchemaVersion, TABLE_META,
+};
 use crate::snapshots::TABLE_SNAPSHOTS;
 
 /// Current on-disk schema version. Phase 4: one value, no migration path.
@@ -311,8 +319,11 @@ fn identity_digest_at(
     sha256_root(&payload.as_ssz_bytes())
 }
 
-fn schedule_digest_at(chain: &ChainConfig, digest_version: u16) -> Result<Root, StoreError> {
-    let payload = ScheduleDigestPayload {
+fn schedule_payload(
+    chain: &ChainConfig,
+    digest_version: u16,
+) -> Result<ScheduleDigestPayload, StoreError> {
+    Ok(ScheduleDigestPayload {
         digest_version,
         altair_fork_epoch: epoch_u64(chain.altair_fork_epoch),
         bellatrix_fork_epoch: epoch_u64(chain.bellatrix_fork_epoch),
@@ -321,8 +332,374 @@ fn schedule_digest_at(chain: &ChainConfig, digest_version: u16) -> Result<Root, 
         electra_fork_epoch: epoch_u64(chain.electra_fork_epoch),
         fulu_fork_epoch: epoch_u64(chain.fulu_fork_epoch),
         blob_schedule: blob_schedule_entries(chain)?,
+    })
+}
+
+fn schedule_digest_at(chain: &ChainConfig, digest_version: u16) -> Result<Root, StoreError> {
+    Ok(sha256_root(
+        &schedule_payload(chain, digest_version)?.as_ssz_bytes(),
+    ))
+}
+
+/// SSZ stored under [`KEY_CONFIG_DIGEST_V2`]: the identity-bucket hash.
+///
+/// `digest_version` is inside the hashed payload, not a second field.
+#[must_use]
+pub fn identity_side_key_bytes(chain: &ChainConfig, genesis_validators_root: Root) -> Vec<u8> {
+    ConfigDigest {
+        digest: compute_identity_digest(chain, genesis_validators_root),
+    }
+    .as_ssz_bytes()
+}
+
+/// SSZ stored under [`KEY_SCHEDULE_DIGEST`].
+///
+/// The preimage, not the hash: a forward schedule move has to be told apart
+/// from a move at or below the finalized epoch, and a hash cannot say which.
+pub fn schedule_side_key_bytes(chain: &ChainConfig) -> Result<Vec<u8>, StoreError> {
+    Ok(schedule_payload(chain, DIGEST_VERSION)?.as_ssz_bytes())
+}
+
+/// Witness the caller decoded from a stored beacon state.
+///
+/// ADR-R-11: `BeaconState::genesis_validators_root` is the only field a
+/// populated store can prove. The other four identity fields are not on the
+/// anchor. This crate does not name the consensus container; the caller does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorGenesisValidatorsRoot {
+    /// No snapshot row.
+    Missing,
+    /// Snapshot bytes were not a beacon state.
+    Undecodable,
+    /// Decoded genesis validators root.
+    Value(Root),
+}
+
+/// Compare or stamp the two side keys. Policy: ADR-R-11.
+///
+/// An empty store (no canonical rows, no blocks, no snapshots) is stamped
+/// from `chain` when both a network and a genesis validators root were
+/// supplied. A populated store that already has both keys is compared: an
+/// identity mismatch refuses, and a schedule move at or below
+/// [`ForkChoiceScalars::finalized`] refuses. A move strictly above a decoded
+/// finalized epoch logs at WARN and re-stamps the schedule key only.
+///
+/// A populated store with either side key absent is refused. Equality with
+/// [`legacy_config_digest`] is not permission to write side keys. A matching
+/// `anchor_gvr` is not permission either. There is no successful re-stamp of
+/// a populated store. One key without the other is not repaired.
+pub fn reconcile_config_side_keys(
+    engine: &Engine,
+    chain: Option<&ChainConfig>,
+    genesis_validators_root: Option<Root>,
+    anchor_gvr: AnchorGenesisValidatorsRoot,
+) -> Result<(), StoreError> {
+    let rt = engine.read()?;
+    let identity = rt.get(TABLE_META, KEY_CONFIG_DIGEST_V2.as_bytes())?;
+    let schedule = rt.get(TABLE_META, KEY_SCHEDULE_DIGEST.as_bytes())?;
+    let stored_legacy = rt
+        .get(TABLE_META, KEY_CONFIG_DIGEST.as_bytes())?
+        .map(|bytes| {
+            ConfigDigest::from_ssz_bytes(&bytes)
+                .map(|record| record.digest)
+                .map_err(|e| StoreError::Codec(format!("ConfigDigest: {e:?}")))
+        })
+        .transpose()?;
+    drop(rt);
+    let populated = store_holds_chain_history(engine)?;
+
+    match (identity, schedule) {
+        (Some(identity), Some(schedule)) => {
+            compare_side_keys(engine, chain, genesis_validators_root, &identity, &schedule)
+        }
+        (None, None) if !populated => stamp_empty(engine, chain, genesis_validators_root),
+        (None, None) => refuse_populated_without_side_keys(
+            chain,
+            genesis_validators_root,
+            stored_legacy,
+            anchor_gvr,
+        ),
+        _ => Err(StoreError::Config(
+            "side key missing: deleting a side key does not open a second stamp (ADR-R-11)".into(),
+        )),
+    }
+}
+
+/// True when a populated store has neither side key and still holds the legacy
+/// constant, so the caller should decode the anchor witness. The witness is
+/// fail-closed only. A match does not permit a stamp.
+pub fn legacy_open_needs_anchor_witness(engine: &Engine) -> Result<bool, StoreError> {
+    if !store_holds_chain_history(engine)? {
+        return Ok(false);
+    }
+    let rt = engine.read()?;
+    let identity = rt.get(TABLE_META, KEY_CONFIG_DIGEST_V2.as_bytes())?;
+    let schedule = rt.get(TABLE_META, KEY_SCHEDULE_DIGEST.as_bytes())?;
+    if identity.is_some() || schedule.is_some() {
+        return Ok(false);
+    }
+    let Some(bytes) = rt.get(TABLE_META, KEY_CONFIG_DIGEST.as_bytes())? else {
+        return Ok(false);
     };
-    Ok(sha256_root(&payload.as_ssz_bytes()))
+    let digest = ConfigDigest::from_ssz_bytes(&bytes)
+        .map_err(|e| StoreError::Codec(format!("ConfigDigest: {e:?}")))?
+        .digest;
+    Ok(digest == legacy_config_digest())
+}
+
+fn stamp_empty(
+    engine: &Engine,
+    chain: Option<&ChainConfig>,
+    genesis_validators_root: Option<Root>,
+) -> Result<(), StoreError> {
+    let (Some(chain), Some(gvr)) = (chain, genesis_validators_root) else {
+        // No running network yet (beacon-core threads it later), or no GVR.
+        // Do not stamp `Root::ZERO`. An empty store has nothing to contradict.
+        return Ok(());
+    };
+    stamp_both(engine, chain, gvr)
+}
+
+/// ADR-R-11: history plus a missing side key is a refusal. Never [`stamp_both`].
+fn refuse_populated_without_side_keys(
+    chain: Option<&ChainConfig>,
+    genesis_validators_root: Option<Root>,
+    stored_legacy: Option<Root>,
+    anchor_gvr: AnchorGenesisValidatorsRoot,
+) -> Result<(), StoreError> {
+    let Some(gvr) = genesis_validators_root else {
+        return Err(StoreError::Config(
+            "genesis_validators_root is required when the store holds chain history \
+             (absent GVR is not Root::ZERO)"
+                .into(),
+        ));
+    };
+    if chain.is_none() {
+        return Err(StoreError::Config(
+            "populated store refused: config_digest equality with the legacy constant \
+             is not an open until side keys are compared"
+                .into(),
+        ));
+    }
+    if stored_legacy != Some(legacy_config_digest()) {
+        return Err(StoreError::Config(
+            "populated store refused: meta.config_digest is not the legacy constant, \
+             so it is not re-stamped"
+                .into(),
+        ));
+    }
+    // The anchor check only adds a more specific refusal. A match is not a write.
+    match anchor_gvr {
+        AnchorGenesisValidatorsRoot::Value(found) if found == gvr => Err(StoreError::Config(
+            "populated store refused: a matching anchor genesis_validators_root is not \
+             permission to write side keys (ADR-R-11)"
+                .into(),
+        )),
+        AnchorGenesisValidatorsRoot::Value(_) => Err(StoreError::Config(
+            "populated store refused: anchor genesis_validators_root does not match \
+             the running config"
+                .into(),
+        )),
+        AnchorGenesisValidatorsRoot::Missing => Err(StoreError::Config(
+            "populated store refused: no anchor genesis_validators_root to cross-check".into(),
+        )),
+        AnchorGenesisValidatorsRoot::Undecodable => Err(StoreError::Config(
+            "populated store refused: anchor state did not yield genesis_validators_root".into(),
+        )),
+    }
+}
+
+fn compare_side_keys(
+    engine: &Engine,
+    chain: Option<&ChainConfig>,
+    genesis_validators_root: Option<Root>,
+    identity: &[u8],
+    schedule: &[u8],
+) -> Result<(), StoreError> {
+    let Some(chain) = chain else {
+        return Err(StoreError::Config(
+            "running config is required to compare config side keys (ADR-R-11)".into(),
+        ));
+    };
+    let Some(gvr) = genesis_validators_root else {
+        return Err(StoreError::Config(
+            "genesis_validators_root is required when the store holds chain history \
+             (absent GVR is not Root::ZERO)"
+                .into(),
+        ));
+    };
+    let found = ConfigDigest::from_ssz_bytes(identity)
+        .map_err(|e| StoreError::Codec(format!("config_digest_v2: {e:?}")))?;
+    let expected = compute_identity_digest(chain, gvr);
+    if found.digest != expected {
+        return Err(StoreError::Config(
+            "identity digest mismatch: config_digest_v2 does not match \
+             genesis_fork_version, deposit_contract_address, deposit_chain_id, \
+             genesis_validators_root, or seconds_per_slot (ADR-R-11)"
+                .into(),
+        ));
+    }
+    compare_schedule(engine, chain, schedule)
+}
+
+fn compare_schedule(
+    engine: &Engine,
+    chain: &ChainConfig,
+    schedule: &[u8],
+) -> Result<(), StoreError> {
+    let stored = ScheduleDigestPayload::from_ssz_bytes(schedule)
+        .map_err(|e| StoreError::Codec(format!("schedule_digest: {e:?}")))?;
+    if stored.digest_version != DIGEST_VERSION {
+        return Err(StoreError::Config(format!(
+            "schedule digest_version mismatch: found {}, expected {DIGEST_VERSION}",
+            stored.digest_version
+        )));
+    }
+    let running = schedule_payload(chain, DIGEST_VERSION)?;
+    if stored == running {
+        return Ok(());
+    }
+    let finalized = finalized_epoch(engine)?;
+    match classify_schedule(&stored, &running, finalized) {
+        ScheduleVerdict::Unchanged => Ok(()),
+        ScheduleVerdict::Historical => Err(StoreError::Config(format!(
+            "schedule digest mismatch: a fork epoch or BLOB_SCHEDULE entry moved \
+             at or below finalized epoch {finalized} (ADR-R-11)"
+        ))),
+        ScheduleVerdict::Forward => {
+            tracing::warn!(
+                finalized_epoch = finalized,
+                "ADR-R-11 schedule bucket moved above the finalized epoch; \
+                 re-stamping schedule digest"
+            );
+            let bytes = running.as_ssz_bytes();
+            put_meta(engine, &[(KEY_SCHEDULE_DIGEST, bytes.as_slice())])
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleVerdict {
+    Unchanged,
+    /// A boundary at or below the finalized epoch moved.
+    Historical,
+    /// Every moved boundary is strictly above the finalized epoch.
+    Forward,
+}
+
+fn classify_schedule(
+    stored: &ScheduleDigestPayload,
+    running: &ScheduleDigestPayload,
+    finalized_epoch: u64,
+) -> ScheduleVerdict {
+    if stored == running {
+        return ScheduleVerdict::Unchanged;
+    }
+    let mut historical = false;
+    let mut note_move = |old: u64, new: u64| {
+        if old != new && (old <= finalized_epoch || new <= finalized_epoch) {
+            historical = true;
+        }
+    };
+    note_move(stored.altair_fork_epoch, running.altair_fork_epoch);
+    note_move(stored.bellatrix_fork_epoch, running.bellatrix_fork_epoch);
+    note_move(stored.capella_fork_epoch, running.capella_fork_epoch);
+    note_move(stored.deneb_fork_epoch, running.deneb_fork_epoch);
+    note_move(stored.electra_fork_epoch, running.electra_fork_epoch);
+    note_move(stored.fulu_fork_epoch, running.fulu_fork_epoch);
+    note_blob_edits(
+        &stored.blob_schedule,
+        &running.blob_schedule,
+        finalized_epoch,
+        &mut historical,
+    );
+    if historical {
+        ScheduleVerdict::Historical
+    } else {
+        // No boundary at or below finalized moved. Re-stamp, including a
+        // list-order-only difference.
+        ScheduleVerdict::Forward
+    }
+}
+
+fn note_blob_edits(
+    stored: &VariableList<BlobScheduleDigestEntry, U256>,
+    running: &VariableList<BlobScheduleDigestEntry, U256>,
+    finalized_epoch: u64,
+    historical: &mut bool,
+) {
+    let stored_map = blob_map(stored);
+    let running_map = blob_map(running);
+    let mut note = |epoch: u64| {
+        if epoch <= finalized_epoch {
+            *historical = true;
+        }
+    };
+    for (epoch, max) in &stored_map {
+        match running_map.get(epoch) {
+            Some(other) if other == max => {}
+            _ => note(*epoch),
+        }
+    }
+    for (epoch, max) in &running_map {
+        match stored_map.get(epoch) {
+            Some(other) if other == max => {}
+            _ => note(*epoch),
+        }
+    }
+}
+
+fn blob_map(
+    entries: &VariableList<BlobScheduleDigestEntry, U256>,
+) -> std::collections::BTreeMap<u64, u64> {
+    entries
+        .iter()
+        .map(|entry| (entry.epoch, entry.max_blobs_per_block))
+        .collect()
+}
+
+/// Decoded `ForkChoiceScalars.finalized.epoch`. Missing or undecodable bytes
+/// are not epoch 0: a schedule re-stamp needs a proof that every moved
+/// boundary is strictly above this epoch (ADR-R-11).
+fn finalized_epoch(engine: &Engine) -> Result<u64, StoreError> {
+    let rt = engine.read()?;
+    let Some(bytes) = rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())? else {
+        return Err(StoreError::Config(
+            "schedule re-stamp refused: meta.fc_scalars is missing, so no finalized \
+             epoch proves the move is above it (ADR-R-11)"
+                .into(),
+        ));
+    };
+    let scalars = ForkChoiceScalars::from_ssz_bytes(&bytes).map_err(|e| {
+        StoreError::Config(format!(
+            "schedule re-stamp refused: meta.fc_scalars did not decode ({e:?}) (ADR-R-11)"
+        ))
+    })?;
+    Ok(scalars.finalized.epoch.as_u64())
+}
+
+fn stamp_both(engine: &Engine, chain: &ChainConfig, gvr: Root) -> Result<(), StoreError> {
+    let identity = identity_side_key_bytes(chain, gvr);
+    let schedule = schedule_side_key_bytes(chain)?;
+    put_meta(
+        engine,
+        &[
+            (KEY_CONFIG_DIGEST_V2, identity.as_slice()),
+            (KEY_SCHEDULE_DIGEST, schedule.as_slice()),
+        ],
+    )
+}
+
+fn put_meta(engine: &Engine, writes: &[(&str, &[u8])]) -> Result<(), StoreError> {
+    debug_assert!(
+        writes.iter().all(|(key, _)| *key != KEY_CONFIG_DIGEST),
+        "side-key writes must not replace meta.config_digest"
+    );
+    let mut batch = engine.batch();
+    for (key, value) in writes {
+        batch.put(TABLE_META, key.as_bytes(), value);
+    }
+    engine.commit(batch)
 }
 
 fn blob_schedule_entries(

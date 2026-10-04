@@ -27,6 +27,12 @@ pub const TABLE_META: &str = "meta";
 pub const KEY_SCHEMA_VERSION: &str = "schema_version";
 /// Key for [`ConfigDigest`].
 pub const KEY_CONFIG_DIGEST: &str = "config_digest";
+/// Identity bucket (ADR-R-11). Sixteen bytes, which is the meta-key cap.
+pub const KEY_CONFIG_DIGEST_V2: &str = "config_digest_v2";
+/// Schedule bucket (ADR-R-11).
+///
+/// `config_schedule_digest` is 22 bytes and fails the cap. This spelling is 15.
+pub const KEY_SCHEDULE_DIGEST: &str = "schedule_digest";
 /// Key for [`Split`].
 pub const KEY_SPLIT: &str = "split";
 /// Key for [`AnchorInfo`].
@@ -52,6 +58,8 @@ pub const KEY_SNAPSHOT_COMPLETION: &str = "snap_complete";
 pub const META_KEYS: &[&str] = &[
     KEY_SCHEMA_VERSION,
     KEY_CONFIG_DIGEST,
+    KEY_CONFIG_DIGEST_V2,
+    KEY_SCHEDULE_DIGEST,
     KEY_SPLIT,
     KEY_ANCHOR_INFO,
     KEY_COLUMN_INFO,
@@ -449,5 +457,21 @@ mod tests {
             assert!(!k.is_empty());
             assert!(k.is_ascii());
         }
+    }
+
+    /// ADR-R-11: only the schedule spelling is shortened. The cap is not raised.
+    #[test]
+    fn side_key_names_fit_the_cap_without_merging() {
+        assert_eq!(KEY_CONFIG_DIGEST_V2, "config_digest_v2");
+        assert_eq!(KEY_CONFIG_DIGEST_V2.len(), 16);
+        assert_eq!(KEY_SCHEDULE_DIGEST, "schedule_digest");
+        assert!(KEY_SCHEDULE_DIGEST.len() <= 16);
+        assert!(
+            "config_schedule_digest".len() > 16,
+            "the spelled-out schedule key must stay illegal"
+        );
+        assert_ne!(KEY_SCHEDULE_DIGEST, KEY_CONFIG_DIGEST);
+        assert_ne!(KEY_CONFIG_DIGEST_V2, KEY_CONFIG_DIGEST);
+        assert_ne!(KEY_SCHEDULE_DIGEST, KEY_CONFIG_DIGEST_V2);
     }
 }
