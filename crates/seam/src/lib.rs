@@ -471,6 +471,34 @@ pub trait ArchiveWrite: Send + Sync + 'static {
         Ok(false)
     }
 
+    /// Read-only gate before `on_block`.
+    ///
+    /// The default admits every parent so doubles that do not model a store
+    /// keep importing. Production returns the same tokens as
+    /// [`Self::commit_import`]: [`FailedPreconditionReason::StoreIncomplete`]
+    /// when the store holds no durable body, then
+    /// [`FailedPreconditionReason::ParentNotDurable`]. This is not the
+    /// restart tri-state.
+    fn import_precondition(&self, parent_root: Root) -> Result<(), SeamError> {
+        let _ = parent_root;
+        Ok(())
+    }
+
+    /// [`Self::commit_import`] for the core OS thread.
+    ///
+    /// The default drives the async method, which is enough for a double
+    /// whose future is ready on first poll. Production waits on the P0
+    /// writer instead of polling that future.
+    fn commit_import_blocking(&self, import: DurableImport) -> Result<(), SeamError> {
+        futures::executor::block_on(self.commit_import(import))
+    }
+
+    /// [`Self::set_head`] for the core OS thread. Same default as
+    /// [`Self::commit_import_blocking`].
+    fn set_head_blocking(&self, head: HeadChange, scalars: Bytes) -> Result<(), SeamError> {
+        futures::executor::block_on(self.set_head(head, scalars))
+    }
+
     /// Signature only. The default performs no store write and does not
     /// apply the precondition below.
     ///

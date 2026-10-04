@@ -3,7 +3,7 @@
 //! `GetHead` is a pointer load on [`HeadSnapshotStore`] — it never queues behind
 //! an epoch transition on the core thread.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use cc_types::containers::Checkpoint;
@@ -49,9 +49,14 @@ impl Default for HeadSnapshot {
 }
 
 /// Shared head snapshot: core thread writes, gRPC `GetHead` reads.
+///
+/// `durable_head` is the last root for which `set_head` or
+/// `commit_import.head` returned `Ok` in this process. `load` does not take
+/// that lock. Clones share both handles.
 #[derive(Debug, Clone)]
 pub struct HeadSnapshotStore {
     inner: Arc<ArcSwap<HeadSnapshot>>,
+    durable_head: Arc<Mutex<Option<Root>>>,
 }
 
 impl HeadSnapshotStore {
@@ -59,14 +64,34 @@ impl HeadSnapshotStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(HeadSnapshot::default())),
+            durable_head: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Seed from an initial snapshot (tests / post-bootstrap).
+    ///
+    /// The durable-head ack starts empty: a seeded snapshot is not a commit.
     pub fn with_snapshot(snapshot: HeadSnapshot) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(snapshot)),
+            durable_head: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Last head this process durably committed, if any.
+    pub fn durable_head(&self) -> Option<Root> {
+        *self
+            .durable_head
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Record a head after `set_head` or `commit_import.head` returns `Ok`.
+    pub fn set_durable_head(&self, root: Root) {
+        *self
+            .durable_head
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(root);
     }
 
     /// Clone of the `ArcSwap` handle (core thread + service share this).

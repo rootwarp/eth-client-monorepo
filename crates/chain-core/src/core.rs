@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use cc_fork_choice::{PeerDasAvailability, Store, is_optimistic, is_optimistic_node, on_tick};
 use cc_proto::chain::{
     ApplyAttestationsRequest, ApplyAttestationsResponse, ImportBlockRequest, ImportBlockResponse,
+    ImportBlockVerdict,
 };
 use cc_proto::common::Source;
 use cc_scheduler::{ChainLane, Enqueue, Manager, QueueSizes, sized_from_validators};
@@ -1748,7 +1749,11 @@ fn core_loop<P: Preset>(
                         &mut epoch_sequence,
                         &mut last_published_epoch,
                     );
-                    // Post-import fcU (off attestation path — after snapshot publish).
+                }
+                // Post-import fcU only for a head this call may publish.
+                if outcome.as_ref().is_ok_and(|o| o.publish_fcu)
+                    && durable_head_may_fcu(&store, &head, archive.as_ref())
+                {
                     emit_fcu_head(&store, fcu.as_ref());
                 }
                 let _ = reply.send(outcome.map(|o| o.response));
@@ -1798,6 +1803,10 @@ fn core_loop<P: Preset>(
                         &mut epoch_sequence,
                         &mut last_published_epoch,
                     );
+                }
+                if outcome.as_ref().is_ok_and(|o| o.publish_fcu)
+                    && durable_head_may_fcu(&store, &head, archive.as_ref())
+                {
                     emit_fcu_head(&store, fcu.as_ref());
                 }
                 let _ = reply.send(outcome);
@@ -1811,12 +1820,16 @@ fn core_loop<P: Preset>(
                     &mut snapshot_sequence,
                     request,
                     &config,
+                    archive.as_ref(),
                 );
                 // Attestations can move head; re-point EL when they do.
-                if outcome.is_ok() {
+                // A failed `set_head` keeps the per-item response and skips fcU.
+                if outcome.as_ref().is_ok_and(|done| done.publish_fcu)
+                    && durable_head_may_fcu(&store, &head, archive.as_ref())
+                {
                     emit_fcu_head(&store, fcu.as_ref());
                 }
-                let _ = reply.send(outcome);
+                let _ = reply.send(outcome.map(|done| done.response));
             }
             CoreCommand::Query { request, reply } => {
                 let outcome = handle_query(&store, &residency, request);
@@ -1830,7 +1843,7 @@ fn core_loop<P: Preset>(
                 if slot_tick_enabled {
                     advance_store_clock(&mut store);
                 }
-                handle_data_available(
+                let publish_fcu = handle_data_available(
                     &mut store,
                     &mut residency,
                     &config,
@@ -1850,8 +1863,10 @@ fn core_loop<P: Preset>(
                     import_gossip_clock(slot_tick_enabled, gossip_disparity),
                     archive.as_ref(),
                 );
-                // Re-import may have moved head.
-                emit_fcu_head(&store, fcu.as_ref());
+                // Re-import may have moved head. Invalid, deferred, and errors do not.
+                if publish_fcu && durable_head_may_fcu(&store, &head, archive.as_ref()) {
+                    emit_fcu_head(&store, fcu.as_ref());
+                }
             }
             CoreCommand::Ping { issued_at, reply } => {
                 tracing::trace!(?issued_at, "core liveness ping");
@@ -1984,7 +1999,7 @@ fn handle_slot_tick<P: Preset>(
                 n = pending_engine.len(),
                 "engine online; re-driving pending_engine"
             );
-            redrive_pending_engine(
+            let publish_fcu = redrive_pending_engine(
                 store,
                 residency,
                 config,
@@ -2001,7 +2016,9 @@ fn handle_slot_tick<P: Preset>(
                 epoch,
                 archive,
             );
-            emit_fcu_head(store, fcu);
+            if publish_fcu && durable_head_may_fcu(store, head, archive) {
+                emit_fcu_head(store, fcu);
+            }
         }
         *last_engine_online = online;
     }
@@ -2011,6 +2028,25 @@ fn handle_slot_tick<P: Preset>(
         if let Err(e) = driver.on_slot(slot) {
             tracing::warn!(error = %e, slot = slot.as_u64(), "fcU per-slot floor failed");
         }
+    }
+}
+
+/// fcU only for a head this process has durably committed.
+///
+/// No archive handle means a fixture import: there is no durable write to
+/// wait for. With an archive, the head root about to be sent must be the
+/// last `set_head` / `commit_import.head` that returned `Ok`.
+fn durable_head_may_fcu<P: Preset>(
+    store: &Store<P>,
+    head: &HeadSnapshotStore,
+    archive: Option<&crate::ArchiveWriteHandle>,
+) -> bool {
+    if archive.is_none() {
+        return true;
+    }
+    match head.durable_head() {
+        Some(root) => head_root_of(store) == root,
+        None => false,
     }
 }
 
@@ -2080,7 +2116,7 @@ fn handle_data_available<P: Preset>(
     epoch: &EpochContextStore,
     gossip_clock: Option<GossipClock>,
     archive: Option<&crate::ArchiveWriteHandle>,
-) {
+) -> bool {
     if let Some(da) = peer_das {
         da.mark_available(root);
         metrics.set_da_available_occupancy(da.len() as u64);
@@ -2096,9 +2132,12 @@ fn handle_data_available<P: Preset>(
         // Signal arrived before the block — import will succeed on first attempt.
         metrics.set_da_pending_occupancy(pending_da.len() as u64);
         tracing::debug!(%root, slot, "DataAvailable; no pending_da entry");
-        return;
+        return true;
     };
     metrics.set_da_pending_occupancy(pending_da.len() as u64);
+    // The parked row stays `Deferred` until the re-drive returns `Imported`.
+    // `finish_imported` writes `da: Available`. Invalid and errors put the
+    // entry back and do not fcU.
     tracing::debug!(%root, slot, "DataAvailable; re-driving pending_da entry");
 
     let request = ImportBlockRequest {
@@ -2133,6 +2172,19 @@ fn handle_data_available<P: Preset>(
     if outcome.is_ok() {
         maybe_publish_epoch_context(store, config, epoch, epoch_sequence, last_published_epoch);
     }
+    let imported = outcome.as_ref().is_ok_and(|o| {
+        let verdict = o.response.verdict;
+        verdict == ImportBlockVerdict::Imported as i32
+            || verdict == ImportBlockVerdict::Duplicate as i32
+    });
+    if !imported {
+        if !pending_da.contains(&root) {
+            pending_da.insert(entry);
+            metrics.set_da_pending_occupancy(pending_da.len() as u64);
+        }
+        return false;
+    }
+    outcome.is_ok_and(|o| o.publish_fcu)
 }
 
 /// Drop timed-out `pending_engine` entries and bump the metric (CC-36a).
@@ -2175,9 +2227,10 @@ fn redrive_pending_engine<P: Preset>(
     last_published_epoch: &mut u64,
     epoch: &EpochContextStore,
     archive: Option<&crate::ArchiveWriteHandle>,
-) {
+) -> bool {
     let entries = pending_engine.drain_oldest_first();
     metrics.set_pending_engine_occupancy(pending_engine.len() as u64);
+    let mut publish_fcu = false;
     for entry in entries {
         let root = entry.root;
         let request = ImportBlockRequest {
@@ -2215,7 +2268,11 @@ fn redrive_pending_engine<P: Preset>(
         if outcome.is_ok() {
             maybe_publish_epoch_context(store, config, epoch, epoch_sequence, last_published_epoch);
         }
+        if outcome.is_ok_and(|o| o.publish_fcu) {
+            publish_fcu = true;
+        }
     }
+    publish_fcu
 }
 
 /// Publish a new [`EpochContext`] when the head state's epoch has advanced.

@@ -860,9 +860,8 @@ fn column_sidecar_decode_lives_in_chain_core() {
         ingest_src.contains("DataColumnSidecar"),
         "chain-core ingest names the sidecar to populate ColumnBatch"
     );
-    // Live writer boundary is still ArchiveWrite::ingest_block.
-    // S2R-A-02 names commit_import / set_head. S2R-A-05 switches this call.
-    duplicate_anchor_reaches_ingest_block();
+    // The duplicate-anchor repair reaches commit_import, not ingest_block.
+    duplicate_anchor_reaches_commit_import();
     let fanout_src = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../crates/chain-core/src/events/fanout.rs"
@@ -873,18 +872,18 @@ fn column_sidecar_decode_lives_in_chain_core() {
     );
 }
 
-/// A fork-choice duplicate whose body is not durable must reach the writer
-/// the import path calls today: `ArchiveWrite::ingest_block`.
-///
-/// S2R-A-02 is the `commit_import` / `set_head` contract. S2R-A-05 is the
-/// call-site switch. The recorder takes those ops only for calls this path
-/// actually makes. It makes none, so those vecs stay empty. The zero-parent
-/// remap (`parent_root == block_root`) stays until S2R-A-05 / S2R-A-08.
-fn duplicate_anchor_reaches_ingest_block() {
+/// A fork-choice duplicate whose body is not durable reaches
+/// `ArchiveWrite::commit_import`. The SSZ parent is stored as-is (zero for
+/// this anchor). `get_head` selects this anchor, so the commit carries
+/// `head` and does not call `set_head`.
+fn duplicate_anchor_reaches_commit_import() {
     use async_trait::async_trait;
     use cc_chain::import::{ImportCounters, encode_signed_block, import_block_with_early};
     use cc_chain::residency::Residency;
-    use cc_seam::{ArchiveWrite, Bytes, DurableImport, HeadChange, IngestBlock, SeamError};
+    use cc_seam::{
+        ArchiveWrite, Bytes, DaVerdict, DurableImport, HeadCause, HeadChange, IngestBlock,
+        SeamError,
+    };
     use cc_state_transition::BlockSignatureStrategy;
     use std::sync::Mutex;
     use tree_hash::TreeHash;
@@ -988,25 +987,35 @@ fn duplicate_anchor_reaches_ingest_block() {
         outcome.response.verdict,
         cc_proto::chain::ImportBlockVerdict::Duplicate as i32
     );
-    let got = archive_impl.blocks.lock().unwrap();
+    assert!(
+        archive_impl.blocks.lock().unwrap().is_empty(),
+        "duplicate repair calls commit_import, not ingest_block"
+    );
+    let got = archive_impl.imports.lock().unwrap();
     assert_eq!(
         got.len(),
         1,
-        "non-durable duplicate must reach the live writer"
+        "non-durable duplicate must reach commit_import"
     );
     let mut expected_root = [0u8; 32];
     expected_root.copy_from_slice(root.as_slice());
     assert_eq!(got[0].block_root, expected_root);
-    // Genesis parent is the block itself at this boundary.
-    assert_eq!(got[0].parent_root, expected_root);
+    assert_eq!(
+        got[0].parent_root, [0u8; 32],
+        "SSZ parent stays zero; it is not remapped to the block root"
+    );
     assert_eq!(got[0].slot, signed.message.slot.as_u64());
+    assert_eq!(got[0].da, DaVerdict::Available);
+    let written = got[0]
+        .head
+        .as_ref()
+        .expect("anchor duplicate commits its head");
+    assert_eq!(written.cause, HeadCause::Import);
+    assert_eq!(written.head_root, expected_root);
+    assert_eq!(written.head_slot, signed.message.slot.as_u64());
     drop(got);
     assert!(
-        archive_impl.imports.lock().unwrap().is_empty(),
-        "import still calls ingest_block, not commit_import"
-    );
-    assert!(
         archive_impl.heads.lock().unwrap().is_empty(),
-        "import still calls ingest_block, not set_head"
+        "this duplicate does not set_head"
     );
 }

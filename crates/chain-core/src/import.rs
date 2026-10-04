@@ -4,8 +4,8 @@
 //! decode-free dedup probe → decode → root check → parent → proposer →
 //! finalized descent → **block proposer BLS** (always on gossip path; H1)
 //!   → **early gossip ACCEPT**  (CC-27c fast path)
-//!   → DA → ST → FC → get_head → pin residency → prune → snapshot → events
-//!   → import result (not a second gossip verdict)
+//!   → DA → ST → FC → get_head → **durable commit** → pin residency → prune
+//!   → snapshot → events → import result (not a second gossip verdict)
 //! ```
 //!
 //! The pre-computed `ImportBlockRequest.root` is a **probe only**: a hit that is
@@ -252,6 +252,20 @@ pub struct ImportOutcome {
     /// Set when import parks on `Deferred(DataUnavailable)` with non-empty
     /// `blob_kzg_commitments`. Core fires unary `FetchBlobs` — never cells.
     pub block_branch: Option<BlockBranchTrigger>,
+    /// Whether core may emit import-path fcU for this outcome.
+    ///
+    /// False for `Invalid` and `DeferredDa`: those calls do not durably move
+    /// the head. Core also skips fcU when this process has not recorded a
+    /// durable head.
+    pub publish_fcu: bool,
+}
+
+/// `Invalid` and `DeferredDa` do not move canonical, so they do not fcU.
+fn publishes_import_fcu(verdict: ImportBlockVerdict) -> bool {
+    !matches!(
+        verdict,
+        ImportBlockVerdict::Invalid | ImportBlockVerdict::DeferredDa
+    )
 }
 
 /// Map `(early_accept, class)` → late-import flags (CC-27c / §5.3).
@@ -381,7 +395,7 @@ pub fn import_block_with_early<P: Preset>(
                     "supplied root {probe} does not match decoded hash_tree_root {true_root}"
                 )));
             }
-            persist_duplicate_if_missing(archive, &signed, probe, &request.ssz)?;
+            commit_duplicate_if_missing(archive, store, head_store, &signed, probe, &request.ssz)?;
         }
         metrics.inc_import_result(ImportResult::Duplicate);
         return Ok(ImportOutcome {
@@ -392,6 +406,7 @@ pub fn import_block_with_early<P: Preset>(
             late_import_reject: false,
             late_import_internal: false,
             block_branch: None,
+            publish_fcu: publishes_import_fcu(ImportBlockVerdict::Duplicate),
         });
     }
 
@@ -431,7 +446,17 @@ pub fn import_block_with_early<P: Preset>(
             late_import_reject: false,
             late_import_internal: false,
             block_branch: None,
+            publish_fcu: publishes_import_fcu(terminal.verdict),
         });
+    }
+
+    // Parent durability and the empty-store gate are knowable before
+    // `on_block`. A refusal is an ordinary import `Err`: no early ACCEPT,
+    // no transition, nothing visible. Absent archive keeps fixture imports.
+    if let Some(archive) = archive {
+        archive
+            .import_precondition(seam_root(signed.message.parent_root))
+            .map_err(map_archive_err)?;
     }
 
     // --- 4b. early gossip ACCEPT (before state transition) ------------------
@@ -454,6 +479,7 @@ pub fn import_block_with_early<P: Preset>(
             late_import_reject,
             late_import_internal,
             block_branch: None,
+            publish_fcu: publishes_import_fcu(ImportBlockVerdict::Invalid),
         });
     }
 
@@ -505,7 +531,26 @@ pub fn import_block_with_early<P: Preset>(
         Ok(BlockImport::Deferred(DeferralReason::DataUnavailable)) => {
             // Park for re-drive when DataAvailable lands (CC-24d / §8.3).
             // Prefer arrival `request.ssz` (F2) for both parking and the event.
+            // The deferred row is durable before the event. `head` stays
+            // `None`: DA deferral does not move canonical. A later
+            // `DataAvailable` upgrades `da` to `Available`.
             let arrival_ssz = &request.ssz;
+            if let Some(archive) = archive {
+                let (scalar_root, scalar_slot) = current_scalar_head(store);
+                commit_durable_import(
+                    archive,
+                    assemble_durable_import(
+                        &signed,
+                        true_root,
+                        arrival_ssz,
+                        store,
+                        cc_seam::DaVerdict::Deferred,
+                        None,
+                        scalar_root,
+                        scalar_slot,
+                    ),
+                )?;
+            }
             if let Some(pending) = pending_da {
                 let entry = PendingDaEntry {
                     root: true_root,
@@ -548,6 +593,7 @@ pub fn import_block_with_early<P: Preset>(
                 late_import_reject: false,
                 late_import_internal: false,
                 block_branch,
+                publish_fcu: publishes_import_fcu(ImportBlockVerdict::DeferredDa),
             })
         }
         Ok(BlockImport::Deferred(DeferralReason::UnknownParent)) => {
@@ -564,6 +610,7 @@ pub fn import_block_with_early<P: Preset>(
                 late_import_reject: false,
                 late_import_internal: false,
                 block_branch: None,
+                publish_fcu: publishes_import_fcu(ImportBlockVerdict::UnknownParent),
             })
         }
         Ok(BlockImport::Deferred(DeferralReason::FutureSlot)) => {
@@ -577,6 +624,7 @@ pub fn import_block_with_early<P: Preset>(
                 late_import_reject: false,
                 late_import_internal: false,
                 block_branch: None,
+                publish_fcu: publishes_import_fcu(ImportBlockVerdict::Invalid),
             })
         }
         Ok(BlockImport::Deferred(DeferralReason::ExecutionEngineUnavailable)) => {
@@ -611,6 +659,7 @@ pub fn import_block_with_early<P: Preset>(
                 late_import_reject: false,
                 late_import_internal: false,
                 block_branch: None,
+                publish_fcu: publishes_import_fcu(ImportBlockVerdict::DeferredDa),
             })
         }
         Err(e) => {
@@ -626,6 +675,7 @@ pub fn import_block_with_early<P: Preset>(
                 late_import_reject,
                 late_import_internal,
                 block_branch: None,
+                publish_fcu: publishes_import_fcu(ImportBlockVerdict::Invalid),
             })
         }
     }
@@ -837,58 +887,171 @@ fn verify_block_proposer_sig<P: Preset>(
     set.verify(strategy)
 }
 
-fn seam_root(root: Root) -> cc_seam::Root {
+pub(crate) fn seam_root(root: Root) -> cc_seam::Root {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(root.as_slice());
     arr
 }
 
-fn map_archive_err(err: cc_seam::SeamError) -> Status {
+pub(crate) fn map_archive_err(err: cc_seam::SeamError) -> Status {
     match err {
         cc_seam::SeamError::Backpressure { .. } => Status::resource_exhausted(err.to_string()),
         cc_seam::SeamError::InvalidArgument(msg) => Status::invalid_argument(msg),
+        cc_seam::SeamError::FailedPrecondition { reason } => {
+            Status::failed_precondition(reason.as_str())
+        }
         other => Status::unavailable(other.to_string()),
     }
 }
 
-/// Persist a successfully imported block through the live archive writer.
-fn persist_imported_block<P: Preset>(
-    archive: &ArchiveWriteHandle,
+/// Fork-choice head to stamp into scalars when this call does not move it.
+pub(crate) fn current_scalar_head<P: Preset>(store: &Store<P>) -> (Root, Slot) {
+    if let Some(root) = store.cached_head_root() {
+        let slot = store
+            .blocks()
+            .get(&root)
+            .map(|h| h.slot)
+            .unwrap_or_else(|| store.get_current_slot());
+        return (root, slot);
+    }
+    let justified = store.justified_checkpoint().root;
+    let slot = store
+        .blocks()
+        .get(&justified)
+        .map(|h| h.slot)
+        .unwrap_or_else(|| store.get_current_slot());
+    (justified, slot)
+}
+
+/// One `commit_import` body. `head` is set only when it names this body.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_durable_import<P: Preset>(
     signed: &SignedBeaconBlock<P>,
     block_root: Root,
     arrival_ssz: &[u8],
-) -> Result<(), Status> {
-    let parent = signed.message.parent_root;
-    let parent_root = if parent == Root::ZERO {
-        seam_root(block_root)
-    } else {
-        seam_root(parent)
-    };
-    let block = cc_seam::IngestBlock {
-        parent_root,
-        slot: signed.message.slot.as_u64(),
+    store: &Store<P>,
+    da: cc_seam::DaVerdict,
+    head: Option<cc_seam::HeadChange>,
+    scalar_head: Root,
+    scalar_slot: Slot,
+) -> cc_seam::DurableImport {
+    cc_seam::DurableImport {
         block_root: seam_root(block_root),
+        parent_root: seam_root(signed.message.parent_root),
+        slot: signed.message.slot.as_u64(),
+        state_root: seam_root(signed.message.state_root),
         ssz: Bytes::copy_from_slice(arrival_ssz),
-    };
+        da,
+        scalars: fork_choice_scalars_ssz(store, scalar_head, scalar_slot),
+        head,
+    }
+}
+
+pub(crate) fn commit_durable_import(
+    archive: &ArchiveWriteHandle,
+    import: cc_seam::DurableImport,
+) -> Result<(), Status> {
     archive
-        .ingest_block_blocking(block)
+        .commit_import_blocking(import)
         .map_err(map_archive_err)
 }
 
-/// DUPLICATE retry: persist only if this block is not already durable (H3).
-fn persist_duplicate_if_missing<P: Preset>(
+pub(crate) fn commit_set_head(
     archive: &ArchiveWriteHandle,
+    head: cc_seam::HeadChange,
+    scalars: Bytes,
+) -> Result<(), Status> {
+    archive
+        .set_head_blocking(head, scalars)
+        .map_err(map_archive_err)
+}
+
+/// DUPLICATE retry: commit a missing body, or `set_head` when the body is
+/// already durable but canonical was not moved onto it.
+///
+/// The SSZ parent is stored as-is. A missing body carries `head` only when
+/// `get_head` selected that body — a non-durable anchor is not `set_head`.
+/// When this call does not durably write the fork-choice head, the latch
+/// `get_head` stored is restored unless that head was already committed.
+fn commit_duplicate_if_missing<P: Preset>(
+    archive: &ArchiveWriteHandle,
+    store: &mut Store<P>,
+    head_store: &HeadSnapshotStore,
     signed: &SignedBeaconBlock<P>,
     block_root: Root,
     arrival_ssz: &[u8],
 ) -> Result<(), Status> {
-    if archive
+    let latch = store.head_latch();
+    let (pre_scalar_root, pre_scalar_slot) = current_scalar_head(store);
+    let (fc_head, _) = match get_head(store) {
+        Ok(head) => head,
+        Err(e) => {
+            store.restore_head_latch(latch);
+            return Err(Status::internal(format!(
+                "get_head failed on duplicate repair: {e}"
+            )));
+        }
+    };
+    let body_durable = archive
         .block_is_durable(seam_root(block_root))
-        .map_err(map_archive_err)?
-    {
-        return Ok(());
+        .map_err(map_archive_err)?;
+    let fc_is_this = fc_head == block_root;
+    let mut wrote_fc_head = false;
+    if body_durable {
+        if fc_is_this && head_store.durable_head() != Some(block_root) {
+            let head_slot = signed.message.slot;
+            if let Err(e) = commit_set_head(
+                archive,
+                cc_seam::HeadChange {
+                    head_root: seam_root(block_root),
+                    head_slot: head_slot.as_u64(),
+                    cause: cc_seam::HeadCause::Import,
+                },
+                fork_choice_scalars_ssz(store, block_root, head_slot),
+            ) {
+                store.restore_head_latch(latch);
+                return Err(e);
+            }
+            head_store.set_durable_head(block_root);
+            wrote_fc_head = true;
+        }
+    } else {
+        // Body is missing: the head rides on `commit_import`, not `set_head`.
+        let head = fc_is_this.then(|| cc_seam::HeadChange {
+            head_root: seam_root(block_root),
+            head_slot: signed.message.slot.as_u64(),
+            cause: cc_seam::HeadCause::Import,
+        });
+        let (scalar_root, scalar_slot) = if fc_is_this {
+            (block_root, signed.message.slot)
+        } else {
+            (pre_scalar_root, pre_scalar_slot)
+        };
+        if let Err(e) = commit_durable_import(
+            archive,
+            assemble_durable_import(
+                signed,
+                block_root,
+                arrival_ssz,
+                store,
+                cc_seam::DaVerdict::Available,
+                head,
+                scalar_root,
+                scalar_slot,
+            ),
+        ) {
+            store.restore_head_latch(latch);
+            return Err(e);
+        }
+        if fc_is_this {
+            head_store.set_durable_head(block_root);
+            wrote_fc_head = true;
+        }
     }
-    persist_imported_block(archive, signed, block_root, arrival_ssz)
+    if !wrote_fc_head && head_store.durable_head() != Some(fc_head) {
+        store.restore_head_latch(latch);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -925,14 +1088,23 @@ fn finish_imported<P: Preset>(
         validator_count,
     );
 
-    if let Some(post) = store.block_state(&block_root).cloned() {
-        residency.record_imported_body(block_root, Arc::new(signed.clone()), post);
-    }
-
-    // --- 7. head recompute --------------------------------------------------
+    // --- 7. head recompute, then the durable commit -----------------------
+    // `get_head` selects the head. The published snapshot, residency, and
+    // events wait until that commit returns. A failed write restores the
+    // latch `get_head` stored. "Changed" is versus the last head this
+    // process durably committed, not the latch alone.
     let publish_start = Instant::now();
-    let (head_root, reorg) = get_head(store)
-        .map_err(|e| Status::internal(format!("get_head failed after import: {e}")))?;
+    let latch = store.head_latch();
+    let (pre_scalar_root, pre_scalar_slot) = current_scalar_head(store);
+    let (head_root, reorg) = match get_head(store) {
+        Ok(head) => head,
+        Err(e) => {
+            store.restore_head_latch(latch);
+            return Err(Status::internal(format!(
+                "get_head failed after import: {e}"
+            )));
+        }
+    };
     let head_slot = store
         .blocks()
         .get(&head_root)
@@ -943,6 +1115,64 @@ fn finish_imported<P: Preset>(
         .get(&head_root)
         .map(|h| h.state_root)
         .unwrap_or(Root::ZERO);
+    if let Some(archive) = archive {
+        let needs_head_write = head_store.durable_head() != Some(head_root);
+        // This body's transaction carries `head` only when the new head is
+        // the body it writes. Any other new head is `set_head`. Scalars on
+        // a body that does not carry that head stay the pre-`get_head` head
+        // so the writer does not persist the uncommitted root.
+        let head_on_body = needs_head_write && head_root == block_root;
+        let (scalar_root, scalar_slot) = if head_on_body {
+            (block_root, signed.message.slot)
+        } else if needs_head_write {
+            (pre_scalar_root, pre_scalar_slot)
+        } else {
+            (head_root, head_slot)
+        };
+        let head_field = head_on_body.then(|| cc_seam::HeadChange {
+            head_root: seam_root(block_root),
+            head_slot: slot,
+            cause: cc_seam::HeadCause::Import,
+        });
+        if let Err(e) = commit_durable_import(
+            archive,
+            assemble_durable_import(
+                signed,
+                block_root,
+                arrival_ssz,
+                store,
+                cc_seam::DaVerdict::Available,
+                head_field,
+                scalar_root,
+                scalar_slot,
+            ),
+        ) {
+            store.restore_head_latch(latch);
+            return Err(e);
+        }
+        if head_on_body {
+            head_store.set_durable_head(head_root);
+        }
+        if needs_head_write && head_root != block_root {
+            if let Err(e) = commit_set_head(
+                archive,
+                cc_seam::HeadChange {
+                    head_root: seam_root(head_root),
+                    head_slot: head_slot.as_u64(),
+                    cause: cc_seam::HeadCause::Import,
+                },
+                fork_choice_scalars_ssz(store, head_root, head_slot),
+            ) {
+                store.restore_head_latch(latch);
+                return Err(e);
+            }
+            head_store.set_durable_head(head_root);
+        }
+    }
+
+    if let Some(post) = store.block_state(&block_root).cloned() {
+        residency.record_imported_body(block_root, Arc::new(signed.clone()), post);
+    }
 
     // --- 7b. pin Head = FC head, then prune (H2) ----------------------------
     residency.settle_after_head(store, head_root, block_root, is_epoch_boundary);
@@ -985,10 +1215,6 @@ fn finish_imported<P: Preset>(
         .get(&finalized.root)
         .map(|h| h.state_root)
         .unwrap_or(Root::ZERO);
-    if let Some(archive) = archive {
-        persist_imported_block(archive, signed, block_root, arrival_ssz)?;
-    }
-
     publish_import_events(
         event_tx,
         metrics,
@@ -1019,6 +1245,7 @@ fn finish_imported<P: Preset>(
         late_import_reject: false,
         late_import_internal: false,
         block_branch: None,
+        publish_fcu: publishes_import_fcu(ImportBlockVerdict::Imported),
     })
 }
 
@@ -1321,7 +1548,20 @@ mod tests {
         ImportBlockRequest,
         Root,
     ) {
-        use cc_fork_choice::{HarnessAvailability, get_forkchoice_store, on_tick};
+        use cc_fork_choice::HarnessAvailability;
+        use std::sync::Arc;
+        persist_retry_child_da(Arc::new(HarnessAvailability))
+    }
+
+    fn persist_retry_child_da(
+        da: Arc<dyn cc_fork_choice::DataAvailability>,
+    ) -> (
+        cc_fork_choice::Store<Minimal>,
+        ChainConfig,
+        ImportBlockRequest,
+        Root,
+    ) {
+        use cc_fork_choice::{get_forkchoice_store, on_tick};
         use cc_types::BeaconBlockBody;
         use cc_types::containers::Validator;
         use cc_types::primitives::{BlsPublicKey, Gwei};
@@ -1380,7 +1620,7 @@ mod tests {
             state.clone(),
             &anchor_block,
             Arc::new(AcceptEngine),
-            Arc::new(HarnessAvailability),
+            da,
             config.seconds_per_slot,
         )
         .unwrap();
@@ -1858,7 +2098,7 @@ mod tests {
     fn persist_fail_after_import_retries_on_duplicate() {
         use crate::ArchiveWriteHandle;
         use crate::residency::Residency;
-        use cc_seam::{ArchiveWrite, IngestBlock, SeamError};
+        use cc_seam::{ArchiveWrite, DurableImport, SeamError};
         use std::sync::atomic::AtomicU32;
         use std::sync::{Arc, Mutex};
 
@@ -1874,16 +2114,12 @@ mod tests {
                 Ok(())
             }
 
-            async fn ingest_block(&self, block: IngestBlock) -> Result<(), SeamError> {
-                self.ingest_block_blocking(block)
-            }
-
-            fn ingest_block_blocking(&self, block: IngestBlock) -> Result<(), SeamError> {
+            fn commit_import_blocking(&self, import: DurableImport) -> Result<(), SeamError> {
                 if self.fails_left.load(Ordering::SeqCst) > 0 {
                     self.fails_left.fetch_sub(1, Ordering::SeqCst);
                     return Err(SeamError::Unavailable("injected persist fail".into()));
                 }
-                self.persisted.lock().unwrap().push(block.block_root);
+                self.persisted.lock().unwrap().push(import.block_root);
                 Ok(())
             }
         }
@@ -1930,6 +2166,16 @@ mod tests {
             is_fully_imported(&store, &true_root),
             "on_block already applied; retry must see DUPLICATE"
         );
+        assert_ne!(
+            store.cached_head_root(),
+            Some(true_root),
+            "a failed head write restores the pre-call latch"
+        );
+        assert_eq!(
+            snap_seq, 0,
+            "the failing call does not publish a head snapshot"
+        );
+        assert_eq!(head.load().sequence, 0);
 
         let second = import_block_with_early(
             &mut store,
@@ -1967,13 +2213,13 @@ mod tests {
         use crate::ArchiveWriteHandle;
         use crate::residency::Residency;
         use cc_fork_choice::on_tick;
-        use cc_seam::{ArchiveWrite, IngestBlock, SeamError};
+        use cc_seam::{ArchiveWrite, DaVerdict, DurableImport, HeadCause, SeamError};
         use std::collections::HashSet;
         use std::sync::{Arc, Mutex};
 
         #[derive(Debug, Default)]
         struct RecordDurable {
-            persisted: Mutex<Vec<[u8; 32]>>,
+            persisted: Mutex<Vec<DurableImport>>,
         }
 
         #[async_trait::async_trait]
@@ -1982,17 +2228,18 @@ mod tests {
                 Ok(())
             }
 
-            async fn ingest_block(&self, block: IngestBlock) -> Result<(), SeamError> {
-                self.ingest_block_blocking(block)
-            }
-
-            fn ingest_block_blocking(&self, block: IngestBlock) -> Result<(), SeamError> {
-                self.persisted.lock().unwrap().push(block.block_root);
+            fn commit_import_blocking(&self, import: DurableImport) -> Result<(), SeamError> {
+                self.persisted.lock().unwrap().push(import);
                 Ok(())
             }
 
             fn block_is_durable(&self, root: cc_seam::Root) -> Result<bool, SeamError> {
-                Ok(self.persisted.lock().unwrap().contains(&root))
+                Ok(self
+                    .persisted
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.block_root == root))
             }
         }
 
@@ -2082,11 +2329,22 @@ mod tests {
         assert_eq!(
             persisted.len(),
             2,
-            "already-durable A must not be ingested again: {persisted:?}"
+            "already-durable A must not be committed again: {persisted:?}"
         );
-        let set: HashSet<_> = persisted.iter().copied().collect();
+        let set: HashSet<_> = persisted.iter().map(|row| row.block_root).collect();
         assert!(set.contains(&seam_root(root_a)));
         assert!(set.contains(&seam_root(root_b)));
+        let first = &persisted[0];
+        assert_eq!(first.da, DaVerdict::Available);
+        assert_eq!(first.block_root, seam_root(root_a));
+        assert_ne!(
+            first.parent_root, first.block_root,
+            "SSZ parent is stored as-is; a zero parent is not remapped"
+        );
+        let head = first.head.as_ref().expect("import A moves head onto A");
+        assert_eq!(head.head_root, first.block_root);
+        assert_eq!(head.head_slot, first.slot);
+        assert_eq!(head.cause, HeadCause::Import);
     }
 
     fn test_root(b: u8) -> Root {
@@ -2397,5 +2655,318 @@ mod tests {
             None,
             "must not fall back to the head state's in-window row"
         );
+    }
+
+    /// A refused commit (parent not durable, or store incomplete) must not
+    /// advance the head, move residency, publish BLOCK_IMPORTED / head /
+    /// finalized, or take the import-path fcU. The check is before `on_block`.
+    #[test]
+    fn refused_commit_leaves_no_visible_import_mutation() {
+        use crate::residency::Residency;
+        use cc_seam::{ArchiveWrite, FailedPreconditionReason, SeamError};
+        use std::sync::Arc;
+
+        struct Refuse {
+            reason: FailedPreconditionReason,
+        }
+
+        #[async_trait::async_trait]
+        impl ArchiveWrite for Refuse {
+            async fn ingest_columns(&self, _batch: cc_seam::ColumnBatch) -> Result<(), SeamError> {
+                Ok(())
+            }
+
+            fn import_precondition(&self, _parent_root: cc_seam::Root) -> Result<(), SeamError> {
+                Err(SeamError::FailedPrecondition {
+                    reason: self.reason,
+                })
+            }
+        }
+
+        for reason in [
+            FailedPreconditionReason::ParentNotDurable,
+            FailedPreconditionReason::StoreIncomplete,
+        ] {
+            let (mut store, config, request, true_root) = persist_retry_child();
+            let archive: crate::ArchiveWriteHandle = Arc::new(Refuse { reason });
+            let mut registry = Registry::default();
+            let metrics = ChainMetrics::register(&mut registry);
+            let head = HeadSnapshotStore::new();
+            let head_before = head.load();
+            let (event_tx, mut event_rx) = mpsc::channel(8);
+            let counters = ImportCounters::default();
+            let mut residency = Residency::<Minimal>::new(64, 32);
+            let mut snap_seq = 0u64;
+
+            let outcome = import_block_with_early(
+                &mut store,
+                &mut residency,
+                &config,
+                &head,
+                &event_tx,
+                &metrics,
+                &counters,
+                &mut snap_seq,
+                request,
+                BlockSignatureStrategy::NoVerification,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&archive),
+            );
+            // Import-path fcU (`emit_fcu_head`) runs only after `Ok`.
+            let fcu_emissions = u32::from(outcome.is_ok());
+
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains(reason.as_str())),
+                "{reason}: refused commit must be an ordinary Err, got {outcome:?}"
+            );
+            assert_eq!(
+                counters.transition_count(),
+                0,
+                "{reason}: parent/store refusal is checked before on_block"
+            );
+            assert!(
+                !is_fully_imported(&store, &true_root),
+                "{reason}: on_block must not integrate the block"
+            );
+            assert_eq!(
+                residency.resident_count(),
+                0,
+                "{reason}: residency must not move"
+            );
+            assert_eq!(
+                residency.body_ring_len(),
+                0,
+                "{reason}: body ring must not move"
+            );
+            let published = head.load();
+            assert_eq!(published.sequence, head_before.sequence);
+            assert_eq!(
+                published.head_root, head_before.head_root,
+                "{reason}: head snapshot must not advance"
+            );
+            assert!(
+                event_rx.try_recv().is_err(),
+                "{reason}: no BLOCK_IMPORTED / head / finalized event"
+            );
+            assert_eq!(
+                fcu_emissions, 0,
+                "{reason}: no import-path fcU after a refused commit"
+            );
+        }
+    }
+
+    /// DA deferral writes `da: Deferred` with `head: None` before the park
+    /// and the deferred `BLOCK_IMPORTED`. A refused commit does neither.
+    #[test]
+    fn deferred_da_commits_before_park_and_event() {
+        use crate::da::PendingDa;
+        use crate::residency::Residency;
+        use cc_fork_choice::PeerDasAvailability;
+        use cc_seam::{ArchiveWrite, DaVerdict, DurableImport, SeamError};
+        use std::sync::{Arc, Mutex};
+
+        struct Record {
+            rows: Mutex<Vec<DurableImport>>,
+            fail: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl ArchiveWrite for Record {
+            async fn ingest_columns(&self, _batch: cc_seam::ColumnBatch) -> Result<(), SeamError> {
+                Ok(())
+            }
+
+            fn commit_import_blocking(&self, import: DurableImport) -> Result<(), SeamError> {
+                if self.fail {
+                    return Err(SeamError::Unavailable("deferred commit refused".into()));
+                }
+                self.rows.lock().unwrap().push(import);
+                Ok(())
+            }
+        }
+
+        for fail in [false, true] {
+            let (mut store, config, request, true_root) =
+                persist_retry_child_da(Arc::new(PeerDasAvailability::new()));
+            let archive_impl = Arc::new(Record {
+                rows: Mutex::new(Vec::new()),
+                fail,
+            });
+            let archive: crate::ArchiveWriteHandle = archive_impl.clone();
+            let mut registry = Registry::default();
+            let metrics = ChainMetrics::register(&mut registry);
+            let head = HeadSnapshotStore::new();
+            let (event_tx, mut event_rx) = mpsc::channel(8);
+            let counters = ImportCounters::default();
+            let mut residency = Residency::<Minimal>::new(64, 32);
+            let mut snap_seq = 0u64;
+            let mut pending = PendingDa::new();
+
+            let outcome = import_block_with_early(
+                &mut store,
+                &mut residency,
+                &config,
+                &head,
+                &event_tx,
+                &metrics,
+                &counters,
+                &mut snap_seq,
+                request,
+                BlockSignatureStrategy::NoVerification,
+                None,
+                None,
+                None,
+                Some(&mut pending),
+                None,
+                None,
+                Some(&archive),
+            );
+
+            assert!(
+                !is_fully_imported(&store, &true_root),
+                "a DA deferral must not integrate"
+            );
+            assert_eq!(residency.resident_count(), 0);
+            assert_eq!(head.load().sequence, 0);
+
+            if fail {
+                assert!(outcome.is_err(), "refused deferred commit is an Err");
+                assert!(
+                    pending.is_empty(),
+                    "a refused deferred commit must not park"
+                );
+                assert!(event_rx.try_recv().is_err(), "no deferred event");
+                assert!(archive_impl.rows.lock().unwrap().is_empty());
+            } else {
+                let outcome = outcome.expect("deferred import");
+                assert_eq!(
+                    outcome.response.verdict,
+                    ImportBlockVerdict::DeferredDa as i32
+                );
+                assert!(
+                    !outcome.publish_fcu,
+                    "a deferred commit does not move the head"
+                );
+                assert!(pending.contains(&true_root));
+                assert!(event_rx.try_recv().is_ok(), "deferred BLOCK_IMPORTED");
+                let rows = archive_impl.rows.lock().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].da, DaVerdict::Deferred);
+                assert!(rows[0].head.is_none(), "deferral does not move head");
+                assert_eq!(rows[0].block_root, seam_root(true_root));
+            }
+        }
+    }
+
+    /// A successful DataAvailable re-drive commits `da: Available`.
+    /// The handler does not promote the parked row before that import.
+    #[test]
+    fn data_available_redrive_commits_import_as_available() {
+        use crate::da::PendingDa;
+        use crate::residency::Residency;
+        use cc_fork_choice::PeerDasAvailability;
+        use cc_seam::{ArchiveWrite, DaVerdict, DurableImport, SeamError};
+        use std::sync::{Arc, Mutex};
+
+        struct Record {
+            rows: Mutex<Vec<DurableImport>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ArchiveWrite for Record {
+            async fn ingest_columns(&self, _batch: cc_seam::ColumnBatch) -> Result<(), SeamError> {
+                Ok(())
+            }
+
+            fn commit_import_blocking(&self, import: DurableImport) -> Result<(), SeamError> {
+                self.rows.lock().unwrap().push(import);
+                Ok(())
+            }
+        }
+
+        let da = Arc::new(PeerDasAvailability::new());
+        let (mut store, config, request, true_root) = persist_retry_child_da(da.clone());
+        let archive_impl = Arc::new(Record {
+            rows: Mutex::new(Vec::new()),
+        });
+        let archive: crate::ArchiveWriteHandle = archive_impl.clone();
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let head = HeadSnapshotStore::new();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let counters = ImportCounters::default();
+        let mut residency = Residency::<Minimal>::new(64, 32);
+        let mut snap_seq = 0u64;
+        let mut pending = PendingDa::new();
+
+        let parked = import_block_with_early(
+            &mut store,
+            &mut residency,
+            &config,
+            &head,
+            &event_tx,
+            &metrics,
+            &counters,
+            &mut snap_seq,
+            request.clone(),
+            BlockSignatureStrategy::NoVerification,
+            None,
+            None,
+            None,
+            Some(&mut pending),
+            None,
+            None,
+            Some(&archive),
+        )
+        .expect("first attempt parks on DA");
+        assert_eq!(
+            parked.response.verdict,
+            ImportBlockVerdict::DeferredDa as i32
+        );
+        assert!(pending.contains(&true_root));
+        assert_eq!(archive_impl.rows.lock().unwrap()[0].da, DaVerdict::Deferred);
+
+        da.mark_available(true_root);
+        let imported = import_block_with_early(
+            &mut store,
+            &mut residency,
+            &config,
+            &head,
+            &event_tx,
+            &metrics,
+            &counters,
+            &mut snap_seq,
+            request,
+            BlockSignatureStrategy::NoVerification,
+            None,
+            None,
+            None,
+            Some(&mut pending),
+            None,
+            None,
+            Some(&archive),
+        )
+        .expect("re-drive imports");
+        assert_eq!(
+            imported.response.verdict,
+            ImportBlockVerdict::Imported as i32
+        );
+        assert!(imported.publish_fcu);
+        let rows = archive_impl.rows.lock().unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "re-drive commits the body again as Available"
+        );
+        assert_eq!(rows[1].da, DaVerdict::Available);
+        assert_eq!(rows[1].block_root, seam_root(true_root));
+        assert_eq!(head.durable_head(), Some(true_root));
     }
 }

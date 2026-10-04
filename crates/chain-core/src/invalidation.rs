@@ -19,9 +19,14 @@
 //! run the walk, then if [`cc_fork_choice::justified_checkpoint_is_invalid`] call
 //! this handler. Do not call `apply_invalidation` alone for engine INVALID.
 
+use cc_fork_choice::{Store, get_head};
 use cc_types::containers::Checkpoint;
-use cc_types::primitives::Hash256;
+use cc_types::preset::Preset;
+use cc_types::primitives::{Hash256, Root};
+use tonic::Status;
 
+use crate::ArchiveWriteHandle;
+use crate::head::HeadSnapshotStore;
 use crate::metrics::ChainMetrics;
 
 /// Exit hook: production uses [`std::process::exit`]; tests inject a recorder.
@@ -71,6 +76,55 @@ pub fn handle_justified_checkpoint_invalidated(
     metrics.inc_justified_invalidated();
 
     exit(1);
+}
+
+/// Durable `set_head` after engine invalidation moved fork choice.
+///
+/// Returns whether this call wrote the head. A write happens when `get_head`
+/// differs from `previous_head` and this process has not already committed
+/// that root. A failed `set_head` restores the pre-call latch. The
+/// invalidation walk that decides the new head is not this function.
+pub fn commit_engine_invalidation_head<P: Preset>(
+    store: &mut Store<P>,
+    archive: &ArchiveWriteHandle,
+    head_store: &HeadSnapshotStore,
+    previous_head: Root,
+) -> Result<bool, Status> {
+    let latch = store.head_latch();
+    let (head_root, _) = match get_head(store) {
+        Ok(head) => head,
+        Err(e) => {
+            store.restore_head_latch(latch);
+            return Err(Status::internal(format!(
+                "get_head failed after engine invalidation: {e}"
+            )));
+        }
+    };
+    if head_root == previous_head || head_store.durable_head() == Some(head_root) {
+        if head_store.durable_head() != Some(head_root) {
+            store.restore_head_latch(latch);
+        }
+        return Ok(false);
+    }
+    let head_slot = store
+        .blocks()
+        .get(&head_root)
+        .map(|h| h.slot)
+        .unwrap_or_else(|| store.get_current_slot());
+    if let Err(e) = crate::import::commit_set_head(
+        archive,
+        cc_seam::HeadChange {
+            head_root: crate::import::seam_root(head_root),
+            head_slot: head_slot.as_u64(),
+            cause: cc_seam::HeadCause::EngineInvalidation,
+        },
+        crate::import::fork_choice_scalars_ssz(store, head_root, head_slot),
+    ) {
+        store.restore_head_latch(latch);
+        return Err(e);
+    }
+    head_store.set_durable_head(head_root);
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -176,6 +230,100 @@ mod tests {
             *exit_called.lock().unwrap(),
             Some(1),
             "exit hook must be called with code 1"
+        );
+    }
+
+    /// Engine invalidation is a `set_head` trigger, once per real head change.
+    #[test]
+    fn engine_invalidation_sets_head_only_when_head_changes() {
+        use super::commit_engine_invalidation_head;
+        use crate::ArchiveWriteHandle;
+        use cc_fork_choice::{HarnessAvailability, get_forkchoice_store};
+        use cc_seam::{ArchiveWrite, HeadCause, HeadChange, SeamError};
+        use cc_types::preset::Minimal;
+        use cc_types::{BeaconBlock, BeaconState};
+        use std::sync::{Arc, Mutex};
+
+        struct CountHeads {
+            n: Mutex<u32>,
+            last: Mutex<Option<HeadChange>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ArchiveWrite for CountHeads {
+            async fn ingest_columns(&self, _batch: cc_seam::ColumnBatch) -> Result<(), SeamError> {
+                Ok(())
+            }
+
+            fn set_head_blocking(
+                &self,
+                head: HeadChange,
+                _scalars: bytes::Bytes,
+            ) -> Result<(), SeamError> {
+                *self.n.lock().unwrap() += 1;
+                *self.last.lock().unwrap() = Some(head);
+                Ok(())
+            }
+        }
+
+        #[derive(Debug, Default, Clone, Copy)]
+        struct AcceptEngine;
+        impl<P: cc_types::preset::Preset> cc_state_transition::ExecutionEngine<P> for AcceptEngine {
+            fn verify_and_notify_new_payload(
+                &self,
+                _request: cc_state_transition::NewPayloadRequest<'_, P>,
+            ) -> Result<cc_state_transition::PayloadStatus, cc_state_transition::EngineError>
+            {
+                Ok(cc_state_transition::PayloadStatus::Valid)
+            }
+        }
+
+        let mut state = BeaconState::<Minimal>::default();
+        state.set_genesis_time(0);
+        state.set_slot(cc_types::primitives::Slot::new(0));
+        let anchor_block = BeaconBlock {
+            slot: cc_types::primitives::Slot::new(0),
+            proposer_index: cc_types::primitives::ValidatorIndex::new(0),
+            parent_root: Root::ZERO,
+            state_root: Root::ZERO,
+            body: Default::default(),
+        };
+        let mut store = get_forkchoice_store(
+            state,
+            &anchor_block,
+            Arc::new(AcceptEngine),
+            Arc::new(HarnessAvailability),
+            6,
+        )
+        .unwrap();
+        store.resize_votes(1);
+        store.set_justified_balances(vec![32_000_000_000]);
+        let anchor = Root::from_hash256(tree_hash::TreeHash::tree_hash_root(&anchor_block));
+        let (head, _) = get_head(&mut store).unwrap();
+        assert_eq!(head, anchor);
+
+        let recorded = Arc::new(CountHeads {
+            n: Mutex::new(0),
+            last: Mutex::new(None),
+        });
+        let archive: ArchiveWriteHandle = recorded.clone();
+        let head = crate::head::HeadSnapshotStore::new();
+
+        let changed =
+            commit_engine_invalidation_head(&mut store, &archive, &head, Root::ZERO).unwrap();
+        assert!(changed);
+        assert_eq!(*recorded.n.lock().unwrap(), 1);
+        let written = recorded.last.lock().unwrap().clone().unwrap();
+        assert_eq!(written.cause, HeadCause::EngineInvalidation);
+        assert_eq!(written.head_root, *anchor.as_array());
+        assert_eq!(head.durable_head(), Some(anchor));
+
+        let again = commit_engine_invalidation_head(&mut store, &archive, &head, anchor).unwrap();
+        assert!(!again);
+        assert_eq!(
+            *recorded.n.lock().unwrap(),
+            1,
+            "an unchanged head is not a set_head"
         );
     }
 }

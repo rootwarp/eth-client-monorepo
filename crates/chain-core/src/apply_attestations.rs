@@ -45,6 +45,16 @@ use crate::metrics::ChainMetrics;
 /// Maximum attestations accepted in one `ApplyAttestations` batch (Architecture §7.7).
 pub const MAX_APPLY_ATTESTATIONS: usize = 128;
 
+/// Per-item results plus whether the caller may emit import-path fcU.
+///
+/// `publish_fcu` is false only when the trailing recompute or its `set_head`
+/// failed. Vote results are still returned (SEC-1E-2).
+#[derive(Debug)]
+pub struct AttestationApply {
+    pub response: ApplyAttestationsResponse,
+    pub publish_fcu: bool,
+}
+
 /// Apply a batch of free-floating attestations on the core thread.
 ///
 /// Oversized batches return `INVALID_ARGUMENT` **before** any store mutation
@@ -53,11 +63,13 @@ pub const MAX_APPLY_ATTESTATIONS: usize = 128;
 /// # Trailing `get_head` failure (SEC-1E-2)
 ///
 /// Vote trackers are committed before the trailing recompute. If `get_head`
-/// fails after one or more applies, this still returns **`Ok` with per-item
-/// results** so the client learns what was applied. The head snapshot is left
-/// unchanged (may be **stale** relative to the store until the next successful
-/// recompute via import / a later batch). An error is logged; it is not
-/// surfaced as gRPC `INTERNAL` that would drop the results vector.
+/// or the coalesced `set_head` fails after one or more applies, this still
+/// returns **`Ok` with per-item results** so the client learns what was
+/// applied. The head snapshot is left unchanged (may be **stale** relative to
+/// the store until the next successful recompute via import / a later batch).
+/// An error is logged; it is not surfaced as gRPC `INTERNAL` that would drop
+/// the results vector. `publish_fcu` is false in that case.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_attestations<P: Preset>(
     store: &mut Store<P>,
     head_store: &HeadSnapshotStore,
@@ -66,7 +78,8 @@ pub fn apply_attestations<P: Preset>(
     snapshot_sequence: &mut u64,
     request: ApplyAttestationsRequest,
     config: &ChainConfig,
-) -> Result<ApplyAttestationsResponse, Status> {
+    archive: Option<&crate::ArchiveWriteHandle>,
+) -> Result<AttestationApply, Status> {
     let n = request.attestations_ssz.len();
     if n > MAX_APPLY_ATTESTATIONS {
         return Err(Status::invalid_argument(format!(
@@ -98,10 +111,18 @@ pub fn apply_attestations<P: Preset>(
     // Single head recompute after the batch so GetHead (ArcSwap) observes weight
     // through the honest observation point (§6.3). No get_head per attestation.
     // On failure: keep results (SEC-1E-2) — do not discard applied outcomes.
+    let mut publish_fcu = true;
     if any_applied
-        && let Err(e) =
-            recompute_and_publish_head(store, head_store, event_tx, metrics, snapshot_sequence)
+        && let Err(e) = recompute_and_publish_head(
+            store,
+            head_store,
+            event_tx,
+            metrics,
+            snapshot_sequence,
+            archive,
+        )
     {
+        publish_fcu = false;
         tracing::error!(
             error = %e,
             applied = results
@@ -113,7 +134,10 @@ pub fn apply_attestations<P: Preset>(
         );
     }
 
-    Ok(ApplyAttestationsResponse { results })
+    Ok(AttestationApply {
+        response: ApplyAttestationsResponse { results },
+        publish_fcu,
+    })
 }
 
 fn apply_one<P: Preset>(
@@ -133,9 +157,18 @@ fn recompute_and_publish_head<P: Preset>(
     event_tx: &tokio::sync::mpsc::Sender<EventInput>,
     metrics: &ChainMetrics,
     snapshot_sequence: &mut u64,
+    archive: Option<&crate::ArchiveWriteHandle>,
 ) -> Result<(), Status> {
-    let (head_root, reorg) = get_head(store)
-        .map_err(|e| Status::internal(format!("get_head failed after ApplyAttestations: {e}")))?;
+    let latch = store.head_latch();
+    let (head_root, reorg) = match get_head(store) {
+        Ok(head) => head,
+        Err(e) => {
+            store.restore_head_latch(latch);
+            return Err(Status::internal(format!(
+                "get_head failed after ApplyAttestations: {e}"
+            )));
+        }
+    };
     let head_slot = store
         .blocks()
         .get(&head_root)
@@ -146,6 +179,27 @@ fn recompute_and_publish_head<P: Preset>(
         .get(&head_root)
         .map(|h| h.state_root)
         .unwrap_or(Root::ZERO);
+
+    // One `set_head` per batch, only when this head is not the last one
+    // `set_head` or `commit_import.head` committed. The latch alone is not
+    // that ack: `get_head` updates it before the write returns.
+    if let Some(archive) = archive
+        && head_store.durable_head() != Some(head_root)
+    {
+        if let Err(e) = crate::import::commit_set_head(
+            archive,
+            cc_seam::HeadChange {
+                head_root: crate::import::seam_root(head_root),
+                head_slot: head_slot.as_u64(),
+                cause: cc_seam::HeadCause::Attestation,
+            },
+            crate::import::fork_choice_scalars_ssz(store, head_root, head_slot),
+        ) {
+            store.restore_head_latch(latch);
+            return Err(e);
+        }
+        head_store.set_durable_head(head_root);
+    }
 
     *snapshot_sequence = snapshot_sequence.saturating_add(1);
     let optimistic = cc_fork_choice::is_optimistic_node(store);
@@ -222,7 +276,7 @@ mod tests {
     }
 
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use cc_fork_choice::{ExecutionStatus, HarnessAvailability, get_forkchoice_store};
     use cc_types::config::{BlobParameters, BlobSchedule, PresetName};
@@ -341,6 +395,45 @@ mod tests {
         (store, anchor)
     }
 
+    /// Anchor whose justified context has `n` active, non-zero balances.
+    fn weighted_store(n: usize) -> (Store<Minimal>, Root) {
+        let mut state = BeaconState::<Minimal>::default();
+        state.set_genesis_time(0);
+        state.set_slot(Slot::new(0));
+        for _ in 0..n {
+            state
+                .validators_push(cc_types::containers::Validator {
+                    effective_balance: cc_types::primitives::Gwei::new(32_000_000_000),
+                    activation_epoch: Epoch::new(0),
+                    exit_epoch: Epoch::new(u64::MAX),
+                    withdrawable_epoch: Epoch::new(u64::MAX),
+                    ..Default::default()
+                })
+                .unwrap();
+            state
+                .balances_push(cc_types::primitives::Gwei::new(32_000_000_000))
+                .unwrap();
+        }
+        let anchor_block = BeaconBlock {
+            slot: Slot::new(0),
+            proposer_index: ValidatorIndex::new(0),
+            parent_root: Root::ZERO,
+            state_root: Root::ZERO,
+            body: Default::default(),
+        };
+        let mut store = get_forkchoice_store(
+            state,
+            &anchor_block,
+            Arc::new(AcceptEngine),
+            Arc::new(HarnessAvailability),
+            6,
+        )
+        .unwrap();
+        cc_fork_choice::on_tick(&mut store, 12).unwrap();
+        let anchor = Root::from_hash256(TreeHash::tree_hash_root(&anchor_block));
+        (store, anchor)
+    }
+
     fn insert_child(store: &mut Store<Minimal>, parent: Root, child: Root, slot: u64) {
         let justified = store.justified_checkpoint();
         let finalized = store.finalized_checkpoint();
@@ -402,6 +495,7 @@ mod tests {
                 attestations_ssz: batch,
             },
             &test_config(),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
@@ -441,8 +535,10 @@ mod tests {
                 attestations_ssz: vec![valid.as_ssz_bytes(), unknown.as_ssz_bytes()],
             },
             &test_config(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert_eq!(resp.results.len(), 2);
         assert_eq!(
             resp.results[0].verdict,
@@ -487,8 +583,10 @@ mod tests {
                 attestations_ssz: batch,
             },
             &test_config(),
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .response;
         assert_eq!(resp.results.len(), MAX_APPLY_ATTESTATIONS);
         assert!(
             resp.results
@@ -512,5 +610,300 @@ mod tests {
             "compute_deltas ran {delta} times across a 128-att batch (expected 1, \
              <128 even under concurrent test noise) — per-att head path?"
         );
+    }
+
+    /// One `set_head` per batch, and only when the head root actually changes.
+    #[test]
+    fn one_set_head_per_batch_only_on_real_head_change() {
+        use cc_seam::{ArchiveWrite, HeadCause, HeadChange, SeamError};
+        use std::sync::Mutex;
+
+        struct CountHeads {
+            heads: Mutex<Vec<HeadChange>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ArchiveWrite for CountHeads {
+            async fn ingest_columns(&self, _batch: cc_seam::ColumnBatch) -> Result<(), SeamError> {
+                Ok(())
+            }
+
+            fn set_head_blocking(
+                &self,
+                head: HeadChange,
+                _scalars: bytes::Bytes,
+            ) -> Result<(), SeamError> {
+                self.heads.lock().unwrap().push(head);
+                Ok(())
+            }
+        }
+
+        let (mut store, anchor) = weighted_store(8);
+        // Two equal children: zero-weight LMD already walks to one leaf.
+        // Votes for the other leaf are the real head change.
+        let child_a = root(0x55);
+        let child_b = root(0x66);
+        insert_child(&mut store, anchor, child_a, 1);
+        insert_child(&mut store, anchor, child_b, 1);
+        let (before, _) = get_head(&mut store).unwrap();
+        assert!(
+            before == child_a || before == child_b,
+            "head starts on one of the two children, got {before:?}"
+        );
+        let other = if before == child_a { child_b } else { child_a };
+
+        let archive_impl = Arc::new(CountHeads {
+            heads: Mutex::new(Vec::new()),
+        });
+        let archive: crate::ArchiveWriteHandle = archive_impl.clone();
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let head = HeadSnapshotStore::new();
+        let (tx, _rx) = mpsc::channel(4);
+        let mut seq = 0u64;
+        let moving: Vec<Vec<u8>> = (0..MAX_APPLY_ATTESTATIONS)
+            .map(|i| indexed(&[(i % 8) as u64], 1, other, cp(0, anchor)).as_ssz_bytes())
+            .collect();
+        let moved = apply_attestations(
+            &mut store,
+            &head,
+            &tx,
+            &metrics,
+            &mut seq,
+            ApplyAttestationsRequest {
+                attestations_ssz: moving,
+            },
+            &test_config(),
+            Some(&archive),
+        )
+        .unwrap();
+        assert!(moved.publish_fcu);
+        assert!(
+            moved
+                .response
+                .results
+                .iter()
+                .all(|r| r.verdict == AttestationApplyVerdict::Applied as i32)
+        );
+        let (after, _) = get_head(&mut store).unwrap();
+        assert_eq!(after, other, "eight equal votes must move LMD head");
+        let heads = archive_impl.heads.lock().unwrap();
+        assert_eq!(heads.len(), 1, "one set_head for the batch, not per vote");
+        assert_eq!(heads[0].cause, HeadCause::Attestation);
+        assert_eq!(heads[0].head_root, *other.as_array());
+        drop(heads);
+
+        let steady: Vec<Vec<u8>> = (0..8u64)
+            .map(|i| indexed(&[i], 1, other, cp(0, anchor)).as_ssz_bytes())
+            .collect();
+        let _ = apply_attestations(
+            &mut store,
+            &head,
+            &tx,
+            &metrics,
+            &mut seq,
+            ApplyAttestationsRequest {
+                attestations_ssz: steady,
+            },
+            &test_config(),
+            Some(&archive),
+        )
+        .unwrap();
+        assert_eq!(
+            archive_impl.heads.lock().unwrap().len(),
+            1,
+            "a batch that does not move the head must not set_head"
+        );
+    }
+
+    /// A failed `set_head` restores the latch and publishes nothing. The next
+    /// batch, whose fork-choice head did not move again, still writes it once.
+    #[test]
+    fn failed_head_write_is_not_visible_on_the_next_batch() {
+        use cc_seam::{ArchiveWrite, HeadCause, HeadChange, SeamError};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct FailThenHead {
+            fails_left: AtomicU32,
+            heads: Mutex<Vec<HeadChange>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ArchiveWrite for FailThenHead {
+            async fn ingest_columns(&self, _batch: cc_seam::ColumnBatch) -> Result<(), SeamError> {
+                Ok(())
+            }
+
+            fn set_head_blocking(
+                &self,
+                head: HeadChange,
+                _scalars: bytes::Bytes,
+            ) -> Result<(), SeamError> {
+                if self.fails_left.load(Ordering::SeqCst) > 0 {
+                    self.fails_left.fetch_sub(1, Ordering::SeqCst);
+                    return Err(SeamError::Unavailable("head write failed".into()));
+                }
+                self.heads.lock().unwrap().push(head);
+                Ok(())
+            }
+        }
+
+        let (mut store, anchor) = weighted_store(8);
+        let child_a = root(0x55);
+        let child_b = root(0x66);
+        insert_child(&mut store, anchor, child_a, 1);
+        insert_child(&mut store, anchor, child_b, 1);
+        let (before, _) = get_head(&mut store).unwrap();
+        let other = if before == child_a { child_b } else { child_a };
+
+        let archive_impl = Arc::new(FailThenHead {
+            fails_left: AtomicU32::new(1),
+            heads: Mutex::new(Vec::new()),
+        });
+        let archive: crate::ArchiveWriteHandle = archive_impl.clone();
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let head = HeadSnapshotStore::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut seq = 0u64;
+        let moving: Vec<Vec<u8>> = (0..MAX_APPLY_ATTESTATIONS)
+            .map(|i| indexed(&[(i % 8) as u64], 1, other, cp(0, anchor)).as_ssz_bytes())
+            .collect();
+        let failed = apply_attestations(
+            &mut store,
+            &head,
+            &tx,
+            &metrics,
+            &mut seq,
+            ApplyAttestationsRequest {
+                attestations_ssz: moving,
+            },
+            &test_config(),
+            Some(&archive),
+        )
+        .unwrap();
+        assert!(!failed.publish_fcu);
+        assert_eq!(seq, 0);
+        assert_eq!(head.load().sequence, 0);
+        assert_eq!(store.cached_head_root(), Some(before));
+        assert!(head.durable_head().is_none());
+        assert!(archive_impl.heads.lock().unwrap().is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "no HEAD event after a failed set_head"
+        );
+
+        let steady: Vec<Vec<u8>> = (0..8u64)
+            .map(|i| indexed(&[i], 1, other, cp(0, anchor)).as_ssz_bytes())
+            .collect();
+        let recovered = apply_attestations(
+            &mut store,
+            &head,
+            &tx,
+            &metrics,
+            &mut seq,
+            ApplyAttestationsRequest {
+                attestations_ssz: steady,
+            },
+            &test_config(),
+            Some(&archive),
+        )
+        .unwrap();
+        assert!(recovered.publish_fcu);
+        assert_eq!(seq, 1);
+        let heads = archive_impl.heads.lock().unwrap();
+        assert_eq!(heads.len(), 1, "the next batch still set_head once");
+        assert_eq!(heads[0].cause, HeadCause::Attestation);
+        assert_eq!(heads[0].head_root, *other.as_array());
+        drop(heads);
+        assert_eq!(head.durable_head(), Some(other));
+        assert!(
+            rx.try_recv()
+                .is_ok_and(|ev| ev.kind == cc_proto::chain::EventKind::Head),
+            "HEAD follows the durable write"
+        );
+    }
+
+    /// An unchanged fork-choice head is still one `set_head` when this
+    /// process has not committed it. A later unchanged batch does not write.
+    #[test]
+    fn unchanged_head_sets_head_once_until_durable() {
+        use cc_seam::{ArchiveWrite, HeadCause, HeadChange, SeamError};
+
+        struct CountHeads {
+            heads: Mutex<Vec<HeadChange>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ArchiveWrite for CountHeads {
+            async fn ingest_columns(&self, _batch: cc_seam::ColumnBatch) -> Result<(), SeamError> {
+                Ok(())
+            }
+
+            fn set_head_blocking(
+                &self,
+                head: HeadChange,
+                _scalars: bytes::Bytes,
+            ) -> Result<(), SeamError> {
+                self.heads.lock().unwrap().push(head);
+                Ok(())
+            }
+        }
+
+        let (mut store, anchor) = weighted_store(8);
+        let child_a = root(0x55);
+        let child_b = root(0x66);
+        insert_child(&mut store, anchor, child_a, 1);
+        insert_child(&mut store, anchor, child_b, 1);
+        let (before, _) = get_head(&mut store).unwrap();
+        let archive_impl = Arc::new(CountHeads {
+            heads: Mutex::new(Vec::new()),
+        });
+        let archive: crate::ArchiveWriteHandle = archive_impl.clone();
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let head = HeadSnapshotStore::new();
+        let (tx, _rx) = mpsc::channel(4);
+        let mut seq = 0u64;
+        let steady: Vec<Vec<u8>> = (0..8u64)
+            .map(|i| indexed(&[i], 1, before, cp(0, anchor)).as_ssz_bytes())
+            .collect();
+        let first = apply_attestations(
+            &mut store,
+            &head,
+            &tx,
+            &metrics,
+            &mut seq,
+            ApplyAttestationsRequest {
+                attestations_ssz: steady.clone(),
+            },
+            &test_config(),
+            Some(&archive),
+        )
+        .unwrap();
+        assert!(first.publish_fcu);
+        let (after, _) = get_head(&mut store).unwrap();
+        assert_eq!(after, before);
+        let heads = archive_impl.heads.lock().unwrap();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].cause, HeadCause::Attestation);
+        assert_eq!(heads[0].head_root, *before.as_array());
+        drop(heads);
+        assert_eq!(head.durable_head(), Some(before));
+
+        let _ = apply_attestations(
+            &mut store,
+            &head,
+            &tx,
+            &metrics,
+            &mut seq,
+            ApplyAttestationsRequest {
+                attestations_ssz: steady,
+            },
+            &test_config(),
+            Some(&archive),
+        )
+        .unwrap();
+        assert_eq!(archive_impl.heads.lock().unwrap().len(), 1);
     }
 }

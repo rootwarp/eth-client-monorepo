@@ -83,6 +83,18 @@ impl VoteTracker {
     }
 }
 
+/// Fork-choice head latch written by `get_head` before a durable commit returns.
+///
+/// Chain restores this when `commit_import` or `set_head` fails so the next
+/// success does not publish a head this process has not committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadLatch {
+    /// `last_head_root` at capture time.
+    pub last_head_root: Option<Root>,
+    /// Head cache at capture time.
+    pub head_cache: Option<CachedHead>,
+}
+
 /// Head-cache entry served while the store's mutation counter is unchanged (§6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachedHead {
@@ -306,6 +318,26 @@ impl<P: Preset> Store<P> {
     pub fn cached_head_root(&self) -> Option<Root> {
         self.last_head_root
             .or_else(|| self.head_cache.as_ref().map(|c| c.head_root))
+    }
+
+    /// Copy of the head latch `get_head` writes.
+    ///
+    /// Does not bump the mutation counter. Pair with [`Self::restore_head_latch`]
+    /// when a durable head write fails.
+    #[inline]
+    pub fn head_latch(&self) -> HeadLatch {
+        HeadLatch {
+            last_head_root: self.last_head_root,
+            head_cache: self.head_cache,
+        }
+    }
+
+    /// Put the head latch back. Does not bump the mutation counter and does
+    /// not undo proto-array weights or votes.
+    #[inline]
+    pub fn restore_head_latch(&mut self, latch: HeadLatch) {
+        self.last_head_root = latch.last_head_root;
+        self.head_cache = latch.head_cache;
     }
 
     /// Whether `root` was recorded as timely at import (spec `block_timeliness`).

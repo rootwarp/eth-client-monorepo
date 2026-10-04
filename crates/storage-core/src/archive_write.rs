@@ -328,6 +328,32 @@ impl ArchiveWrite for ArchiveWriter {
             .map_err(|e| SeamError::Unavailable(e.to_string()))
     }
 
+    fn import_precondition(&self, parent_root: cc_seam::Root) -> Result<(), SeamError> {
+        // Same predicate `commit_import` already applies. Not the restart
+        // tri-state: an empty store is `STORE_INCOMPLETE`, then a missing
+        // parent on a store that holds a body is `PARENT_NOT_DURABLE`.
+        admit_import_store(&self.engine)?;
+        match block_present(&self.engine, &Root::from_array(parent_root)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(precondition(FailedPreconditionReason::ParentNotDurable)),
+            Err(e) => Err(SeamError::Unavailable(e.to_string())),
+        }
+    }
+
+    fn commit_import_blocking(&self, import: DurableImport) -> Result<(), SeamError> {
+        let unit = bind_durable_import(&self.engine, import)?;
+        self.writer
+            .blocking_submit_p0_committed(unit)
+            .map_err(map_writer_err)
+    }
+
+    fn set_head_blocking(&self, head: HeadChange, scalars: Bytes) -> Result<(), SeamError> {
+        let unit = bind_set_head(&self.engine, head, scalars)?;
+        self.writer
+            .blocking_submit_p0_committed(unit)
+            .map_err(map_writer_err)
+    }
+
     async fn commit_anchor(&self, anchor: TrustedAnchor) -> Result<(), SeamError> {
         if !store_is_uninitialized(&self.engine)
             .map_err(|e| SeamError::Unavailable(e.to_string()))?
@@ -2581,6 +2607,44 @@ mod tests {
                 }
             ),
             "{err}"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn import_precondition_matches_commit_import_refusal_tokens() {
+        let (dir, _engine, archive, shutdown_tx) = block_archive("precondition-empty");
+        let missing = [0x11u8; 32];
+        let err = archive.import_precondition(missing).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreIncomplete,
+                }
+            ),
+            "empty store is STORE_INCOMPLETE, not a new classifier: {err}"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, _engine, archive, shutdown_tx) = block_archive("precondition-parent");
+        let parent = Root::from_array([0x21; 32]);
+        let state = Root::from_array([0x22; 32]);
+        ingest_signed(&archive, 0, &parent, &parent, &state).await;
+        archive
+            .import_precondition(parent.into_array())
+            .expect("durable parent is admitted");
+        let err = archive.import_precondition([0x23; 32]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::ParentNotDurable,
+                }
+            ),
+            "missing parent on a non-empty store is PARENT_NOT_DURABLE: {err}"
         );
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&dir);

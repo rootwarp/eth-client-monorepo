@@ -67,7 +67,8 @@ pub use proto_array::{
     SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY, is_optimistic_candidate_block,
 };
 pub use store::{
-    CachedHead, DEFAULT_CHECKPOINT_CONTEXT_CAPACITY, LatestMessage, Store, StoreError, VoteTracker,
+    CachedHead, DEFAULT_CHECKPOINT_CONTEXT_CAPACITY, HeadLatch, LatestMessage, Store, StoreError,
+    VoteTracker,
 };
 pub use validation::{
     PropagateValidationOutcome, ValidationError, propagate_execution_payload_validation,

@@ -1118,4 +1118,29 @@ mod tests {
         let (head_after, _) = get_head(&mut store).expect("head");
         assert_eq!(head_after, block_root);
     }
+
+    /// `DataAvailable` re-drives the parked body. It does not promote
+    /// `da: Available` before `import_block_with_early`. A successful
+    /// re-drive commits `da: Available` from `finish_imported`.
+    #[test]
+    fn data_available_resubmits_commit_import_as_available() {
+        let core = include_str!("core.rs");
+        let handler = core
+            .split_once("fn handle_data_available")
+            .expect("handler")
+            .1;
+        let handler = handler.split_once("\nfn ").expect("next fn").0;
+        assert!(
+            !handler.contains("commit_data_available"),
+            "DataAvailable must not promote da to Available before the re-drive"
+        );
+        assert!(
+            handler.contains("import_block_with_early"),
+            "DataAvailable re-drives the parked body through import"
+        );
+        assert!(
+            handler.contains("ImportBlockVerdict::Imported"),
+            "only an imported re-drive may drop the pending entry"
+        );
+    }
 }
