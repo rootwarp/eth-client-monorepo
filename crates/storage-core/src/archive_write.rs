@@ -32,13 +32,31 @@ use cc_store::meta::{
 };
 use cc_store::{DaStatus, Root, Slot, SszDecode, SszEncode, get_block_by_root};
 
-use crate::resume::{RestartState, classify};
+use crate::metrics::{StorageClass, StorageMetrics};
+use crate::resume::{RestartState, classify_for_epoch};
 use crate::writer::{
-    CommitUnit, StagedAnchor, StagedBlock, StagedColumn, StagedForkChoiceScalars, WriterError,
-    WriterHandle, block_present, load_write_cursor, store_is_uninitialized,
+    BackgroundChunk, CommitUnit, StagedAnchor, StagedBlock, StagedColumn, StagedForkChoiceScalars,
+    WriterError, WriterHandle, block_present, load_write_cursor, store_is_uninitialized,
 };
 
 pub(crate) use crate::writer::COMMIT_DEADLINE_REASON;
+
+/// Staging slice size for [`ArchiveWrite::commit_snapshot`].
+///
+/// Same 1 MiB as the serve-side state chunk. The final P2 chunk still carries
+/// the full SSZ plus the completion marker; these slices stay off the P0 path.
+const DEFAULT_SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// How many staging keys the final chunk deletes, including leftovers from an
+/// earlier interrupted attempt at the same slot.
+const SNAPSHOT_STAGING_DELETE_SPAN: u32 = 1024;
+
+const SNAPSHOT_STAGING_PREFIX: &[u8] = b"snap_chunk:";
+
+fn detached_metrics() -> StorageMetrics {
+    let mut registry = prometheus_client::registry::Registry::default();
+    StorageMetrics::register(&mut registry)
+}
 
 /// One block from by-range serve: canonical lookup, then that body's SSZ.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +76,18 @@ pub struct ArchiveWriter {
     engine: Arc<Engine>,
     /// Running chain `seconds_per_slot`. The commit deadline is twice this.
     seconds_per_slot: u64,
+    /// Preset epoch length. Epoch-boundary snapshots use this, not a fixed 32.
+    slots_per_epoch: u64,
+    /// `OpenOpts.snapshot_ring`. `0` is stored as 1.
+    snapshot_ring: u64,
+    /// Staging slice size for a P2 snapshot. The final chunk still writes the
+    /// full SSZ with the completion marker.
+    snapshot_chunk_bytes: usize,
+    /// Drop counter for [`WriterHandle::try_submit_p2`].
+    metrics: StorageMetrics,
+    /// Test-only: return after this many staging chunks, before the marker.
+    #[cfg(test)]
+    snapshot_interrupt_after: Option<u32>,
 }
 
 impl ArchiveWriter {
@@ -69,6 +99,12 @@ impl ArchiveWriter {
             // slot length is the stand-in; the deadline is still twice that,
             // not a fixed 24 s. `with_seconds_per_slot` replaces it.
             seconds_per_slot: crate::prune::DEFAULT_SECONDS_PER_SLOT.max(1),
+            slots_per_epoch: crate::resume::default_slots_per_epoch(),
+            snapshot_ring: cc_store::DEFAULT_SNAPSHOT_RING.max(1),
+            snapshot_chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
+            metrics: detached_metrics(),
+            #[cfg(test)]
+            snapshot_interrupt_after: None,
         }
     }
 
@@ -77,6 +113,54 @@ impl ArchiveWriter {
     pub(crate) fn with_seconds_per_slot(mut self, seconds_per_slot: u64) -> Self {
         self.seconds_per_slot = seconds_per_slot.max(1);
         self
+    }
+
+    /// Epoch length from the running chain preset. `0` is not an epoch.
+    #[must_use]
+    pub(crate) fn with_slots_per_epoch(mut self, slots_per_epoch: u64) -> Self {
+        self.slots_per_epoch = slots_per_epoch.max(1);
+        self
+    }
+
+    /// Ring depth. Trim deletes are part of the final snapshot chunk.
+    #[must_use]
+    pub(crate) fn with_snapshot_ring(mut self, snapshot_ring: u64) -> Self {
+        self.snapshot_ring = snapshot_ring.max(1);
+        self
+    }
+
+    /// Staging chunk size. `0` becomes 1 byte so `chunks` cannot panic.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_snapshot_chunk_bytes(mut self, snapshot_chunk_bytes: usize) -> Self {
+        self.snapshot_chunk_bytes = snapshot_chunk_bytes.max(1);
+        self
+    }
+
+    /// Metrics clone shared with the writer so a P2 drop is observable.
+    #[must_use]
+    pub(crate) fn with_metrics(mut self, metrics: StorageMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Stop after `chunks` staging commits and do not write the marker.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_snapshot_interrupt_after(mut self, chunks: u32) -> Self {
+        self.snapshot_interrupt_after = Some(chunks);
+        self
+    }
+
+    #[cfg(test)]
+    fn snapshot_interrupted(&self, staged: u32) -> bool {
+        self.snapshot_interrupt_after
+            .is_some_and(|limit| staged >= limit)
+    }
+
+    #[cfg(not(test))]
+    fn snapshot_interrupted(&self, _staged: u32) -> bool {
+        false
     }
 
     /// Seed a genesis write cursor when the store has none (S2-A-14).
@@ -327,12 +411,12 @@ impl ArchiveWrite for ArchiveWriter {
     }
 
     async fn commit_import(&self, import: DurableImport) -> Result<(), SeamError> {
-        let unit = bind_durable_import(&self.engine, import)?;
+        let unit = bind_durable_import(&self.engine, self.slots_per_epoch, import)?;
         self.submit_commit_import(unit).await
     }
 
     async fn set_head(&self, head: HeadChange, scalars: Bytes) -> Result<(), SeamError> {
-        let unit = bind_set_head(&self.engine, head, scalars)?;
+        let unit = bind_set_head(&self.engine, self.slots_per_epoch, head, scalars)?;
         self.writer
             .submit_p0_committed(unit)
             .await
@@ -348,7 +432,7 @@ impl ArchiveWrite for ArchiveWriter {
         // Same predicate `commit_import` already applies. A store that is not
         // `Complete` is `STORE_INCOMPLETE`, then a missing parent is
         // `PARENT_NOT_DURABLE`.
-        admit_import_store(&self.engine)?;
+        admit_import_store(&self.engine, self.slots_per_epoch)?;
         match block_present(&self.engine, &Root::from_array(parent_root)) {
             Ok(true) => Ok(()),
             Ok(false) => Err(precondition(FailedPreconditionReason::ParentNotDurable)),
@@ -357,14 +441,14 @@ impl ArchiveWrite for ArchiveWriter {
     }
 
     fn commit_import_blocking(&self, import: DurableImport) -> Result<(), SeamError> {
-        let unit = bind_durable_import(&self.engine, import)?;
+        let unit = bind_durable_import(&self.engine, self.slots_per_epoch, import)?;
         self.writer
             .blocking_submit_p0_committed(unit)
             .map_err(map_writer_err)
     }
 
     fn set_head_blocking(&self, head: HeadChange, scalars: Bytes) -> Result<(), SeamError> {
-        let unit = bind_set_head(&self.engine, head, scalars)?;
+        let unit = bind_set_head(&self.engine, self.slots_per_epoch, head, scalars)?;
         self.writer
             .blocking_submit_p0_committed(unit)
             .map_err(map_writer_err)
@@ -383,6 +467,155 @@ impl ArchiveWrite for ArchiveWriter {
             .submit_p0_committed(unit)
             .await
             .map_err(map_writer_err)
+    }
+
+    async fn commit_snapshot(&self, snapshot: cc_seam::Snapshot) -> Result<(), SeamError> {
+        admit_import_store(&self.engine, self.slots_per_epoch)?;
+        let slot = Slot::new(snapshot.slot);
+        let ssz = snapshot.state_ssz.as_ref();
+        cc_store::check_snapshot_len(slot, ssz.len() as u64).map_err(map_store_read_err)?;
+        let epoch_slots = self.slots_per_epoch.max(1);
+        if !snapshot.slot.is_multiple_of(epoch_slots) {
+            return Err(SeamError::InvalidArgument(format!(
+                "snapshot slot {} is not an epoch boundary (slots_per_epoch {epoch_slots})",
+                snapshot.slot
+            )));
+        }
+        let head = durable_head_slot(&self.engine)?;
+        if snapshot.slot > head {
+            return Err(SeamError::InvalidArgument(format!(
+                "snapshot slot {} is ahead of durable head {head}",
+                snapshot.slot
+            )));
+        }
+        if let Some(marker) = completed_marker(&self.engine)? {
+            let completed = marker.slot.as_u64();
+            if snapshot.slot < completed {
+                return Err(SeamError::InvalidArgument(format!(
+                    "snapshot slot {} is behind completed snapshot {completed}",
+                    snapshot.slot
+                )));
+            }
+            if snapshot.slot == completed {
+                let same = marker.state_root == Root::from_array(snapshot.state_root)
+                    && marker.bytes == ssz.len() as u64;
+                if same {
+                    return Ok(());
+                }
+                return Err(SeamError::InvalidArgument(format!(
+                    "snapshot slot {} does not match the completion marker",
+                    snapshot.slot
+                )));
+            }
+        }
+
+        // ADR-R-08: P2 bound 256 drop-newest. The literal is `WRITER_P2_BOUND`.
+        // A dropped chunk is not a durable snapshot. The ring entry becomes
+        // newest only when `SnapshotCompletion` lands in the final chunk.
+        let pieces: Vec<&[u8]> = ssz.chunks(self.snapshot_chunk_bytes.max(1)).collect();
+        let mut staged = 0u32;
+        for (index, piece) in pieces.iter().enumerate() {
+            if self.snapshot_interrupted(staged) {
+                return Err(interrupted_snapshot());
+            }
+            let index = u32::try_from(index).map_err(|_| {
+                SeamError::InvalidArgument("snapshot staging index exceeds u32".into())
+            })?;
+            self.submit_p2_chunk(BackgroundChunk {
+                class: StorageClass::Snapshots,
+                puts: vec![(
+                    TABLE_META.to_owned(),
+                    snapshot_staging_key(snapshot.slot, index),
+                    piece.to_vec(),
+                )],
+                deletes: Vec::new(),
+                done: None,
+            })
+            .await?;
+            staged = staged.saturating_add(1);
+        }
+        if self.snapshot_interrupted(staged) {
+            return Err(interrupted_snapshot());
+        }
+
+        self.submit_completed_snapshot(&snapshot).await
+    }
+
+    async fn realign_head_snapshot(&self, snapshot: cc_seam::Snapshot) -> Result<(), SeamError> {
+        admit_import_store(&self.engine, self.slots_per_epoch)?;
+        let slot = Slot::new(snapshot.slot);
+        let ssz = snapshot.state_ssz.as_ref();
+        cc_store::check_snapshot_len(slot, ssz.len() as u64).map_err(map_store_read_err)?;
+        let Some(marker) = completed_marker(&self.engine)? else {
+            return Ok(());
+        };
+        if marker.slot.as_u64() != snapshot.slot {
+            return Ok(());
+        }
+        let state_root = Root::from_array(snapshot.state_root);
+        if marker.state_root == state_root && marker.bytes == ssz.len() as u64 {
+            return Ok(());
+        }
+        // The head write already made this block canonical. A losing block's
+        // state root does not match that header, so it cannot move the marker.
+        let canonical = canonical_state_root(&self.engine, marker.slot)?;
+        if canonical != Some(state_root) {
+            return Err(SeamError::InvalidArgument(
+                "head snapshot state_root does not match the canonical block at the marker slot"
+                    .into(),
+            ));
+        }
+        self.submit_completed_snapshot(&snapshot).await
+    }
+}
+
+impl ArchiveWriter {
+    /// Final P2 chunk: full SSZ, the one `snap_complete` marker, and ring trim.
+    ///
+    /// The write cursor stays the block root the boundary `commit_import` or
+    /// `set_head` already stored. Putting a cursor sampled here onto P2 would
+    /// let a later P0 commit rewind `seq`.
+    async fn submit_completed_snapshot(
+        &self,
+        snapshot: &cc_seam::Snapshot,
+    ) -> Result<(), SeamError> {
+        let slot = Slot::new(snapshot.slot);
+        let ssz = snapshot.state_ssz.as_ref();
+        let plan = crate::open::StorageRuntime::plan_snapshot_ring(
+            &self.engine,
+            slot,
+            ssz,
+            self.snapshot_ring,
+        )
+        .map_err(map_store_read_err)?;
+        let marker = SnapshotCompletion {
+            slot,
+            state_root: Root::from_array(snapshot.state_root),
+            bytes: ssz.len() as u64,
+        };
+        let mut puts = plan.puts;
+        puts.push((
+            TABLE_META.to_owned(),
+            cc_store::meta::KEY_SNAPSHOT_COMPLETION.as_bytes().to_vec(),
+            marker.as_ssz_bytes(),
+        ));
+        let mut deletes = plan.deletes;
+        for index in 0..SNAPSHOT_STAGING_DELETE_SPAN {
+            deletes.push((
+                TABLE_META.to_owned(),
+                snapshot_staging_key(snapshot.slot, index),
+            ));
+        }
+        self.submit_p2_chunk(BackgroundChunk {
+            class: StorageClass::Snapshots,
+            puts,
+            deletes,
+            done: None,
+        })
+        .await?;
+        crate::open::StorageRuntime::enforce_snapshot_ring_on(&self.engine, self.snapshot_ring)
+            .map_err(|err| SeamError::Unavailable(format!("I-ring: {err}")))?;
+        Ok(())
     }
 }
 
@@ -506,12 +739,29 @@ fn precondition(reason: FailedPreconditionReason) -> SeamError {
 }
 
 /// A committed scalar blob must still decode, or the next admit is `Incomplete`.
-fn require_fork_choice_scalars(bytes: &[u8]) -> Result<(), SeamError> {
-    ForkChoiceScalars::from_ssz_bytes(bytes)
-        .map(|_| ())
-        .map_err(|err| {
-            SeamError::InvalidArgument(format!("ForkChoiceScalars decode failed: {err:?}"))
-        })
+fn decode_fork_choice_scalars(bytes: &[u8]) -> Result<ForkChoiceScalars, SeamError> {
+    ForkChoiceScalars::from_ssz_bytes(bytes).map_err(|err| {
+        SeamError::InvalidArgument(format!("ForkChoiceScalars decode failed: {err:?}"))
+    })
+}
+
+/// The head this commit persists must not open a replay window past one epoch.
+///
+/// An exact window (`head - snap == slots_per_epoch`) stays `Complete`, so the
+/// boundary snapshot and its retry can still be admitted.
+fn refuse_if_head_crosses_window(
+    engine: &Engine,
+    slots_per_epoch: u64,
+    head_slot: u64,
+) -> Result<(), SeamError> {
+    let Some(snap) = completed_slot(engine)? else {
+        return Ok(());
+    };
+    let epoch_slots = slots_per_epoch.max(1);
+    if head_slot > snap && head_slot - snap > epoch_slots {
+        return Err(precondition(FailedPreconditionReason::StoreIncomplete));
+    }
+    Ok(())
 }
 
 fn da_status_of(verdict: DaVerdict) -> DaStatus {
@@ -521,13 +771,99 @@ fn da_status_of(verdict: DaVerdict) -> DaStatus {
     }
 }
 
+fn snapshot_staging_key(slot: u64, index: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SNAPSHOT_STAGING_PREFIX.len() + 12);
+    key.extend_from_slice(SNAPSHOT_STAGING_PREFIX);
+    key.extend_from_slice(&slot.to_be_bytes());
+    key.extend_from_slice(&index.to_be_bytes());
+    key
+}
+
+fn interrupted_snapshot() -> SeamError {
+    SeamError::Unavailable(
+        "snapshot interrupted before the completion marker; a partial ring entry is not newest"
+            .into(),
+    )
+}
+
+fn durable_head_slot(engine: &Engine) -> Result<u64, SeamError> {
+    let rt = engine
+        .read()
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?;
+    let Some(bytes) = rt
+        .get(TABLE_META, cc_store::meta::KEY_FC_SCALARS.as_bytes())
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?
+    else {
+        return Err(SeamError::Unavailable(
+            "fc_scalars missing after Complete admit".into(),
+        ));
+    };
+    ForkChoiceScalars::from_ssz_bytes(&bytes)
+        .map(|scalars| scalars.head_slot.as_u64())
+        .map_err(|err| SeamError::Unavailable(format!("ForkChoiceScalars decode failed: {err:?}")))
+}
+
+fn completed_marker(engine: &Engine) -> Result<Option<SnapshotCompletion>, SeamError> {
+    let rt = engine
+        .read()
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?;
+    cc_store::load_snapshot_completion(&rt).map_err(|e| SeamError::Unavailable(e.to_string()))
+}
+
+fn completed_slot(engine: &Engine) -> Result<Option<u64>, SeamError> {
+    Ok(completed_marker(engine)?.map(|marker| marker.slot.as_u64()))
+}
+
+fn canonical_state_root(engine: &Engine, slot: Slot) -> Result<Option<Root>, SeamError> {
+    let rt = engine
+        .read()
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?;
+    let Some(root) =
+        cc_store::get_canonical(&rt, slot).map_err(|e| SeamError::Unavailable(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let Some(ssz) =
+        get_block_by_root(&rt, &root).map_err(|e| SeamError::Unavailable(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    state_root_at_offset(&ssz)
+        .map(Some)
+        .map_err(|e| SeamError::InvalidArgument(e.to_string()))
+}
+
+impl ArchiveWriter {
+    async fn submit_p2_chunk(&self, mut chunk: BackgroundChunk) -> Result<(), SeamError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        chunk.done = Some(tx);
+        // ADR-R-08 exemption: drop-newest stays the P2 policy. Cite the
+        // existing bound; do not introduce another overflow class.
+        if !self.writer.try_submit_p2(chunk, &self.metrics) {
+            return Err(SeamError::Unavailable(format!(
+                "P2 drop-newest refused a snapshot chunk (ADR-R-08); bound WRITER_P2_BOUND={}; a dropped chunk is not a durable snapshot",
+                crate::writer::WRITER_P2_BOUND
+            )));
+        }
+        rx.await
+            .map_err(|_| {
+                SeamError::Unavailable(
+                    "writer shut down before the snapshot chunk committed".into(),
+                )
+            })?
+            .map_err(map_writer_err)
+    }
+}
+
 /// `commit_import` and `set_head` are legal only on [`RestartState::Complete`].
 ///
 /// `Uninitialized` and `Incomplete` are both
 /// [`FailedPreconditionReason::StoreIncomplete`]. Head durability is a
 /// separate check and is not relaxed here.
-fn admit_import_store(engine: &Engine) -> Result<(), SeamError> {
-    match classify(engine).map_err(|e| SeamError::Unavailable(e.to_string()))? {
+fn admit_import_store(engine: &Engine, slots_per_epoch: u64) -> Result<(), SeamError> {
+    match classify_for_epoch(engine, slots_per_epoch)
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?
+    {
         RestartState::Complete => Ok(()),
         RestartState::Uninitialized | RestartState::Incomplete(_) => {
             Err(precondition(FailedPreconditionReason::StoreIncomplete))
@@ -566,7 +902,11 @@ fn durable_body_slot(engine: &Engine, root: &Root) -> Result<Option<Slot>, SeamE
 /// One `commit_import` unit: body (idempotent if already durable), state root,
 /// `da_status`, scalars, and the cursor. Canonical moves only when `head` names
 /// this body.
-fn bind_durable_import(engine: &Engine, import: DurableImport) -> Result<CommitUnit, SeamError> {
+fn bind_durable_import(
+    engine: &Engine,
+    slots_per_epoch: u64,
+    import: DurableImport,
+) -> Result<CommitUnit, SeamError> {
     let ssz_slot = slot_at_offset(import.ssz.as_ref())
         .map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
     if ssz_slot.as_u64() != import.slot {
@@ -593,7 +933,7 @@ fn bind_durable_import(engine: &Engine, import: DurableImport) -> Result<CommitU
         ));
     }
 
-    admit_import_store(engine)?;
+    admit_import_store(engine, slots_per_epoch)?;
 
     match block_present(engine, &claimed_parent) {
         Ok(true) => {}
@@ -613,7 +953,8 @@ fn bind_durable_import(engine: &Engine, import: DurableImport) -> Result<CommitU
         Some(_) => true,
         None => false,
     };
-    require_fork_choice_scalars(import.scalars.as_ref())?;
+    let persisted_head = decode_fork_choice_scalars(import.scalars.as_ref())?;
+    refuse_if_head_crosses_window(engine, slots_per_epoch, persisted_head.head_slot.as_u64())?;
 
     let claimed_root = Root::from_array(import.block_root);
     let cursor = next_cursor(engine, ssz_slot, claimed_root)?;
@@ -642,10 +983,11 @@ fn bind_durable_import(engine: &Engine, import: DurableImport) -> Result<CommitU
 /// body on a complete store is `HEAD_NOT_DURABLE`.
 fn bind_set_head(
     engine: &Engine,
+    slots_per_epoch: u64,
     head: HeadChange,
     scalars: Bytes,
 ) -> Result<CommitUnit, SeamError> {
-    admit_import_store(engine)?;
+    admit_import_store(engine, slots_per_epoch)?;
     let root = Root::from_array(head.head_root);
     let Some(slot) = durable_body_slot(engine, &root)? else {
         return Err(precondition(FailedPreconditionReason::HeadNotDurable));
@@ -655,7 +997,8 @@ fn bind_set_head(
             "head_slot does not match the durable body".into(),
         ));
     }
-    require_fork_choice_scalars(scalars.as_ref())?;
+    let persisted_head = decode_fork_choice_scalars(scalars.as_ref())?;
+    refuse_if_head_crosses_window(engine, slots_per_epoch, persisted_head.head_slot.as_u64())?;
     let cursor = next_cursor(engine, slot, root)?;
     Ok(CommitUnit {
         blocks: Vec::new(),
@@ -675,9 +1018,10 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
-    use crate::metrics::StorageMetrics;
+    use crate::metrics::{ClassLabels, StorageClass, StorageMetrics, WriterPriority};
+    use crate::open::StorageRuntime;
     use crate::writer::{
-        WriterBounds, WriterFaults, WriterHandle, load_write_cursor, spawn_writer,
+        BackgroundChunk, WriterBounds, WriterFaults, WriterHandle, load_write_cursor, spawn_writer,
         store_is_uninitialized,
     };
     use cc_seam::{Bytes, DaVerdict, FailedPreconditionReason, SeamError, TrustedAnchor};
@@ -706,7 +1050,10 @@ mod tests {
         AnchorInfo, ForkChoiceScalars, KEY_ANCHOR_INFO, KEY_FC_SCALARS, KEY_NODE_ID,
         KEY_SNAPSHOT_COMPLETION, KEY_SPLIT, SnapshotCompletion, TABLE_META, WriteCursor,
     };
-    use cc_store::{SszDecode, completed_snapshot, get_snapshot, load_split};
+    use cc_store::{
+        SszDecode, completed_snapshot, get_snapshot, list_snapshot_slots, load_split,
+        newest_snapshot,
+    };
     use cc_store::{get_block_by_root, put_block};
     use cc_types::{Checkpoint, Epoch};
     use prometheus_client::registry::Registry;
@@ -1130,6 +1477,538 @@ mod tests {
         ArchiveWriter::ensure_write_cursor(&engine).unwrap();
         let archive = ArchiveWriter::new(handle, Arc::clone(&engine));
         (dir, engine, archive, shutdown_tx)
+    }
+
+    fn set_durable_head(engine: &Engine, head: &Root, slot: u64) {
+        let mut batch = engine.batch();
+        batch.put(
+            TABLE_META,
+            KEY_FC_SCALARS.as_bytes(),
+            &scalars_ssz(head, slot),
+        );
+        engine.commit(batch).unwrap();
+    }
+
+    async fn anchor_at_zero(archive: &ArchiveWriter) -> (Root, Root) {
+        let parent = Root::from_array([0x11; 32]);
+        let root = Root::from_array([0x42; 32]);
+        let state = Root::from_array([0xF0; 32]);
+        archive
+            .commit_anchor(trusted_anchor(
+                &root,
+                &parent,
+                &state,
+                0,
+                synth_block(0, &parent, &state),
+                b"anchor-state".to_vec(),
+            ))
+            .await
+            .unwrap();
+        (root, state)
+    }
+
+    fn snap(slot: u64, state: &Root, bytes: &[u8]) -> cc_seam::Snapshot {
+        cc_seam::Snapshot {
+            slot,
+            state_root: state.into_array(),
+            state_ssz: Bytes::from(bytes.to_vec()),
+        }
+    }
+
+    /// Chunked P2 snapshot: the marker and `newest_snapshot` move together,
+    /// and only on the final chunk.
+    #[tokio::test]
+    async fn commit_snapshot_advances_newest_only_with_the_marker() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("snap-chunks");
+        let archive = archive.with_snapshot_chunk_bytes(4).with_snapshot_ring(4);
+        let (root, state) = anchor_at_zero(&archive).await;
+        set_durable_head(&engine, &root, 32);
+        let payload = b"0123456789abcdef";
+        archive
+            .commit_snapshot(snap(32, &state, payload))
+            .await
+            .unwrap();
+
+        let rt = engine.read().unwrap();
+        let (newest_slot, newest_bytes) = newest_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(newest_slot.as_u64(), 32);
+        assert_eq!(newest_bytes, payload);
+        let (marker, completed_bytes) = completed_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(marker.slot.as_u64(), 32);
+        assert_eq!(marker.bytes, payload.len() as u64);
+        assert_eq!(completed_bytes, payload);
+        assert!(
+            rt.get(TABLE_META, &snapshot_staging_key(32, 0))
+                .unwrap()
+                .is_none(),
+            "final chunk deletes staging keys"
+        );
+        drop(rt);
+        StorageRuntime::enforce_snapshot_ring_on(&engine, 4).unwrap();
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chunk that commits before the marker leaves the previous ring entry newest.
+    #[tokio::test]
+    async fn interrupted_snapshot_keeps_the_previous_ring_entry() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("snap-interrupt");
+        let archive = archive
+            .with_snapshot_chunk_bytes(4)
+            .with_snapshot_interrupt_after(1)
+            .with_snapshot_ring(4);
+        let (root, state) = anchor_at_zero(&archive).await;
+        set_durable_head(&engine, &root, 32);
+        let err = archive
+            .commit_snapshot(snap(32, &state, b"0123456789"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeamError::Unavailable(_)),
+            "interrupt is not a durable snapshot: {err}"
+        );
+
+        let rt = engine.read().unwrap();
+        let (newest_slot, _) = newest_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(newest_slot.as_u64(), 0, "partial entry must not be newest");
+        let (marker, _) = completed_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(marker.slot.as_u64(), 0);
+        assert!(get_snapshot(&rt, Slot::new(32)).unwrap().is_none());
+        assert!(
+            rt.get(TABLE_META, &snapshot_staging_key(32, 0))
+                .unwrap()
+                .is_some(),
+            "the staging chunk committed"
+        );
+        drop(rt);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ring trim runs in the final chunk. `I-ring` then accepts depth and rejects empty.
+    #[tokio::test]
+    async fn snapshot_ring_trims_on_commit_and_runtime_enforces_ring() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("snap-ring");
+        let archive = archive.with_snapshot_ring(2).with_snapshot_chunk_bytes(8);
+        let (root, state) = anchor_at_zero(&archive).await;
+        set_durable_head(&engine, &root, 32);
+        archive
+            .commit_snapshot(snap(32, &state, b"epoch-1"))
+            .await
+            .unwrap();
+        set_durable_head(&engine, &root, 64);
+        archive
+            .commit_snapshot(snap(64, &state, b"epoch-2"))
+            .await
+            .unwrap();
+
+        let rt = engine.read().unwrap();
+        let slots = list_snapshot_slots(&rt).unwrap();
+        assert_eq!(
+            slots.iter().map(|s| s.as_u64()).collect::<Vec<_>>(),
+            vec![32, 64],
+            "ring 2 drops the anchor snapshot"
+        );
+        drop(rt);
+        StorageRuntime::enforce_snapshot_ring_on(&engine, 2).unwrap();
+
+        {
+            let mut batch = engine.batch();
+            for slot in [32u64, 64] {
+                batch.delete(
+                    cc_store::TABLE_SNAPSHOTS,
+                    &cc_store::encode_snapshot_key(Slot::new(slot)),
+                );
+            }
+            engine.commit(batch).unwrap();
+        }
+        let err = StorageRuntime::enforce_snapshot_ring_on(&engine, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("ring"),
+            "empty ring is I-ring: {err}"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2 drop-newest does not advance the completion marker (ADR-R-08).
+    #[tokio::test]
+    async fn dropped_p2_chunk_does_not_advance_newest_snapshot() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("snap-drop");
+        let (root, state) = anchor_at_zero(&archive).await;
+        set_durable_head(&engine, &root, 32);
+        let mut done = archive.writer.writer_done();
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), done.changed())
+            .await
+            .expect("writer should stop")
+            .unwrap();
+
+        let metrics = metrics();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_writer(
+            Arc::clone(&engine),
+            metrics.clone(),
+            WriterBounds {
+                p2: 1,
+                ..WriterBounds::default()
+            },
+            WriterFaults {
+                start_paused: true,
+                ..WriterFaults::default()
+            },
+            shutdown_rx,
+            false,
+        );
+        let archive = ArchiveWriter::new(handle, Arc::clone(&engine)).with_metrics(metrics.clone());
+        let queued = archive.writer.try_submit_p2(
+            BackgroundChunk {
+                class: StorageClass::Snapshots,
+                puts: vec![(TABLE_META.to_owned(), b"filler".to_vec(), b"x".to_vec())],
+                deletes: Vec::new(),
+                done: None,
+            },
+            &metrics,
+        );
+        assert!(
+            queued,
+            "bound 1 accepts the filler chunk while the writer is paused"
+        );
+        let before = metrics
+            .writer_chunk_dropped
+            .get_or_create(&ClassLabels {
+                class: WriterPriority::P2.as_str().to_owned(),
+            })
+            .get();
+        let err = archive
+            .commit_snapshot(snap(32, &state, b"dropped"))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, SeamError::Unavailable(_)),
+            "drop-newest is unavailable, not backpressure: {msg}"
+        );
+        assert!(
+            msg.contains("ADR-R-08") && msg.contains("drop-newest"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&crate::writer::WRITER_P2_BOUND.to_string()),
+            "the error cites the existing bound: {msg}"
+        );
+        let after = metrics
+            .writer_chunk_dropped
+            .get_or_create(&ClassLabels {
+                class: WriterPriority::P2.as_str().to_owned(),
+            })
+            .get();
+        assert!(after > before, "drop metric is class p2");
+        let rt = engine.read().unwrap();
+        let (marker, _) = completed_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(marker.slot.as_u64(), 0);
+        let (newest, _) = newest_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(newest.as_u64(), 0);
+        drop(rt);
+
+        archive.writer.unpause_loop();
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn commit_snapshot_refuses_a_non_boundary_and_an_incomplete_store() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("snap-refuse");
+        let err = archive
+            .commit_snapshot(snap(32, &Root::ZERO, b"no-anchor"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreIncomplete,
+                }
+            ),
+            "{err}"
+        );
+
+        let (root, state) = anchor_at_zero(&archive).await;
+        set_durable_head(&engine, &root, 31);
+        let err = archive
+            .commit_snapshot(snap(31, &state, b"mid-epoch"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeamError::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains("epoch boundary"), "{err}");
+
+        set_durable_head(&engine, &root, 0);
+        let err = archive
+            .commit_snapshot(snap(32, &state, b"ahead"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeamError::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains("ahead of durable head"), "{err}");
+
+        let rt = engine.read().unwrap();
+        let (marker, _) = completed_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(marker.slot.as_u64(), 0);
+        drop(rt);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same slot is idempotent only when the state root and length match.
+    #[tokio::test]
+    async fn same_slot_snapshot_state_root_is_refused() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("snap-same-slot");
+        let (block, state) = anchor_at_zero(&archive).await;
+        set_durable_head(&engine, &block, 32);
+        archive
+            .commit_snapshot(snap(32, &state, b"winner"))
+            .await
+            .unwrap();
+
+        let other = Root::from_array([0xAB; 32]);
+        let err = archive
+            .commit_snapshot(snap(32, &other, b"loser!!"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeamError::InvalidArgument(_)),
+            "a different state_root at the marker slot is refused: {err}"
+        );
+
+        let err = archive
+            .commit_snapshot(snap(32, &state, b"winner!"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeamError::InvalidArgument(_)),
+            "a different length at the marker slot is refused: {err}"
+        );
+
+        archive
+            .commit_snapshot(snap(32, &state, b"winner"))
+            .await
+            .expect("matching root and length is idempotent");
+
+        let rt = engine.read().unwrap();
+        let (marker, bytes) = completed_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(marker.state_root, state);
+        assert_eq!(bytes, b"winner");
+        drop(rt);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The next head past one epoch is refused while the exact window stays open.
+    #[tokio::test]
+    async fn import_past_snapshot_window_is_refused() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("snap-window");
+        let (anchor, state) = anchor_at_zero(&archive).await;
+        let root32 = Root::from_array([0x32; 32]);
+        archive
+            .commit_import(durable_import(
+                32,
+                &anchor,
+                &root32,
+                &state,
+                DaVerdict::Available,
+                &scalars_ssz(&root32, 32),
+                true,
+            ))
+            .await
+            .expect("exact one-epoch head stays Complete");
+
+        let root33 = Root::from_array([0x33; 32]);
+        let err = archive
+            .commit_import(durable_import(
+                33,
+                &anchor,
+                &root33,
+                &state,
+                DaVerdict::Available,
+                &scalars_ssz(&root33, 33),
+                true,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreIncomplete,
+                }
+            ),
+            "post-commit head past one epoch is refused: {err}"
+        );
+        assert!(!archive.block_is_durable(root33.into_array()).unwrap());
+
+        archive
+            .commit_import(durable_import(
+                33,
+                &anchor,
+                &root33,
+                &state,
+                DaVerdict::Available,
+                &scalars_ssz(&root32, 32),
+                false,
+            ))
+            .await
+            .expect("a body that does not advance the head stays inside the window");
+        let err = archive
+            .set_head(
+                HeadChange {
+                    head_root: root33.into_array(),
+                    head_slot: 33,
+                    cause: HeadCause::Import,
+                },
+                Bytes::from(scalars_ssz(&root33, 33)),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreIncomplete,
+                }
+            ),
+            "set_head past one epoch is refused: {err}"
+        );
+
+        archive
+            .commit_snapshot(snap(32, &state, b"boundary"))
+            .await
+            .expect("the boundary snapshot is still admitted at exactly one epoch");
+        let rt = engine.read().unwrap();
+        let (marker, _) = completed_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(marker.slot.as_u64(), 32);
+        drop(rt);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The snapshot chunk must not replace the block root on the write cursor.
+    #[tokio::test]
+    async fn snapshot_cursor_root_stays_the_block_root() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("snap-cursor");
+        let (block, _state) = anchor_at_zero(&archive).await;
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(before.root, block);
+        set_durable_head(&engine, &block, 32);
+        let state_root = Root::from_array([0xAB; 32]);
+        archive
+            .commit_snapshot(snap(32, &state_root, b"state-bytes"))
+            .await
+            .unwrap();
+        let after = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(
+            after.root, block,
+            "durable cursor root stays the block root from the boundary commit"
+        );
+        assert_ne!(after.root, state_root);
+        assert_eq!(
+            after.seq, before.seq,
+            "a snapshot must not publish a cursor sampled outside the writer onto P2"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `set_head` at the marker slot moves the marker onto that block's state.
+    #[tokio::test]
+    async fn set_head_realigns_snapshot_at_the_marker_slot() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("snap-realign");
+        let (anchor, state_a) = anchor_at_zero(&archive).await;
+        let root_a = Root::from_array([0x32; 32]);
+        archive
+            .commit_import(durable_import(
+                32,
+                &anchor,
+                &root_a,
+                &state_a,
+                DaVerdict::Available,
+                &scalars_ssz(&root_a, 32),
+                true,
+            ))
+            .await
+            .unwrap();
+        archive
+            .commit_snapshot(snap(32, &state_a, b"winner"))
+            .await
+            .unwrap();
+
+        let state_b = Root::from_array([0xB2; 32]);
+        let root_b = Root::from_array([0x33; 32]);
+        archive
+            .commit_import(durable_import(
+                32,
+                &anchor,
+                &root_b,
+                &state_b,
+                DaVerdict::Available,
+                &scalars_ssz(&root_a, 32),
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let err = archive
+            .realign_head_snapshot(snap(32, &state_b, b"replaced"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SeamError::InvalidArgument(_)),
+            "a non-canonical state must not move the marker: {err}"
+        );
+        {
+            let rt = engine.read().unwrap();
+            let (marker, bytes) = completed_snapshot(&rt).unwrap().unwrap();
+            assert_eq!(marker.state_root, state_a);
+            assert_eq!(bytes, b"winner");
+        }
+
+        archive
+            .set_head(
+                HeadChange {
+                    head_root: root_b.into_array(),
+                    head_slot: 32,
+                    cause: HeadCause::Import,
+                },
+                Bytes::from(scalars_ssz(&root_b, 32)),
+            )
+            .await
+            .unwrap();
+        let cursor_after_head = load_write_cursor(&engine).unwrap().unwrap();
+        archive
+            .realign_head_snapshot(snap(32, &state_b, b"replaced"))
+            .await
+            .unwrap();
+
+        let rt = engine.read().unwrap();
+        let (marker, bytes) = completed_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(marker.slot.as_u64(), 32);
+        assert_eq!(marker.state_root, state_b);
+        assert_eq!(bytes, b"replaced");
+        let (newest, newest_bytes) = newest_snapshot(&rt).unwrap().unwrap();
+        assert_eq!(newest.as_u64(), 32);
+        assert_eq!(newest_bytes, b"replaced");
+        drop(rt);
+        let cursor = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(cursor.root, root_b);
+        assert_eq!(cursor.seq, cursor_after_head.seq);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

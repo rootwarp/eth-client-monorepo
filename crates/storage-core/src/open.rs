@@ -120,6 +120,10 @@ pub struct OpenedStore {
     /// When a chain is supplied the commit deadline is `2 * seconds_per_slot`.
     /// Do not hardcode the slot length: Hoodi and mainnet happen to be 12.
     seconds_per_slot: u64,
+    /// Preset epoch length from [`OpenOpts::chain`], else mainnet 32.
+    ///
+    /// Not written to the store. A populated store is not re-stamped.
+    slots_per_epoch: u64,
 }
 
 impl fmt::Debug for OpenedStore {
@@ -135,6 +139,7 @@ impl fmt::Debug for OpenedStore {
             .field("identity_digest", &self.identity_digest)
             .field("schedule_digest", &self.schedule_digest)
             .field("seconds_per_slot", &self.seconds_per_slot)
+            .field("slots_per_epoch", &self.slots_per_epoch)
             .finish()
     }
 }
@@ -247,6 +252,7 @@ struct PendingInner {
     identity_digest: Option<Root>,
     schedule_digest: Option<Root>,
     seconds_per_slot: u64,
+    slots_per_epoch: u64,
 }
 
 impl fmt::Debug for PendingStore {
@@ -300,6 +306,7 @@ impl PendingStore {
             identity_digest: inner.identity_digest,
             schedule_digest: inner.schedule_digest,
             seconds_per_slot: inner.seconds_per_slot,
+            slots_per_epoch: inner.slots_per_epoch,
         };
         if let Some(id) = expected.legacy_root() {
             opened.persist_anchor_node_id(id)?;
@@ -466,6 +473,37 @@ impl StorageRuntime {
             .flush_split(new_split)
             .await
             .map_err(|e| anyhow::anyhow!("flush before split: {e}"))
+    }
+
+    /// `I-ring` after a snapshot commit: non-empty when `Split` exists, and
+    /// depth at most `storage.snapshot_ring`.
+    ///
+    /// Trim deletes ride the snapshot's final chunk. This check is what the
+    /// commit runs once that chunk has committed. A newest snapshot above
+    /// `Split.slot` is allowed; depth and an empty ring are not.
+    pub fn enforce_snapshot_ring(&self) -> Result<(), cc_store::StoreError> {
+        Self::enforce_snapshot_ring_on(&self.engine, self.durable_ctx.snapshot_ring)
+    }
+
+    pub(crate) fn enforce_snapshot_ring_on(
+        engine: &Engine,
+        ring: u64,
+    ) -> Result<(), cc_store::StoreError> {
+        cc_store::check_snapshot_ring(engine, ring)
+    }
+
+    /// Puts and oldest-first deletes that keep `|snapshots| ≤ ring`.
+    ///
+    /// The final snapshot chunk commits this plan in the same transaction as
+    /// the completion marker. [`Self::enforce_snapshot_ring`] then checks it.
+    pub(crate) fn plan_snapshot_ring(
+        engine: &Engine,
+        slot: Slot,
+        ssz: &[u8],
+        ring: u64,
+    ) -> Result<cc_store::SnapshotPlan, cc_store::StoreError> {
+        let rt = engine.read()?;
+        cc_store::plan_snapshot_put(&rt, slot, ssz, ring)
     }
 }
 
@@ -678,6 +716,11 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Pendin
         .as_ref()
         .map(|chain| chain.seconds_per_slot.max(1))
         .unwrap_or(crate::prune::DEFAULT_SECONDS_PER_SLOT.max(1));
+    let slots_per_epoch = opts
+        .chain
+        .as_ref()
+        .map(resume::slots_per_epoch_of)
+        .unwrap_or_else(resume::default_slots_per_epoch);
     Ok(PendingStore {
         paired: false,
         inner: Some(PendingInner {
@@ -687,6 +730,7 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Pendin
             identity_digest,
             schedule_digest,
             seconds_per_slot,
+            slots_per_epoch,
         }),
     })
 }
@@ -762,7 +806,9 @@ fn load_durable_seed_sync(
     ctx: &DurableSetContext,
     chain: &ChainConfig,
 ) -> anyhow::Result<Option<DurableSet>> {
-    match resume::classify(engine).map_err(|e| anyhow::anyhow!("{e}"))? {
+    match resume::classify_for_epoch(engine, resume::slots_per_epoch_of(chain))
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
         resume::RestartState::Uninitialized => return Ok(None),
         resume::RestartState::Incomplete(assessment) => {
             let detail = match assessment {
@@ -806,12 +852,14 @@ fn start_writer_with_faults(
     faults: WriterFaults,
 ) -> StorageRuntime {
     let seconds_per_slot = db.seconds_per_slot;
+    let slots_per_epoch = db.slots_per_epoch;
     let durable_ctx = durable_ctx_from_opened(&db);
     start_writer_on_engine(
         Arc::new(db.into_engine()),
         metrics,
         process_fatal,
         seconds_per_slot,
+        slots_per_epoch,
         durable_ctx,
         faults,
     )
@@ -828,6 +876,7 @@ pub fn start_writer_from_store(
         metrics,
         process_fatal,
         crate::prune::DEFAULT_SECONDS_PER_SLOT.max(1),
+        resume::default_slots_per_epoch(),
         DurableSetContext::new(),
         WriterFaults::default(),
     )
@@ -838,6 +887,7 @@ fn start_writer_on_engine(
     metrics: StorageMetrics,
     process_fatal: bool,
     seconds_per_slot: u64,
+    slots_per_epoch: u64,
     durable_ctx: DurableSetContext,
     faults: WriterFaults,
 ) -> StorageRuntime {
@@ -847,14 +897,17 @@ fn start_writer_on_engine(
     }
     let writer = spawn_writer(
         Arc::clone(&engine),
-        metrics,
+        metrics.clone(),
         WriterBounds::default(),
         faults,
         shutdown_rx,
         process_fatal,
     );
     let archive = ArchiveWriter::new(writer.clone(), Arc::clone(&engine))
-        .with_seconds_per_slot(seconds_per_slot);
+        .with_seconds_per_slot(seconds_per_slot)
+        .with_slots_per_epoch(slots_per_epoch)
+        .with_snapshot_ring(durable_ctx.snapshot_ring)
+        .with_metrics(metrics);
     StorageRuntime {
         engine,
         writer,
@@ -989,6 +1042,10 @@ mod tests {
         opts.chain = Some(chain);
         let opened = open(&dir, opts).unwrap();
         assert_eq!(opened.seconds_per_slot, 6);
+        assert_eq!(
+            opened.slots_per_epoch,
+            crate::resume::default_slots_per_epoch()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

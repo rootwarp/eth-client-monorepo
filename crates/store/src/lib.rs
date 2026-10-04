@@ -82,7 +82,7 @@ pub use engine::{
 pub use invariants::{
     CountingSink, DEFAULT_MAX_OPEN_SCAN_ROWS, DEFAULT_SNAPSHOT_RING, FanoutSink,
     InvariantCheckMode, InvariantContext, InvariantSink, InvariantViolation, MAX_CONTIG_WALK_SLOTS,
-    MAX_RING_SCAN_ROWS, StoreInvariant, TracingSink, check_invariants,
+    MAX_RING_SCAN_ROWS, StoreInvariant, TracingSink, check_invariants, check_snapshot_ring,
     run_invariant_checks_if_enabled,
 };
 pub use keys::{BlockRegion, shard_of, slots_in};

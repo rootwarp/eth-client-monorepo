@@ -119,6 +119,7 @@ pub fn commit_engine_invalidation_head<P: Preset>(
             cause: cc_seam::HeadCause::EngineInvalidation,
         },
         crate::import::fork_choice_scalars_ssz(store, head_root, head_slot),
+        crate::import::resident_epoch_snapshot::<P>(store, head_root, head_slot),
     ) {
         store.restore_head_latch(latch);
         return Err(e);

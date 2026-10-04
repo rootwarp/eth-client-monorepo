@@ -99,7 +99,11 @@ pub enum StoreInvariant {
     ColBlock,
     /// Migration half-applied: `blocks_hot` row at or below `Split.slot`, or split past finality.
     SplitFin,
-    /// Empty snapshot ring, over-depth ring, or newest snapshot above the split.
+    /// Empty snapshot ring while `Split` exists, or ring depth above config.
+    ///
+    /// A newest snapshot above `Split.slot` is not a violation: epoch snapshots
+    /// sit on the hot side of the anchor split, and moving that split is the
+    /// deferred migrate op.
     Ring,
     /// Advertisement below oldest stored block or below `PruneMarks.blocks_up_to`.
     Window,
@@ -780,7 +784,11 @@ fn check_split_fin(
     Ok(None)
 }
 
-/// `I-ring`: non-empty when Split exists; `|snapshots| ≤ ring`; newest ≤ Split.slot.
+/// `I-ring`: non-empty when Split exists, and `|snapshots| ≤ ring`.
+///
+/// Newest slot may be above `Split.slot`. Epoch-boundary snapshots are hot
+/// relative to the anchor split; requiring `newest ≤ Split.slot` would make
+/// the next open fatal before migrate exists.
 ///
 /// Scans at most `min(MAX_RING_SCAN_ROWS, remaining check budget)` rows;
 /// beyond either → [`StoreError::Limit`].
@@ -817,11 +825,8 @@ fn check_ring(
         Err(e) => return Err(e),
     };
     let mut count: u64 = 0;
-    let mut newest = 0u64;
     for (k, _) in rows {
-        if let Some(slot) = decode_snapshot_key(&k) {
-            let s = slot.as_u64();
-            newest = newest.max(s);
+        if decode_snapshot_key(&k).is_some() {
             count = count.saturating_add(1);
             // Over-depth is an I-ring violation; stop as soon as depth exceeds config
             // so we never scan a multi-million-row corrupt table (SEC-4H-1 medium).
@@ -844,16 +849,22 @@ fn check_ring(
             ),
         }));
     }
-    if newest > split.slot.as_u64() {
-        return Ok(Some(InvariantViolation {
-            invariant: StoreInvariant::Ring,
-            detail: format!(
-                "newest snapshot slot {newest} > Split.slot {}",
-                split.slot.as_u64()
-            ),
-        }));
-    }
     Ok(None)
+}
+
+/// `I-ring` only: depth and non-empty when `Split` exists.
+///
+/// `ring == 0` is treated as 1. Does not run the other seven invariants.
+pub fn check_snapshot_ring(engine: &Engine, ring: u64) -> Result<(), StoreError> {
+    let rt = engine.read()?;
+    let mut budget = ScanBudget::new(DEFAULT_MAX_OPEN_SCAN_ROWS);
+    if let Some(violation) = check_ring(&rt, ring.max(1), &mut budget)? {
+        return Err(StoreError::InvariantViolation {
+            invariant: violation.invariant.as_str(),
+            detail: violation.detail,
+        });
+    }
+    Ok(())
 }
 
 /// `I-window`: `earliest_available_slot ≥ oldest_block_slot` and `≥ PruneMarks.blocks_up_to`.
@@ -1507,6 +1518,45 @@ mod tests {
         let key = encode_hot_block_key(Slot::new(5), &root(0x55));
         f.put_row("blocks_hot", &key, b"stale-hot");
         f.assert_only(StoreInvariant::SplitFin);
+    }
+
+    /// A snapshot above `Split.slot` is hot state, not an `I-ring` failure.
+    #[test]
+    fn snapshot_above_split_is_not_ring() {
+        let f = Fixture::new("ring-above-split");
+        f.put_row(
+            "snapshots",
+            &encode_cold_block_key(Slot::new(40)),
+            b"hot-state",
+        );
+        let n = check_invariants(f.engine(), InvariantCheckMode::Open, &f.ctx(), None).unwrap();
+        assert_eq!(n, 0);
+        check_snapshot_ring(f.engine(), DEFAULT_SNAPSHOT_RING).unwrap();
+    }
+
+    /// Depth above `storage.snapshot_ring` is still `I-ring`.
+    #[test]
+    fn ring_depth_above_config_is_ring() {
+        let f = Fixture::new("ring-depth");
+        for slot in [40u64, 41, 42, 43] {
+            f.put_row(
+                "snapshots",
+                &encode_cold_block_key(Slot::new(slot)),
+                b"extra-state",
+            );
+        }
+        f.assert_only(StoreInvariant::Ring);
+        let err = check_snapshot_ring(f.engine(), DEFAULT_SNAPSHOT_RING).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::InvariantViolation {
+                    invariant: "ring",
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     /// Negative construction: empty snapshot ring while Split is present (I-ring).

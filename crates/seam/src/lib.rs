@@ -531,6 +531,25 @@ pub trait ArchiveWrite: Send + Sync + 'static {
         let _ = snapshot;
         Ok(())
     }
+
+    /// Move the one completion marker when a head write selects a different
+    /// block at that marker's slot.
+    ///
+    /// [`Self::commit_snapshot`] at an existing marker slot is idempotent only
+    /// when `state_root` and the byte length match. Every other same-slot
+    /// payload is refused. This call is the head-write exception: storage
+    /// replaces that same marker when the canonical block at `snapshot.slot`
+    /// carries `state_root`. A different slot does not write here.
+    /// The default writes nothing.
+    async fn realign_head_snapshot(&self, snapshot: Snapshot) -> Result<(), SeamError> {
+        let _ = snapshot;
+        Ok(())
+    }
+
+    /// [`Self::realign_head_snapshot`] for the core OS thread.
+    fn realign_head_snapshot_blocking(&self, snapshot: Snapshot) -> Result<(), SeamError> {
+        futures::executor::block_on(self.realign_head_snapshot(snapshot))
+    }
 }
 
 #[cfg(test)]

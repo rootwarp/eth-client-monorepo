@@ -960,10 +960,95 @@ pub(crate) fn commit_set_head(
     archive: &ArchiveWriteHandle,
     head: cc_seam::HeadChange,
     scalars: Bytes,
+    snapshot: Option<cc_seam::Snapshot>,
 ) -> Result<(), Status> {
     archive
         .set_head_blocking(head, scalars)
-        .map_err(map_archive_err)
+        .map_err(map_archive_err)?;
+    if let Some(snapshot) = snapshot {
+        persist_boundary_snapshot(
+            archive,
+            snapshot.slot,
+            snapshot.state_root,
+            Some(snapshot.state_ssz),
+        )?;
+    }
+    Ok(())
+}
+
+/// Resident post-state of a head that sits on an epoch boundary.
+///
+/// `None` when the slot is not a boundary or the post-state is not resident.
+/// A missing state does not fail the head write that asked for this snapshot.
+pub(crate) fn resident_epoch_snapshot<P: Preset>(
+    store: &Store<P>,
+    head_root: Root,
+    head_slot: Slot,
+) -> Option<cc_seam::Snapshot> {
+    let slots = P::SLOTS_PER_EPOCH.max(1);
+    if !head_slot.as_u64().is_multiple_of(slots) {
+        return None;
+    }
+    let state_root = store.blocks().get(&head_root)?.state_root;
+    let state = store.block_state(&head_root)?;
+    Some(cc_seam::Snapshot {
+        slot: head_slot.as_u64(),
+        state_root: seam_root(state_root),
+        state_ssz: Bytes::from(state.as_ssz_bytes()),
+    })
+}
+
+/// Realign the one completion marker, then write it if this slot is still behind.
+///
+/// Realign is a no-op when the marker slot differs. A same-slot payload whose
+/// canonical block does not carry `state_root` is refused before the write.
+fn persist_boundary_snapshot(
+    archive: &ArchiveWriteHandle,
+    slot: u64,
+    state_root: cc_seam::Root,
+    state_ssz: Option<Bytes>,
+) -> Result<(), Status> {
+    if let Some(bytes) = state_ssz.clone() {
+        archive
+            .realign_head_snapshot_blocking(cc_seam::Snapshot {
+                slot,
+                state_root,
+                state_ssz: bytes,
+            })
+            .map_err(map_archive_err)?;
+    }
+    maybe_commit_epoch_snapshot(true, Some(archive), slot, state_root, state_ssz)
+}
+
+/// One snapshot per epoch boundary. `false` writes nothing.
+///
+/// The post-state bytes belong to chain-core. Storage sees an opaque
+/// [`cc_seam::Snapshot`] and does not name a state type. A missing post-state
+/// on a boundary is an error: the replay window would otherwise stay open.
+pub(crate) fn maybe_commit_epoch_snapshot(
+    is_epoch_boundary: bool,
+    archive: Option<&ArchiveWriteHandle>,
+    slot: u64,
+    state_root: cc_seam::Root,
+    state_ssz: Option<Bytes>,
+) -> Result<(), Status> {
+    if !is_epoch_boundary {
+        return Ok(());
+    }
+    let Some(archive) = archive else {
+        return Ok(());
+    };
+    let Some(state_ssz) = state_ssz else {
+        return Err(Status::internal(
+            "epoch-boundary import has no post-state to snapshot",
+        ));
+    };
+    futures::executor::block_on(archive.commit_snapshot(cc_seam::Snapshot {
+        slot,
+        state_root,
+        state_ssz,
+    }))
+    .map_err(map_archive_err)
 }
 
 /// DUPLICATE retry: commit a missing body, or `set_head` when the body is
@@ -996,10 +1081,15 @@ fn commit_duplicate_if_missing<P: Preset>(
         .block_is_durable(seam_root(block_root))
         .map_err(map_archive_err)?;
     let fc_is_this = fc_head == block_root;
+    let slot = signed.message.slot.as_u64();
+    let is_epoch_boundary = slot.is_multiple_of(P::SLOTS_PER_EPOCH.max(1));
     let mut wrote_fc_head = false;
+    let mut snapshotted = false;
     if body_durable {
         if fc_is_this && head_store.durable_head() != Some(block_root) {
             let head_slot = signed.message.slot;
+            let snapshot = resident_epoch_snapshot::<P>(store, block_root, head_slot);
+            snapshotted = snapshot.is_some();
             if let Err(e) = commit_set_head(
                 archive,
                 cc_seam::HeadChange {
@@ -1008,6 +1098,7 @@ fn commit_duplicate_if_missing<P: Preset>(
                     cause: cc_seam::HeadCause::Import,
                 },
                 fork_choice_scalars_ssz(store, block_root, head_slot),
+                snapshot,
             ) {
                 store.restore_head_latch(latch);
                 return Err(e);
@@ -1046,6 +1137,23 @@ fn commit_duplicate_if_missing<P: Preset>(
         if fc_is_this {
             head_store.set_durable_head(block_root);
             wrote_fc_head = true;
+        }
+    }
+    // The body can already be the durable head while the completion marker
+    // is still behind (a dropped P2 chunk). Re-issue while the window is
+    // still exactly one epoch. A non-head duplicate does not snapshot.
+    if fc_is_this && is_epoch_boundary && !snapshotted {
+        let state_ssz = store
+            .block_state(&block_root)
+            .map(|state| Bytes::from(state.as_ssz_bytes()));
+        if let Err(e) = persist_boundary_snapshot(
+            archive,
+            slot,
+            seam_root(signed.message.state_root),
+            state_ssz,
+        ) {
+            store.restore_head_latch(latch);
+            return Err(e);
         }
     }
     if !wrote_fc_head && head_store.durable_head() != Some(fc_head) {
@@ -1162,11 +1270,40 @@ fn finish_imported<P: Preset>(
                     cause: cc_seam::HeadCause::Import,
                 },
                 fork_choice_scalars_ssz(store, head_root, head_slot),
+                resident_epoch_snapshot::<P>(store, head_root, head_slot),
             ) {
                 store.restore_head_latch(latch);
                 return Err(e);
             }
             head_store.set_durable_head(head_root);
+        }
+        if is_epoch_boundary && head_root == block_root {
+            let state_root = seam_root(signed.message.state_root);
+            let state_ssz = store
+                .block_state(&block_root)
+                .map(|state| Bytes::from(state.as_ssz_bytes()));
+            if let Some(bytes) = state_ssz.clone()
+                && let Err(status) = archive
+                    .realign_head_snapshot_blocking(cc_seam::Snapshot {
+                        slot,
+                        state_root,
+                        state_ssz: bytes,
+                    })
+                    .map_err(map_archive_err)
+            {
+                store.restore_head_latch(latch);
+                return Err(status);
+            }
+            if let Err(status) = maybe_commit_epoch_snapshot(
+                is_epoch_boundary,
+                Some(archive),
+                slot,
+                state_root,
+                state_ssz,
+            ) {
+                store.restore_head_latch(latch);
+                return Err(status);
+            }
         }
     }
 
@@ -1507,6 +1644,386 @@ mod tests {
         }
     }
 
+    #[test]
+    fn epoch_boundary_drives_one_snapshot() {
+        use std::sync::Mutex;
+
+        struct Rec {
+            snaps: Mutex<Vec<cc_seam::Snapshot>>,
+        }
+
+        #[async_trait::async_trait]
+        impl cc_seam::ArchiveWrite for Rec {
+            async fn ingest_columns(
+                &self,
+                _batch: cc_seam::ColumnBatch,
+            ) -> Result<(), cc_seam::SeamError> {
+                Ok(())
+            }
+
+            async fn commit_snapshot(
+                &self,
+                snapshot: cc_seam::Snapshot,
+            ) -> Result<(), cc_seam::SeamError> {
+                self.snaps.lock().expect("snap lock").push(snapshot);
+                Ok(())
+            }
+        }
+
+        let rec = Arc::new(Rec {
+            snaps: Mutex::new(Vec::new()),
+        });
+        let handle: ArchiveWriteHandle = rec.clone();
+        let root = [7u8; 32];
+        maybe_commit_epoch_snapshot(
+            false,
+            Some(&handle),
+            8,
+            root,
+            Some(Bytes::from(b"state".to_vec())),
+        )
+        .unwrap();
+        assert!(rec.snaps.lock().unwrap().is_empty());
+
+        maybe_commit_epoch_snapshot(
+            true,
+            Some(&handle),
+            8,
+            root,
+            Some(Bytes::from(b"state".to_vec())),
+        )
+        .unwrap();
+        {
+            let snaps = rec.snaps.lock().unwrap();
+            assert_eq!(snaps.len(), 1);
+            assert_eq!(snaps[0].slot, 8);
+            assert_eq!(snaps[0].state_root, root);
+            assert_eq!(snaps[0].state_ssz.as_ref(), b"state");
+        }
+        let missing = maybe_commit_epoch_snapshot(true, Some(&handle), 8, root, None).unwrap_err();
+        assert!(missing.to_string().contains("post-state"), "{missing}");
+
+        let body = include_str!("import.rs")
+            .split("fn finish_imported")
+            .nth(1)
+            .unwrap()
+            .split("mod tests")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("maybe_commit_epoch_snapshot("),
+            "finish_imported must drive the snapshot from the epoch flag"
+        );
+        assert!(
+            body.contains("is_epoch_boundary && head_root == block_root"),
+            "only the selected head at an epoch boundary is snapshotted"
+        );
+    }
+
+    struct SnapRec {
+        snaps: std::sync::Mutex<Vec<cc_seam::Snapshot>>,
+        attempts: std::sync::atomic::AtomicU32,
+        fail_first: u32,
+        durable: std::sync::Mutex<Vec<[u8; 32]>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cc_seam::ArchiveWrite for SnapRec {
+        async fn ingest_columns(
+            &self,
+            _batch: cc_seam::ColumnBatch,
+        ) -> Result<(), cc_seam::SeamError> {
+            Ok(())
+        }
+
+        fn commit_import_blocking(
+            &self,
+            import: cc_seam::DurableImport,
+        ) -> Result<(), cc_seam::SeamError> {
+            self.durable.lock().unwrap().push(import.block_root);
+            Ok(())
+        }
+
+        fn block_is_durable(&self, root: cc_seam::Root) -> Result<bool, cc_seam::SeamError> {
+            Ok(self.durable.lock().unwrap().contains(&root))
+        }
+
+        async fn commit_snapshot(
+            &self,
+            snapshot: cc_seam::Snapshot,
+        ) -> Result<(), cc_seam::SeamError> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_first {
+                return Err(cc_seam::SeamError::Unavailable(
+                    "dropped boundary snapshot".into(),
+                ));
+            }
+            self.snaps.lock().unwrap().push(snapshot);
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_recorded(
+        store: &mut cc_fork_choice::Store<Minimal>,
+        config: &ChainConfig,
+        head: &HeadSnapshotStore,
+        metrics: &ChainMetrics,
+        residency: &mut crate::residency::Residency<Minimal>,
+        snap_seq: &mut u64,
+        request: ImportBlockRequest,
+        archive: &ArchiveWriteHandle,
+    ) -> Result<ImportOutcome, Status> {
+        let (event_tx, _) = mpsc::channel(1);
+        let counters = ImportCounters::default();
+        import_block_with_early(
+            store,
+            residency,
+            config,
+            head,
+            &event_tx,
+            metrics,
+            &counters,
+            snap_seq,
+            request,
+            BlockSignatureStrategy::NoVerification,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(archive),
+        )
+    }
+
+    fn signed_boundary(
+        parent: Root,
+        state_root: Root,
+    ) -> (SignedBeaconBlock<Minimal>, Root, Vec<u8>) {
+        let signed = SignedBeaconBlock {
+            message: BeaconBlock {
+                slot: Slot::new(Minimal::SLOTS_PER_EPOCH),
+                proposer_index: ValidatorIndex::new(0),
+                parent_root: parent,
+                state_root,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        let root = Root::from_hash256(TreeHash::tree_hash_root(&signed.message));
+        let ssz = encode_signed_block(&signed);
+        (signed, root, ssz)
+    }
+
+    fn install_boundary(
+        store: &mut cc_fork_choice::Store<Minimal>,
+        parent: Root,
+        root: Root,
+        state_root: Root,
+        state: BeaconState<Minimal>,
+    ) {
+        store.insert_block(
+            root,
+            BeaconBlockHeader {
+                slot: Slot::new(Minimal::SLOTS_PER_EPOCH),
+                proposer_index: ValidatorIndex::new(0),
+                parent_root: parent,
+                state_root,
+                body_root: Root::ZERO,
+            },
+            state,
+        );
+        let justified = store.justified_checkpoint();
+        let finalized = store.finalized_checkpoint();
+        store
+            .proto_array_mut()
+            .on_block(ProtoNodeBlock {
+                slot: Slot::new(Minimal::SLOTS_PER_EPOCH),
+                root,
+                parent_root: Some(parent),
+                state_root,
+                target_root: root,
+                justified_checkpoint: justified,
+                finalized_checkpoint: finalized,
+                unrealized_justified_checkpoint: justified,
+                unrealized_finalized_checkpoint: finalized,
+                execution_status: ExecutionStatus::Valid,
+                execution_block_hash: Hash256::ZERO,
+            })
+            .unwrap();
+    }
+
+    /// A losing block at the epoch boundary must not replace the head snapshot.
+    #[test]
+    fn non_head_epoch_boundary_block_does_not_replace_the_marker() {
+        let (mut store, config, _request, _child) = persist_retry_child();
+        let anchor = store.finalized_checkpoint().root;
+        assert_eq!(anchor_slot_distance(), Minimal::SLOTS_PER_EPOCH);
+        let head_state_root = Root::from_array([0xA1; 32]);
+        let lose_state_root = Root::from_array([0xB1; 32]);
+        let (head_signed, head_root, head_ssz) = signed_boundary(anchor, head_state_root);
+        let (lose_signed, lose_root, lose_ssz) = signed_boundary(anchor, lose_state_root);
+        install_boundary(
+            &mut store,
+            anchor,
+            head_root,
+            head_state_root,
+            wrap_marker_state(1),
+        );
+        install_boundary(
+            &mut store,
+            anchor,
+            lose_root,
+            lose_state_root,
+            wrap_marker_state(2),
+        );
+        store.set_proposer_boost_root(head_root);
+        assert_eq!(get_head(&mut store).unwrap().0, head_root);
+
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let head_store = HeadSnapshotStore::new();
+        head_store.set_durable_head(head_root);
+        let mut residency = crate::residency::Residency::<Minimal>::new(64, 32);
+        let mut snap_seq = 0u64;
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let recorded = Arc::new(SnapRec {
+            snaps: std::sync::Mutex::new(Vec::new()),
+            attempts: std::sync::atomic::AtomicU32::new(0),
+            fail_first: 0,
+            durable: std::sync::Mutex::new(Vec::new()),
+        });
+        let archive: ArchiveWriteHandle = recorded.clone();
+
+        finish_imported(
+            &mut store,
+            &mut residency,
+            &head_store,
+            &event_tx,
+            &metrics,
+            &mut snap_seq,
+            &lose_signed,
+            &lose_ssz,
+            lose_root,
+            0.0,
+            false,
+            Some(&archive),
+        )
+        .unwrap();
+        assert!(
+            recorded.snaps.lock().unwrap().is_empty(),
+            "a non-head epoch-boundary block must not replace the marker"
+        );
+
+        finish_imported(
+            &mut store,
+            &mut residency,
+            &head_store,
+            &event_tx,
+            &metrics,
+            &mut snap_seq,
+            &head_signed,
+            &head_ssz,
+            head_root,
+            0.0,
+            false,
+            Some(&archive),
+        )
+        .unwrap();
+        let snaps = recorded.snaps.lock().unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].slot, Minimal::SLOTS_PER_EPOCH);
+        assert_eq!(snaps[0].state_root, seam_root(head_state_root));
+        let _ = config;
+    }
+
+    /// A dropped boundary snapshot is retried while the window is still one epoch.
+    #[test]
+    fn dropped_boundary_snapshot_retries_while_the_window_is_one_epoch() {
+        let (mut store, config, _request, _child) = persist_retry_child();
+        let anchor = store.finalized_checkpoint().root;
+        let state_root = Root::from_array([0xA1; 32]);
+        let (signed, block_root, ssz) = signed_boundary(anchor, state_root);
+        install_boundary(
+            &mut store,
+            anchor,
+            block_root,
+            state_root,
+            wrap_marker_state(1),
+        );
+        store.set_proposer_boost_root(block_root);
+        assert_eq!(get_head(&mut store).unwrap().0, block_root);
+        assert_eq!(
+            signed.message.slot.as_u64(),
+            Minimal::SLOTS_PER_EPOCH,
+            "anchor slot 0 to this block is exactly one epoch"
+        );
+        assert!(is_fully_imported(&store, &block_root));
+
+        let mut registry = Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let head = HeadSnapshotStore::new();
+        head.set_durable_head(block_root);
+        let mut residency = crate::residency::Residency::<Minimal>::new(64, 32);
+        let mut snap_seq = 0u64;
+        let recorded = Arc::new(SnapRec {
+            snaps: std::sync::Mutex::new(Vec::new()),
+            attempts: std::sync::atomic::AtomicU32::new(0),
+            fail_first: 1,
+            durable: std::sync::Mutex::new(vec![seam_root(block_root)]),
+        });
+        let archive: ArchiveWriteHandle = recorded.clone();
+        let request = ImportBlockRequest {
+            ssz,
+            fork: 0,
+            root: block_root.as_slice().to_vec(),
+            source: 0,
+        };
+
+        let first = import_recorded(
+            &mut store,
+            &config,
+            &head,
+            &metrics,
+            &mut residency,
+            &mut snap_seq,
+            request.clone(),
+            &archive,
+        );
+        assert!(
+            first.is_err(),
+            "the dropped snapshot fails the duplicate import: {first:?}"
+        );
+        assert_eq!(recorded.attempts.load(Ordering::SeqCst), 1);
+        assert!(recorded.snaps.lock().unwrap().is_empty());
+
+        let second = import_recorded(
+            &mut store,
+            &config,
+            &head,
+            &metrics,
+            &mut residency,
+            &mut snap_seq,
+            request,
+            &archive,
+        )
+        .expect("duplicate path retries the snapshot");
+        assert_eq!(
+            second.response.verdict,
+            ImportBlockVerdict::Duplicate as i32
+        );
+        assert_eq!(recorded.attempts.load(Ordering::SeqCst), 2);
+        let snaps = recorded.snaps.lock().unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].slot, Minimal::SLOTS_PER_EPOCH);
+        assert_eq!(snaps[0].state_root, seam_root(state_root));
+    }
+
+    fn anchor_slot_distance() -> u64 {
+        Minimal::SLOTS_PER_EPOCH
+    }
+
     fn persist_retry_config() -> ChainConfig {
         use cc_types::config::{BlobParameters, BlobSchedule, PresetName};
         use cc_types::primitives::{ExecutionAddress, ForkVersion};
@@ -1626,7 +2143,7 @@ mod tests {
         .unwrap();
         on_tick(&mut store, config.seconds_per_slot.saturating_mul(2)).unwrap();
         let anchor_root = Root::from_hash256(TreeHash::tree_hash_root(&anchor_block));
-        let (request, true_root) = valid_child_request(&store, anchor_root, &config);
+        let (request, true_root) = valid_child_request(&store, anchor_root, &config, 0);
         (store, config, request, true_root)
     }
 
@@ -1634,6 +2151,7 @@ mod tests {
         store: &cc_fork_choice::Store<Minimal>,
         parent_root: Root,
         config: &ChainConfig,
+        block_number_bump: u64,
     ) -> (ImportBlockRequest, Root) {
         use cc_crypto::INFINITY_SIGNATURE;
         use cc_state_transition::{
@@ -1666,7 +2184,7 @@ mod tests {
             parent_hash,
             prev_randao,
             timestamp,
-            block_number: st.latest_execution_payload_header().block_number + 1,
+            block_number: st.latest_execution_payload_header().block_number + 1 + block_number_bump,
             gas_limit: st.latest_execution_payload_header().gas_limit,
             withdrawals: VariableList::new(withdrawals).expect("withdrawals list"),
             ..Default::default()
@@ -2277,7 +2795,7 @@ mod tests {
         assert_eq!(first.response.verdict, ImportBlockVerdict::Imported as i32);
 
         on_tick(&mut store, config.seconds_per_slot.saturating_mul(3)).unwrap();
-        let (req_b, root_b) = valid_child_request(&store, root_a, &config);
+        let (req_b, root_b) = valid_child_request(&store, root_a, &config, 0);
         let second = import_block_with_early(
             &mut store,
             &mut residency,

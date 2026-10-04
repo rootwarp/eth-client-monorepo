@@ -200,6 +200,13 @@ fn apply_durable_seed<P: Preset + 'static>(
         )));
     }
     let anchor_block = signed_anchor.message;
+    let state_root = Root::from_hash256(tree_hash::TreeHash::tree_hash_root(&state));
+    if state_root != anchor_block.state_root {
+        return Err(Status::invalid_argument(format!(
+            "seed state root mismatch: hash_tree_root {state_root} != anchor block state_root {}",
+            anchor_block.state_root
+        )));
+    }
 
     let peer_das = Arc::new(PeerDasAvailability::new());
     let da_for_store: Arc<dyn cc_fork_choice::DataAvailability> = peer_das.clone();
@@ -1070,6 +1077,59 @@ mod tests {
             Ok(_) => panic!("mismatched canonical key must be refused"),
         };
         assert!(err.to_string().contains("anchor root mismatch"), "{err}");
+    }
+
+    /// The state hash is checked on the seed path, before fork choice is built.
+    #[test]
+    fn seed_refuses_state_root_that_does_not_match_the_anchor_block() {
+        let mut snapshot = seed_payload_state();
+        let _ = snapshot.canonical_root();
+        let signed_anchor = SignedBeaconBlock::<Minimal> {
+            message: BeaconBlock {
+                slot: Slot::new(0),
+                proposer_index: ValidatorIndex::new(0),
+                parent_root: Root::ZERO,
+                state_root: Root::from_array([0x11; 32]),
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        let anchor_root = Root::from_hash256(TreeHash::tree_hash_root(&signed_anchor.message));
+        let state_ssz = snapshot.as_ssz_bytes();
+        let anchor_ssz = signed_anchor.as_ssz_bytes();
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = ChainMetrics::register(&mut registry);
+        let config = minimal_config();
+        let err = match apply_durable_seed::<Minimal>(SeedApplyInput {
+            state_ssz: &state_ssz,
+            anchor_block_ssz: Some(&anchor_ssz),
+            anchor_block_fork: 0,
+            anchor_block_root: anchor_root,
+            blocks: &[],
+            fork_choice_scalars_ssz: &[],
+            chain_config: &config,
+            engine: Arc::new(AcceptEngine) as Arc<dyn ExecutionEngine<Minimal>>,
+            expected_head_root: Root::ZERO,
+            expected_head_slot: 0,
+            metrics: &metrics,
+            _preset: PhantomData,
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("mismatched state root must be refused before get_forkchoice_store"),
+        };
+        assert!(err.to_string().contains("state root mismatch"), "{err}");
+        let apply = include_str!("seed.rs")
+            .split("fn apply_durable_seed<")
+            .nth(1)
+            .unwrap()
+            .split("fn apply_durable_seed_blocking")
+            .next()
+            .unwrap();
+        assert_eq!(
+            apply.matches("TransitionContext::new").count(),
+            1,
+            "seed keeps one transition context before the replay loop"
+        );
     }
 
     /// S0-A-28: durable seed from a runtime worker + a real engine object + a

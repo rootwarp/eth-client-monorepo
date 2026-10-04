@@ -109,7 +109,9 @@ pub(crate) fn run_resume_sequence(
 
     // Uninitialized is the checkpoint arm. Incomplete names the item and
     // does not look empty.
-    match classify(engine).map_err(|e| ResumeError::Store(e.to_string()))? {
+    match classify_for_epoch(engine, slots_per_epoch_of(chain))
+        .map_err(|e| ResumeError::Store(e.to_string()))?
+    {
         RestartState::Uninitialized => {
             info!("resume: store empty — no durable seed (4-container chain checkpoint-syncs)");
             observe_phase(metrics, RestartPhase::RestoreSend, Duration::ZERO);
@@ -198,17 +200,49 @@ pub enum RestartState {
     Uninitialized,
     /// Anchor, completed snapshot, scalars, and `da_status` for every body in
     /// `[snap_slot, scalars.head_slot]`, including the anchor slot.
+    /// `head_slot - snap_slot` is at most one epoch.
     Complete,
     /// Anything else. The assessment names the failing [`DurableItem`].
     Incomplete(ItemAssessment),
 }
 
-/// Classify the store for restart.
+/// Slots in one epoch for `chain`'s preset. `0` is not an epoch.
+pub(crate) fn slots_per_epoch_of(chain: &ChainConfig) -> u64 {
+    match chain.preset_base {
+        PresetName::Mainnet => Mainnet::SLOTS_PER_EPOCH,
+        PresetName::Minimal => Minimal::SLOTS_PER_EPOCH,
+    }
+    .max(1)
+}
+
+/// Mainnet epoch length. Used when no chain config was supplied at open.
+#[must_use]
+pub(crate) const fn default_slots_per_epoch() -> u64 {
+    Mainnet::SLOTS_PER_EPOCH
+}
+
+/// Classify the store for restart using the mainnet epoch length.
 ///
 /// `Uninitialized` is [`crate::writer::store_is_uninitialized`]. `Complete`
 /// reads the snapshot completion marker, not a partial ring entry. The
-/// `da_status` walk includes `snap_slot`.
+/// `da_status` walk includes `snap_slot`. A head more than one epoch past
+/// that marker is `Incomplete`.
+///
+/// Resume and admit pass [`classify_for_epoch`] the chain's preset. This
+/// mainnet entry stays for callers that have no chain config.
 pub fn classify(engine: &Engine) -> Result<RestartState, StoreError> {
+    classify_for_epoch(engine, default_slots_per_epoch())
+}
+
+/// [`classify`] with an explicit epoch length.
+///
+/// A window of exactly `slots_per_epoch` stays `Complete`, so the boundary
+/// snapshot can still be admitted. One slot past that is `Incomplete` and
+/// names `latest_snapshot`.
+pub(crate) fn classify_for_epoch(
+    engine: &Engine,
+    slots_per_epoch: u64,
+) -> Result<RestartState, StoreError> {
     if crate::writer::store_is_uninitialized(engine)? {
         return Ok(RestartState::Uninitialized);
     }
@@ -246,6 +280,16 @@ pub fn classify(engine: &Engine) -> Result<RestartState, StoreError> {
                 "durable item `fork_choice`: head_slot {} is below snapshot slot {}",
                 scalars.head_slot.as_u64(),
                 snap_slot.as_u64()
+            ),
+        )));
+    }
+    let window = scalars.head_slot.as_u64() - snap_slot.as_u64();
+    let epoch_slots = slots_per_epoch.max(1);
+    if window > epoch_slots {
+        return Ok(RestartState::Incomplete(named_failure(
+            DurableItem::LatestSnapshot,
+            format!(
+                "durable item `latest_snapshot`: replay window of {window} slots exceeds one epoch ({epoch_slots} slots)"
             ),
         )));
     }
@@ -528,10 +572,7 @@ fn collect_restore_blocks(
 
 /// Replay fork tag: the schedule's fork at `slot`, not a fixed Fulu constant.
 fn fork_tag(chain: &ChainConfig, slot: Slot) -> u32 {
-    let slots_per_epoch = match chain.preset_base {
-        PresetName::Mainnet => Mainnet::SLOTS_PER_EPOCH,
-        PresetName::Minimal => Minimal::SLOTS_PER_EPOCH,
-    };
+    let slots_per_epoch = slots_per_epoch_of(chain);
     chain.fork_name_at_epoch(slot.epoch(slots_per_epoch)) as u32
 }
 
@@ -903,6 +944,136 @@ mod tests {
         engine.commit(batch).unwrap();
         assert_eq!(classify(&engine).unwrap(), RestartState::Complete);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Complete` holds for exactly one epoch of replay and fails once the
+    /// head moves past that window. Mainnet slots/epoch is 32, so snap 0 with
+    /// head 32 stays `Complete` and head 33 does not.
+    #[test]
+    fn complete_fails_when_replay_window_passes_one_epoch() {
+        let (dir, engine) = open_empty_store("replay-window");
+        seed_classified_range(&engine, 0, 33);
+        match classify(&engine).unwrap() {
+            RestartState::Incomplete(failure) => {
+                assert!(
+                    failure.is_named_failure_for(DurableItem::LatestSnapshot),
+                    "window past one epoch names latest_snapshot, got {failure:?}"
+                );
+                let ItemAssessment::NamedFailure { detail, .. } = failure else {
+                    unreachable!("named failure already matched");
+                };
+                assert!(
+                    detail.contains("replay window"),
+                    "detail must name the replay window, got {detail}"
+                );
+            }
+            other => panic!("replay window past one epoch must be Incomplete, got {other:?}"),
+        }
+
+        let (exact_dir, exact) = open_empty_store("replay-window-exact");
+        seed_classified_range(&exact, 0, 32);
+        assert_eq!(
+            classify(&exact).unwrap(),
+            RestartState::Complete,
+            "a window of exactly one epoch stays Complete so the boundary snapshot can land"
+        );
+        let (min_dir, minimal) = open_empty_store("replay-window-minimal");
+        seed_classified_range(&minimal, 0, 9);
+        match classify_for_epoch(&minimal, Minimal::SLOTS_PER_EPOCH).unwrap() {
+            RestartState::Incomplete(failure) => {
+                assert!(
+                    failure.is_named_failure_for(DurableItem::LatestSnapshot),
+                    "minimal epoch is 8 slots, got {failure:?}"
+                );
+            }
+            other => panic!("minimal window of 9 must be Incomplete, got {other:?}"),
+        }
+        assert_eq!(
+            classify(&minimal).unwrap(),
+            RestartState::Complete,
+            "mainnet epoch still covers a 9-slot window"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&exact_dir);
+        let _ = std::fs::remove_dir_all(&min_dir);
+    }
+
+    /// Anchor, matching completion marker, scalars, and `da_status` on every
+    /// body in `[snap, head]`.
+    fn seed_classified_range(engine: &Engine, snap_slot: u64, head_slot: u64) {
+        use cc_store::meta::SnapshotCompletion;
+
+        let snap = Slot::new(snap_slot);
+        let head = Slot::new(head_slot);
+        let anchor_root = Root::from_array([0xA1; 32]);
+        let head_root = if snap_slot == head_slot {
+            anchor_root
+        } else {
+            Root::from_array([0xB2; 32])
+        };
+        let state = b"snap-window";
+        let rt = engine.read().unwrap();
+        let mut batch = engine.batch();
+        put_block(
+            &rt,
+            &mut batch,
+            snap,
+            &anchor_root,
+            &synth_block(snap.as_u64()),
+            BlockRegion::Hot,
+            false,
+        )
+        .unwrap();
+        put_da_status(&rt, &mut batch, &anchor_root, DaStatus::Available, snap).unwrap();
+        if head_slot != snap_slot {
+            put_block(
+                &rt,
+                &mut batch,
+                head,
+                &head_root,
+                &synth_block(head.as_u64()),
+                BlockRegion::Hot,
+                false,
+            )
+            .unwrap();
+            put_da_status(&rt, &mut batch, &head_root, DaStatus::Available, head).unwrap();
+        }
+        batch.put(
+            cc_store::TABLE_SNAPSHOTS,
+            &cc_store::encode_snapshot_key(snap),
+            state,
+        );
+        cc_store::put_snapshot_completion(
+            &mut batch,
+            &SnapshotCompletion {
+                slot: snap,
+                state_root: Root::from_array([0x22; 32]),
+                bytes: state.len() as u64,
+            },
+        );
+        let anchor = AnchorInfo {
+            anchor_slot: snap,
+            anchor_root,
+            anchor_state_root: Root::from_array([0x22; 32]),
+            ..AnchorInfo::default()
+        };
+        batch.put(
+            TABLE_META,
+            KEY_ANCHOR_INFO.as_bytes(),
+            &anchor.as_ssz_bytes(),
+        );
+        let scalars = ForkChoiceScalars {
+            head_root,
+            head_slot: head,
+            ..ForkChoiceScalars::default()
+        };
+        batch.put(
+            TABLE_META,
+            KEY_FC_SCALARS.as_bytes(),
+            &scalars.as_ssz_bytes(),
+        );
+        drop(rt);
+        engine.commit(batch).unwrap();
     }
 
     /// The reverse-index end is exclusive, and `[0xff; 32]` is a real root.
