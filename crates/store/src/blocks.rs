@@ -238,6 +238,34 @@ pub fn put_state_root(
     }
 }
 
+/// Stage `state_roots[slot]` for a body commit.
+///
+/// Absent → insert. Same root → no-op. A different root is replaced only when
+/// `overwrite` is set (this body is the new canonical head). Otherwise the
+/// existing row stays, so a losing sibling neither collides nor rewinds it.
+pub fn stage_state_root(
+    rt: &ReadTxn,
+    batch: &mut Batch,
+    slot: Slot,
+    state_root: &Root,
+    overwrite: bool,
+) -> Result<(), StoreError> {
+    let key = encode_cold_block_key(slot);
+    let val = encode_root_value(state_root);
+    match rt.get(TABLE_STATE_ROOTS, &key)? {
+        Some(existing) if existing.as_slice() == val.as_slice() => Ok(()),
+        Some(_) if overwrite => {
+            batch.put(TABLE_STATE_ROOTS, &key, &val);
+            Ok(())
+        }
+        Some(_) => Ok(()),
+        None => {
+            batch.put(TABLE_STATE_ROOTS, &key, &val);
+            Ok(())
+        }
+    }
+}
+
 fn block_table_and_key(slot: Slot, root: &Root, region: BlockRegion) -> (String, Vec<u8>) {
     match region {
         BlockRegion::Hot => (
@@ -585,6 +613,56 @@ mod tests {
         let stats = measure_class_stats(&eng).unwrap();
         assert_eq!(stats.blocks_rows, 1, "one row after double write");
         assert_eq!(stats.index_rows, 1, "one by-root index row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_state_root_leaves_a_different_root_unless_overwrite() {
+        let (dir, eng) = eng("state-root-stage");
+        let slot = Slot::new(2);
+        let first = root_n(0x11);
+        let second = root_n(0x22);
+        let mut b = eng.batch();
+        {
+            let rt = eng.read().unwrap();
+            stage_state_root(&rt, &mut b, slot, &first, false).unwrap();
+        }
+        eng.commit(b).unwrap();
+
+        let mut b = eng.batch();
+        {
+            let rt = eng.read().unwrap();
+            stage_state_root(&rt, &mut b, slot, &second, false).unwrap();
+        }
+        eng.commit(b).unwrap();
+        assert_eq!(
+            get_state_root(&eng.read().unwrap(), slot).unwrap().unwrap(),
+            first,
+            "a non-head body must not replace the canonical slot root"
+        );
+
+        let mut b = eng.batch();
+        {
+            let rt = eng.read().unwrap();
+            stage_state_root(&rt, &mut b, slot, &second, true).unwrap();
+        }
+        eng.commit(b).unwrap();
+        assert_eq!(
+            get_state_root(&eng.read().unwrap(), slot).unwrap().unwrap(),
+            second
+        );
+
+        let mut b = eng.batch();
+        {
+            let rt = eng.read().unwrap();
+            stage_state_root(&rt, &mut b, slot, &second, true).unwrap();
+        }
+        eng.commit(b).unwrap();
+        assert_eq!(
+            get_state_root(&eng.read().unwrap(), slot).unwrap().unwrap(),
+            second,
+            "same root is a no-op"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

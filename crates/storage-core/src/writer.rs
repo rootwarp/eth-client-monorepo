@@ -30,12 +30,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use cc_store::blocks::{stage_state_root, state_root_at_offset};
 use cc_store::engine::{Engine, ReadTxn};
 use cc_store::keys::BlockRegion;
 use cc_store::meta::{KEY_FC_SCALARS, KEY_WRITE_CURSOR, TABLE_META, WriteCursor};
 use cc_store::{
     DaStatus, PutBlockOutcome, PutColumnOutcome, StoreError, get_block_by_root, put_block,
-    put_block_and_update_head, put_column, put_da_status,
+    put_block_and_update_head, put_column, put_da_status, rewrite_from_head,
 };
 use cc_store::{Root, Slot, SszEncode};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -65,7 +66,8 @@ pub(crate) struct StagedBlock {
     pub ssz: Vec<u8>,
     /// When true, also rewrite `canonical` from this root as head.
     pub update_canonical: bool,
-    /// When true, write `state_roots[slot]`.
+    /// When true, write `state_roots[slot]`. A different existing root is
+    /// replaced only when [`Self::update_canonical`] is set.
     pub write_state_root: bool,
     /// DA status derived from the BLOCK_IMPORTED verdict discriminator.
     pub da_status: Option<DaStatus>,
@@ -107,6 +109,11 @@ pub(crate) struct CommitUnit {
     pub blocks: Vec<StagedBlock>,
     pub columns: Vec<StagedColumn>,
     pub fork_choice: Option<StagedForkChoiceScalars>,
+    /// Rewrite canonical from this already-durable root without inserting a body.
+    ///
+    /// `set_head` sets this. `commit_import` uses [`StagedBlock::update_canonical`]
+    /// instead, because that transaction writes the body.
+    pub canonical_from: Option<Root>,
     /// Cursor value = seq of the **last event included** in this unit (not last received).
     pub cursor: WriteCursor,
     /// Optional reply (tests inject commit-failure / wait for durable).
@@ -123,6 +130,7 @@ impl CommitUnit {
             blocks: Vec::new(),
             columns: Vec::new(),
             fork_choice: None,
+            canonical_from: None,
             cursor,
             done: None,
             anchor: None,
@@ -580,27 +588,34 @@ fn commit_p0(
         };
         // Blocks (+ optional canonical walk).
         for b in &unit.blocks {
-            let put_result = if b.update_canonical {
-                put_block_and_update_head(
-                    &rt,
-                    &mut batch,
-                    b.slot,
-                    &b.root,
-                    &b.ssz,
-                    region,
-                    b.write_state_root,
+            // State root is staged after the body put so an idempotent upgrade
+            // still fills `state_roots`, and a non-head sibling does not collide.
+            // A root already durable in hot or cold is resolved before put_block.
+            // Same bytes skip the put: a cold index must not be rewritten as hot.
+            // Different bytes stay process-fatal and never reach commit.
+            let put_result = match get_block_by_root(&rt, &b.root)? {
+                Some(existing) if existing.as_slice() == b.ssz.as_slice() => {
+                    if b.update_canonical {
+                        let pending = cc_store::blocks::PendingBlocks::new();
+                        rewrite_from_head(&rt, &mut batch, &pending, &b.root)?;
+                    }
+                    Ok(PutBlockOutcome::Idempotent)
+                }
+                Some(_) => {
+                    let table = match cc_store::blocks::slot_by_root(&rt, &b.root)? {
+                        Some((slot, BlockRegion::Cold)) => {
+                            cc_store::keys::blocks_shard_table(cc_store::keys::block_shard_id(slot))
+                        }
+                        Some((_, BlockRegion::Hot)) => cc_store::TABLE_BLOCKS_HOT.to_owned(),
+                        None => cc_store::TABLE_BLOCK_SLOT_BY_ROOT.to_owned(),
+                    };
+                    return fatal_key_collision(metrics, &table, &b.ssz);
+                }
+                None if b.update_canonical => put_block_and_update_head(
+                    &rt, &mut batch, b.slot, &b.root, &b.ssz, region, false,
                 )
-                .map(|(o, _)| o)
-            } else {
-                put_block(
-                    &rt,
-                    &mut batch,
-                    b.slot,
-                    &b.root,
-                    &b.ssz,
-                    region,
-                    b.write_state_root,
-                )
+                .map(|(o, _)| o),
+                None => put_block(&rt, &mut batch, b.slot, &b.root, &b.ssz, region, false),
             };
             let outcome = match put_result {
                 Ok(o) => o,
@@ -614,8 +629,12 @@ fn commit_p0(
                     written_blocks = written_blocks.saturating_add(b.ssz.len() as u64);
                 }
                 PutBlockOutcome::Idempotent => {
-                    // Identical-bytes put dropped before batch (already true inside put_block).
+                    // Same bytes: no hot insert and no reverse-index rewrite.
                 }
+            }
+            if b.write_state_root {
+                let state_root = state_root_at_offset(&b.ssz)?;
+                stage_state_root(&rt, &mut batch, b.slot, &state_root, b.update_canonical)?;
             }
             if let Some(status) = b.da_status {
                 put_da_status(&rt, &mut batch, &b.root, status, b.slot)?;
@@ -653,6 +672,11 @@ fn commit_p0(
                 .saturating_add(anchor.completion_ssz.len() as u64)
                 .saturating_add(anchor.anchor_info_ssz.len() as u64)
                 .saturating_add(anchor.split_ssz.len() as u64);
+        }
+
+        if let Some(head_root) = &unit.canonical_from {
+            let pending = cc_store::blocks::PendingBlocks::new();
+            rewrite_from_head(&rt, &mut batch, &pending, head_root)?;
         }
 
         // Columns.
@@ -1015,6 +1039,7 @@ mod tests {
                 }],
                 columns: vec![],
                 fork_choice: None,
+                canonical_from: None,
                 anchor: None,
                 cursor: cursor(7, 1, root),
                 done: Some(done_tx),
@@ -1067,6 +1092,7 @@ mod tests {
                 }],
                 columns: vec![],
                 fork_choice: None,
+                canonical_from: None,
                 anchor: None,
                 cursor: cursor(1, 2, root),
                 done: Some(done_tx),
@@ -1111,6 +1137,7 @@ mod tests {
                     }],
                     columns: vec![],
                     fork_choice: None,
+                    canonical_from: None,
                     anchor: None,
                     cursor: cursor(seq, 3, root),
                     done: Some(done_tx),
@@ -1211,6 +1238,7 @@ mod tests {
                 blocks: vec![],
                 columns: vec![],
                 fork_choice: None,
+                canonical_from: None,
                 anchor: None,
                 cursor: cursor(0, 0, Root::ZERO),
                 done: Some(done_tx),
@@ -1255,6 +1283,7 @@ mod tests {
                 blocks: vec![],
                 columns: vec![],
                 fork_choice: None,
+                canonical_from: None,
                 anchor: None,
                 cursor: cursor(0, 0, Root::ZERO),
                 done: Some(done_tx),

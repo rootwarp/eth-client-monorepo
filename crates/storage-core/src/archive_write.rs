@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cc_seam::{
-    ArchiveWrite, ColumnBatch, DaVerdict, FailedPreconditionReason, IngestBlock, SeamError,
-    TrustedAnchor,
+    ArchiveWrite, Bytes, ColumnBatch, DaVerdict, DurableImport, FailedPreconditionReason,
+    HeadChange, IngestBlock, SeamError, TrustedAnchor,
 };
 use cc_store::blocks::{parent_root_at_offset, slot_at_offset, state_root_at_offset};
 use cc_store::columns::{
@@ -27,7 +27,7 @@ use cc_store::columns::{
 };
 use cc_store::engine::{Engine, StoreError};
 use cc_store::meta::{AnchorInfo, KEY_NODE_ID, SnapshotCompletion, Split, TABLE_META, WriteCursor};
-use cc_store::{DaStatus, Root, Slot, SszDecode, SszEncode};
+use cc_store::{DaStatus, Root, Slot, SszDecode, SszEncode, get_block_by_root};
 
 use crate::writer::{
     CommitUnit, StagedAnchor, StagedBlock, StagedColumn, StagedForkChoiceScalars, WriterError,
@@ -181,6 +181,7 @@ impl ArchiveWriter {
             blocks: batch.blocks,
             columns: batch.columns,
             fork_choice: None,
+            canonical_from: None,
             cursor,
             done: None,
             anchor: None,
@@ -257,6 +258,22 @@ impl ArchiveWrite for ArchiveWriter {
             Some(batch) => self.submit_block_batch_blocking(batch),
             None => Ok(()),
         }
+    }
+
+    async fn commit_import(&self, import: DurableImport) -> Result<(), SeamError> {
+        let unit = bind_durable_import(&self.engine, import)?;
+        self.writer
+            .submit_p0_committed(unit)
+            .await
+            .map_err(map_writer_err)
+    }
+
+    async fn set_head(&self, head: HeadChange, scalars: Bytes) -> Result<(), SeamError> {
+        let unit = bind_set_head(&self.engine, head, scalars)?;
+        self.writer
+            .submit_p0_committed(unit)
+            .await
+            .map_err(map_writer_err)
     }
 
     fn block_is_durable(&self, root: cc_seam::Root) -> Result<bool, SeamError> {
@@ -429,6 +446,7 @@ fn anchor_unit(engine: &Engine, anchor: TrustedAnchor) -> Result<CommitUnit, Sea
         fork_choice: Some(StagedForkChoiceScalars {
             ssz: anchor.scalars.to_vec(),
         }),
+        canonical_from: None,
         cursor,
         done: None,
         anchor: Some(StagedAnchor {
@@ -457,9 +475,174 @@ fn load_node_id(engine: &Engine) -> Result<Root, SeamError> {
     })
 }
 
+fn precondition(reason: FailedPreconditionReason) -> SeamError {
+    SeamError::FailedPrecondition { reason }
+}
+
+fn da_status_of(verdict: DaVerdict) -> DaStatus {
+    match verdict {
+        DaVerdict::Available => DaStatus::Available,
+        DaVerdict::Deferred => DaStatus::Deferred,
+    }
+}
+
+/// Empty stores are [`FailedPreconditionReason::StoreIncomplete`].
+///
+/// A store that already holds a body admits `commit_import` and `set_head`.
+/// The restart tri-state replaces this predicate; head durability is separate
+/// and is not relaxed here.
+fn admit_import_store(engine: &Engine) -> Result<(), SeamError> {
+    if store_has_durable_body(engine)? {
+        Ok(())
+    } else {
+        Err(precondition(FailedPreconditionReason::StoreIncomplete))
+    }
+}
+
+fn store_has_durable_body(engine: &Engine) -> Result<bool, SeamError> {
+    let rt = engine
+        .read()
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?;
+    rt.has_any(cc_store::TABLE_BLOCK_SLOT_BY_ROOT)
+        .map_err(|e| SeamError::Unavailable(e.to_string()))
+}
+
+fn next_cursor(engine: &Engine, slot: Slot, root: Root) -> Result<WriteCursor, SeamError> {
+    let prev = load_write_cursor(engine)
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?
+        .ok_or_else(|| {
+            SeamError::Unavailable("no durable write cursor; refuse to invent a zero cursor".into())
+        })?;
+    Ok(WriteCursor {
+        session_id: prev.session_id,
+        seq: prev.seq.saturating_add(1),
+        slot,
+        root,
+    })
+}
+
+fn durable_body_slot(engine: &Engine, root: &Root) -> Result<Option<Slot>, SeamError> {
+    let rt = engine
+        .read()
+        .map_err(|e| SeamError::Unavailable(e.to_string()))?;
+    let Some(ssz) =
+        get_block_by_root(&rt, root).map_err(|e| SeamError::Unavailable(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    slot_at_offset(&ssz)
+        .map(Some)
+        .map_err(|e| SeamError::InvalidArgument(e.to_string()))
+}
+
+/// One `commit_import` unit: body (idempotent if already durable), state root,
+/// `da_status`, scalars, and the cursor. Canonical moves only when `head` names
+/// this body.
+fn bind_durable_import(engine: &Engine, import: DurableImport) -> Result<CommitUnit, SeamError> {
+    let ssz_slot = slot_at_offset(import.ssz.as_ref())
+        .map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
+    if ssz_slot.as_u64() != import.slot {
+        return Err(SeamError::InvalidArgument(format!(
+            "slot mismatch: caller {} != SSZ header slot {}",
+            import.slot,
+            ssz_slot.as_u64()
+        )));
+    }
+    let ssz_parent = parent_root_at_offset(import.ssz.as_ref())
+        .map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
+    let claimed_parent = Root::from_array(import.parent_root);
+    if ssz_parent != claimed_parent {
+        return Err(SeamError::InvalidArgument(format!(
+            "parent_root mismatch: caller != SSZ header parent_root at offset {}",
+            cc_store::PARENT_ROOT_SSZ_OFFSET
+        )));
+    }
+    let ssz_state = state_root_at_offset(import.ssz.as_ref())
+        .map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
+    if ssz_state != Root::from_array(import.state_root) {
+        return Err(SeamError::InvalidArgument(
+            "state_root mismatch: caller != SSZ header state_root".into(),
+        ));
+    }
+
+    admit_import_store(engine)?;
+
+    match block_present(engine, &claimed_parent) {
+        Ok(true) => {}
+        Ok(false) => return Err(precondition(FailedPreconditionReason::ParentNotDurable)),
+        Err(e) => return Err(SeamError::Unavailable(e.to_string())),
+    }
+
+    let update_canonical = match &import.head {
+        Some(head) if head.head_root != import.block_root => {
+            return Err(precondition(FailedPreconditionReason::HeadNotDurable));
+        }
+        Some(head) if head.head_slot != import.slot => {
+            return Err(SeamError::InvalidArgument(
+                "head_slot does not match the body this commit writes".into(),
+            ));
+        }
+        Some(_) => true,
+        None => false,
+    };
+
+    let claimed_root = Root::from_array(import.block_root);
+    let cursor = next_cursor(engine, ssz_slot, claimed_root)?;
+    Ok(CommitUnit {
+        blocks: vec![StagedBlock {
+            slot: ssz_slot,
+            root: claimed_root,
+            ssz: import.ssz.to_vec(),
+            update_canonical,
+            write_state_root: true,
+            da_status: Some(da_status_of(import.da)),
+        }],
+        columns: Vec::new(),
+        fork_choice: Some(StagedForkChoiceScalars {
+            ssz: import.scalars.to_vec(),
+        }),
+        canonical_from: None,
+        cursor,
+        done: None,
+        anchor: None,
+    })
+}
+
+/// `set_head` rewrites canonical from an already-durable root. It does not
+/// insert the body. A non-complete store is `STORE_INCOMPLETE`; a missing
+/// body on a complete store is `HEAD_NOT_DURABLE`.
+fn bind_set_head(
+    engine: &Engine,
+    head: HeadChange,
+    scalars: Bytes,
+) -> Result<CommitUnit, SeamError> {
+    admit_import_store(engine)?;
+    let root = Root::from_array(head.head_root);
+    let Some(slot) = durable_body_slot(engine, &root)? else {
+        return Err(precondition(FailedPreconditionReason::HeadNotDurable));
+    };
+    if slot.as_u64() != head.head_slot {
+        return Err(SeamError::InvalidArgument(
+            "head_slot does not match the durable body".into(),
+        ));
+    }
+    let cursor = next_cursor(engine, slot, root)?;
+    Ok(CommitUnit {
+        blocks: Vec::new(),
+        columns: Vec::new(),
+        fork_choice: Some(StagedForkChoiceScalars {
+            ssz: scalars.to_vec(),
+        }),
+        canonical_from: Some(root),
+        cursor,
+        done: None,
+        anchor: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
     use crate::metrics::StorageMetrics;
@@ -468,6 +651,15 @@ mod tests {
         store_is_uninitialized,
     };
     use cc_seam::{Bytes, DaVerdict, FailedPreconditionReason, SeamError, TrustedAnchor};
+    use cc_seam::{DurableImport, HeadCause, HeadChange};
+    use cc_store::canonical::put_canonical;
+    use cc_store::keys::{
+        block_shard_id, blocks_shard_table, encode_cold_block_key, encode_hot_block_key,
+        encode_root_key,
+    };
+    use cc_store::{TABLE_BLOCK_SLOT_BY_ROOT, TABLE_BLOCKS_HOT, measure_class_stats};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use cc_store::blocks::{
         MIN_BLOCK_SSZ_LEN, PARENT_ROOT_SSZ_OFFSET, SLOT_SSZ_OFFSET, STATE_ROOT_SSZ_OFFSET,
         get_state_root, slot_by_root,
@@ -573,6 +765,7 @@ mod tests {
                 blocks: vec![staged_parent_block(parent, 19)],
                 columns: vec![],
                 fork_choice: None,
+                canonical_from: None,
                 anchor: None,
                 cursor: WriteCursor {
                     session_id: 7,
@@ -1549,5 +1742,1094 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    fn durable_import(
+        slot: u64,
+        parent: &Root,
+        root: &Root,
+        state: &Root,
+        da: DaVerdict,
+        scalars: &[u8],
+        head: bool,
+    ) -> DurableImport {
+        DurableImport {
+            block_root: root.into_array(),
+            parent_root: parent.into_array(),
+            slot,
+            state_root: state.into_array(),
+            ssz: Bytes::from(synth_block(slot, parent, state)),
+            da,
+            scalars: Bytes::copy_from_slice(scalars),
+            head: head.then(|| HeadChange {
+                head_root: root.into_array(),
+                head_slot: slot,
+                cause: HeadCause::Import,
+            }),
+        }
+    }
+
+    async fn ingest_signed(
+        archive: &ArchiveWriter,
+        slot: u64,
+        parent: &Root,
+        root: &Root,
+        state: &Root,
+    ) {
+        let ssz = synth_block(slot, parent, state);
+        // Ingest no longer admits a self-parent. Genesis is commit_anchor.
+        if parent == root {
+            archive
+                .commit_anchor(trusted_anchor(
+                    root,
+                    parent,
+                    state,
+                    slot,
+                    ssz,
+                    b"anchor-state".to_vec(),
+                ))
+                .await
+                .expect("self-parent genesis is commit_anchor");
+            return;
+        }
+        archive
+            .ingest_block(IngestBlock {
+                parent_root: parent.into_array(),
+                slot,
+                block_root: root.into_array(),
+                ssz: Bytes::from(ssz),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Old ingest rewrites `canonical[slot]` for a losing sibling. `commit_import`
+    /// with `head: None` must store the body and leave that row, and every row
+    /// above it, untouched.
+    #[tokio::test]
+    async fn losing_sibling_head_none_does_not_rewrite_canonical() {
+        let state_g = Root::from_array([0xF0; 32]);
+        let state_a = Root::from_array([0xF1; 32]);
+        let state_b = Root::from_array([0xF2; 32]);
+        let state_s = Root::from_array([0xF3; 32]);
+        let g = Root::from_array([0x01; 32]);
+        let a = Root::from_array([0x02; 32]);
+        let b = Root::from_array([0x03; 32]);
+        let sibling = Root::from_array([0x04; 32]);
+
+        // Old behavior, still the ingest path: a losing sibling at the head
+        // slot becomes canonical[slot].
+        {
+            let (dir, engine, archive, shutdown_tx) = block_archive("sibling-old");
+            ingest_signed(&archive, 0, &g, &g, &state_g).await;
+            ingest_signed(&archive, 1, &g, &a, &state_a).await;
+            ingest_signed(&archive, 2, &a, &b, &state_b).await;
+            ingest_signed(&archive, 2, &a, &sibling, &state_s).await;
+            let rt = engine.read().unwrap();
+            assert_eq!(
+                get_canonical(&rt, Slot::new(2)).unwrap(),
+                Some(sibling),
+                "ingest_block still rewrites canonical[slot] for a losing sibling"
+            );
+            assert!(get_block_by_root(&rt, &sibling).unwrap().is_some());
+            let _ = shutdown_tx.send(true);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // New behavior: the same sibling with head: None is durable and
+        // canonical[slot] plus every row above it stay put.
+        {
+            let (dir, engine, archive, shutdown_tx) = block_archive("sibling-new");
+            ingest_signed(&archive, 0, &g, &g, &state_g).await;
+            ingest_signed(&archive, 1, &g, &a, &state_a).await;
+            ingest_signed(&archive, 2, &a, &b, &state_b).await;
+            let rt = engine.read().unwrap();
+            assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), Some(a));
+            assert_eq!(get_canonical(&rt, Slot::new(2)).unwrap(), Some(b));
+            drop(rt);
+
+            let before = load_write_cursor(&engine).unwrap().unwrap();
+            archive
+                .commit_import(durable_import(
+                    2,
+                    &a,
+                    &sibling,
+                    &state_s,
+                    DaVerdict::Deferred,
+                    b"scalars-sibling",
+                    false,
+                ))
+                .await
+                .expect("losing sibling with head: None is a legal body commit");
+
+            let rt = engine.read().unwrap();
+            assert_eq!(
+                get_canonical(&rt, Slot::new(2)).unwrap(),
+                Some(b),
+                "head: None must not rewrite canonical[slot]"
+            );
+            assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), Some(a));
+            assert!(get_block_by_root(&rt, &sibling).unwrap().is_some());
+            assert_eq!(
+                get_state_root(&rt, Slot::new(2)).unwrap(),
+                Some(state_s),
+                "state_roots[slot] is written with the body"
+            );
+            let (da, da_slot) = get_da_status(&rt, &sibling).unwrap().unwrap();
+            assert_eq!(da, DaStatus::Deferred);
+            assert_eq!(da_slot, Slot::new(2));
+            assert_eq!(
+                rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                b"scalars-sibling"
+            );
+            drop(rt);
+            let after = load_write_cursor(&engine).unwrap().unwrap();
+            assert_eq!(after.seq, before.seq + 1);
+            assert_eq!(after.root, sibling);
+            assert_eq!(after.slot, Slot::new(2));
+
+            // Shorter sibling at slot 1 must not delete canonical[2].
+            let shorter = Root::from_array([0x05; 32]);
+            archive
+                .commit_import(durable_import(
+                    1,
+                    &g,
+                    &shorter,
+                    &Root::from_array([0xF4; 32]),
+                    DaVerdict::Available,
+                    b"scalars-shorter",
+                    false,
+                ))
+                .await
+                .expect("shorter sibling with head: None is a legal body commit");
+
+            let rt = engine.read().unwrap();
+            assert_eq!(
+                get_canonical(&rt, Slot::new(2)).unwrap(),
+                Some(b),
+                "head: None must not rewrite canonical[slot]"
+            );
+            assert_eq!(
+                get_canonical(&rt, Slot::new(1)).unwrap(),
+                Some(a),
+                "head: None must not rewrite an earlier canonical row"
+            );
+            assert!(
+                get_block_by_root(&rt, &sibling).unwrap().is_some(),
+                "the losing sibling body must still be durable"
+            );
+            assert!(
+                get_block_by_root(&rt, &shorter).unwrap().is_some(),
+                "the shorter sibling body must still be durable"
+            );
+            let _ = shutdown_tx.send(true);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn head_none_does_not_replace_an_existing_state_root() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("state-root-keep");
+        let g = Root::from_array([0x11; 32]);
+        let a = Root::from_array([0x12; 32]);
+        let sibling = Root::from_array([0x13; 32]);
+        let state_g = Root::from_array([0xA0; 32]);
+        let state_a = Root::from_array([0xA1; 32]);
+        let state_s = Root::from_array([0xA2; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Available,
+                b"scalars-a",
+                true,
+            ))
+            .await
+            .unwrap();
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &sibling,
+                &state_s,
+                DaVerdict::Deferred,
+                b"scalars-s",
+                false,
+            ))
+            .await
+            .unwrap();
+        let rt = engine.read().unwrap();
+        assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), Some(a));
+        assert_eq!(get_state_root(&rt, Slot::new(1)).unwrap(), Some(state_a));
+        assert!(get_block_by_root(&rt, &sibling).unwrap().is_some());
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn commit_import_with_head_rewrites_canonical_and_state_root() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("head-some");
+        let g = Root::from_array([0x21; 32]);
+        let a = Root::from_array([0x22; 32]);
+        let b = Root::from_array([0x23; 32]);
+        let sibling = Root::from_array([0x24; 32]);
+        let state_g = Root::from_array([0xB0; 32]);
+        let state_a = Root::from_array([0xB1; 32]);
+        let state_b = Root::from_array([0xB2; 32]);
+        let state_s = Root::from_array([0xB3; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Available,
+                b"scalars-a",
+                true,
+            ))
+            .await
+            .unwrap();
+        archive
+            .commit_import(durable_import(
+                2,
+                &a,
+                &b,
+                &state_b,
+                DaVerdict::Available,
+                b"scalars-b",
+                true,
+            ))
+            .await
+            .unwrap();
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &sibling,
+                &state_s,
+                DaVerdict::Deferred,
+                b"scalars-s",
+                true,
+            ))
+            .await
+            .unwrap();
+        let rt = engine.read().unwrap();
+        assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), Some(sibling));
+        assert_eq!(
+            get_canonical(&rt, Slot::new(2)).unwrap(),
+            None,
+            "a head at slot 1 deletes canonical rows above it"
+        );
+        assert_eq!(get_state_root(&rt, Slot::new(1)).unwrap(), Some(state_s));
+        assert_eq!(get_canonical(&rt, Slot::new(0)).unwrap(), Some(g));
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn second_commit_import_upgrades_da_and_scalars_without_a_second_body() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("upgrade");
+        let g = Root::from_array([0x31; 32]);
+        let a = Root::from_array([0x32; 32]);
+        let state_g = Root::from_array([0xC0; 32]);
+        let state_a = Root::from_array([0xC1; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Deferred,
+                b"scalars-v1",
+                false,
+            ))
+            .await
+            .unwrap();
+        let rows = measure_class_stats(&engine).unwrap().blocks_rows;
+        let body = {
+            let rt = engine.read().unwrap();
+            assert_eq!(get_state_root(&rt, Slot::new(1)).unwrap(), Some(state_a));
+            let (da, _) = get_da_status(&rt, &a).unwrap().unwrap();
+            assert_eq!(da, DaStatus::Deferred);
+            get_block_by_root(&rt, &a).unwrap().unwrap()
+        };
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Available,
+                b"scalars-v2",
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            measure_class_stats(&engine).unwrap().blocks_rows,
+            rows,
+            "an upgrade must not insert a second body"
+        );
+        let rt = engine.read().unwrap();
+        assert_eq!(get_block_by_root(&rt, &a).unwrap().unwrap(), body);
+        let (da, _) = get_da_status(&rt, &a).unwrap().unwrap();
+        assert_eq!(da, DaStatus::Available);
+        assert_eq!(
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"scalars-v2"
+        );
+        assert_eq!(get_state_root(&rt, Slot::new(1)).unwrap(), Some(state_a));
+        assert_eq!(
+            get_canonical(&rt, Slot::new(1)).unwrap(),
+            None,
+            "head: None upgrade must not create a canonical row"
+        );
+        drop(rt);
+        let after = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(after.seq, before.seq + 1);
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn upgrade_with_head_rewrites_canonical_without_a_second_body() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("upgrade-head");
+        let g = Root::from_array([0x41; 32]);
+        let a = Root::from_array([0x42; 32]);
+        let b = Root::from_array([0x43; 32]);
+        let state_g = Root::from_array([0xD0; 32]);
+        let state_a = Root::from_array([0xD1; 32]);
+        let state_b = Root::from_array([0xD2; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Deferred,
+                b"scalars-a",
+                false,
+            ))
+            .await
+            .unwrap();
+        archive
+            .commit_import(durable_import(
+                2,
+                &a,
+                &b,
+                &state_b,
+                DaVerdict::Available,
+                b"scalars-b",
+                true,
+            ))
+            .await
+            .unwrap();
+        let rows = measure_class_stats(&engine).unwrap().blocks_rows;
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Available,
+                b"scalars-a2",
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(measure_class_stats(&engine).unwrap().blocks_rows, rows);
+        let rt = engine.read().unwrap();
+        assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), Some(a));
+        assert_eq!(get_canonical(&rt, Slot::new(2)).unwrap(), None);
+        let (da, _) = get_da_status(&rt, &a).unwrap().unwrap();
+        assert_eq!(da, DaStatus::Available);
+        assert_eq!(
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"scalars-a2"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_head_refuses_a_root_that_is_not_durable() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("head-refuse");
+        let g = Root::from_array([0x51; 32]);
+        let state_g = Root::from_array([0xE0; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        let scalars_before = {
+            let rt = engine.read().unwrap();
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes()).unwrap()
+        };
+        let err = archive
+            .set_head(
+                HeadChange {
+                    head_root: [0xAB; 32],
+                    head_slot: 4,
+                    cause: HeadCause::Attestation,
+                },
+                Bytes::from_static(b"scalars-missing"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::HeadNotDurable,
+                }
+            ),
+            "{err}"
+        );
+        let after = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(after.seq, before.seq);
+        let rt = engine.read().unwrap();
+        assert_eq!(get_canonical(&rt, Slot::new(0)).unwrap(), Some(g));
+        assert_eq!(
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes()).unwrap(),
+            scalars_before,
+            "a refused set_head must not replace scalars"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_head_on_an_empty_store_is_store_incomplete() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("head-empty");
+        let err = archive
+            .set_head(
+                HeadChange {
+                    head_root: [0xAB; 32],
+                    head_slot: 1,
+                    cause: HeadCause::EngineInvalidation,
+                },
+                Bytes::from_static(b"scalars"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreIncomplete,
+                }
+            ),
+            "{err}"
+        );
+        assert!(load_write_cursor(&engine).unwrap().unwrap().seq == 0);
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_head_rewrites_canonical_from_a_durable_body() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("set-head");
+        let g = Root::from_array([0x61; 32]);
+        let a = Root::from_array([0x62; 32]);
+        let b = Root::from_array([0x63; 32]);
+        let sibling = Root::from_array([0x64; 32]);
+        let state_g = Root::from_array([0xE1; 32]);
+        let state_a = Root::from_array([0xE2; 32]);
+        let state_b = Root::from_array([0xE3; 32]);
+        let state_s = Root::from_array([0xE4; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Available,
+                b"scalars-a",
+                true,
+            ))
+            .await
+            .unwrap();
+        archive
+            .commit_import(durable_import(
+                2,
+                &a,
+                &b,
+                &state_b,
+                DaVerdict::Available,
+                b"scalars-b",
+                true,
+            ))
+            .await
+            .unwrap();
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &sibling,
+                &state_s,
+                DaVerdict::Deferred,
+                b"scalars-s",
+                false,
+            ))
+            .await
+            .unwrap();
+        let rows = measure_class_stats(&engine).unwrap().blocks_rows;
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        archive
+            .set_head(
+                HeadChange {
+                    head_root: sibling.into_array(),
+                    head_slot: 1,
+                    cause: HeadCause::Attestation,
+                },
+                Bytes::from_static(b"scalars-head"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(measure_class_stats(&engine).unwrap().blocks_rows, rows);
+        let rt = engine.read().unwrap();
+        assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), Some(sibling));
+        assert_eq!(get_canonical(&rt, Slot::new(2)).unwrap(), None);
+        assert_eq!(get_canonical(&rt, Slot::new(0)).unwrap(), Some(g));
+        assert_eq!(
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"scalars-head"
+        );
+        // set_head does not insert a body and does not move state_roots.
+        assert_eq!(get_state_root(&rt, Slot::new(1)).unwrap(), Some(state_a));
+        drop(rt);
+        let after = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(after.seq, before.seq + 1);
+        assert_eq!(after.root, sibling);
+        assert_eq!(after.slot, Slot::new(1));
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failed_commit_import_does_not_advance_the_cursor() {
+        let (dir, engine) = eng("fail-import");
+        let flag = Arc::new(AtomicBool::new(false));
+        let faults = WriterFaults {
+            fail_next_commit: Arc::clone(&flag),
+            panic_next: Arc::new(AtomicBool::new(false)),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_writer(
+            Arc::clone(&engine),
+            metrics(),
+            WriterBounds::default(),
+            faults,
+            shutdown_rx,
+            false,
+        );
+        ArchiveWriter::ensure_write_cursor(&engine).unwrap();
+        let archive = ArchiveWriter::new(handle, Arc::clone(&engine));
+        let g = Root::from_array([0x71; 32]);
+        let state_g = Root::from_array([0xE5; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        let scalars_before = {
+            let rt = engine.read().unwrap();
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes()).unwrap()
+        };
+        flag.store(true, Ordering::SeqCst);
+        let a = Root::from_array([0x72; 32]);
+        let err = archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &Root::from_array([0xE6; 32]),
+                DaVerdict::Available,
+                b"scalars-fail",
+                true,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeamError::Unavailable(_)), "{err}");
+        let after = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(after, before, "a failed unit must not advance the cursor");
+        let rt = engine.read().unwrap();
+        assert!(get_block_by_root(&rt, &a).unwrap().is_none());
+        assert!(get_state_root(&rt, Slot::new(1)).unwrap().is_none());
+        assert!(get_da_status(&rt, &a).unwrap().is_none());
+        assert!(get_canonical(&rt, Slot::new(1)).unwrap().is_none());
+        assert_eq!(
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes()).unwrap(),
+            scalars_before,
+            "a failed unit must not replace scalars"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn da_demotion_fails_without_advancing_the_cursor() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("demote");
+        let g = Root::from_array([0x81; 32]);
+        let a = Root::from_array([0x82; 32]);
+        let state_g = Root::from_array([0xE7; 32]);
+        let state_a = Root::from_array([0xE8; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Available,
+                b"scalars-avail",
+                false,
+            ))
+            .await
+            .unwrap();
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        let err = archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Deferred,
+                b"scalars-demote",
+                false,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeamError::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains("demotion"), "{err}");
+        assert_eq!(load_write_cursor(&engine).unwrap().unwrap(), before);
+        let rt = engine.read().unwrap();
+        let (da, _) = get_da_status(&rt, &a).unwrap().unwrap();
+        assert_eq!(da, DaStatus::Available);
+        assert_eq!(
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"scalars-avail"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn commit_import_refuses_parent_that_is_not_durable() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("parent-missing");
+        let g = Root::from_array([0x91; 32]);
+        let state_g = Root::from_array([0xE9; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        let missing = Root::from_array([0x92; 32]);
+        let child = Root::from_array([0x93; 32]);
+        let err = archive
+            .commit_import(durable_import(
+                1,
+                &missing,
+                &child,
+                &Root::from_array([0xEA; 32]),
+                DaVerdict::Available,
+                b"scalars",
+                false,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::ParentNotDurable,
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(load_write_cursor(&engine).unwrap().unwrap(), before);
+        let rt = engine.read().unwrap();
+        assert!(get_block_by_root(&rt, &child).unwrap().is_none());
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn commit_import_refuses_a_head_root_other_than_the_body() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("head-other");
+        let g = Root::from_array([0xA1; 32]);
+        let state_g = Root::from_array([0xEB; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        let a = Root::from_array([0xA2; 32]);
+        let mut import = durable_import(
+            1,
+            &g,
+            &a,
+            &Root::from_array([0xEC; 32]),
+            DaVerdict::Available,
+            b"scalars",
+            true,
+        );
+        import.head = Some(HeadChange {
+            head_root: g.into_array(),
+            head_slot: 1,
+            cause: HeadCause::Import,
+        });
+        let err = archive.commit_import(import).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::HeadNotDurable,
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(load_write_cursor(&engine).unwrap().unwrap(), before);
+        let rt = engine.read().unwrap();
+        assert!(get_block_by_root(&rt, &a).unwrap().is_none());
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn commit_import_on_an_empty_store_is_store_incomplete() {
+        let (dir, _engine, archive, shutdown_tx) = block_archive("import-empty");
+        let g = Root::from_array([0xB1; 32]);
+        let err = archive
+            .commit_import(durable_import(
+                0,
+                &Root::ZERO,
+                &g,
+                &Root::from_array([0xED; 32]),
+                DaVerdict::Available,
+                b"scalars",
+                true,
+            ))
+            .await
+            .unwrap_err();
+        // SSZ parent is zero and the caller parent is zero, so the bind is
+        // structural-ok; the empty store is refused before parent durability.
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreIncomplete,
+                }
+            ),
+            "{err}"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn plant_cold_body(
+        engine: &Engine,
+        slot: u64,
+        parent: &Root,
+        root: &Root,
+        state: &Root,
+    ) -> Vec<u8> {
+        let ssz = synth_block(slot, parent, state);
+        let rt = engine.read().unwrap();
+        let mut batch = engine.batch();
+        put_block(
+            &rt,
+            &mut batch,
+            Slot::new(slot),
+            root,
+            &ssz,
+            BlockRegion::Cold,
+            false,
+        )
+        .unwrap();
+        drop(rt);
+        engine.commit(batch).unwrap();
+        ssz
+    }
+
+    fn assert_cold_index_untouched(
+        engine: &Engine,
+        slot: u64,
+        root: &Root,
+        ssz: &[u8],
+        index: &[u8],
+        rows: u64,
+    ) {
+        assert_eq!(measure_class_stats(engine).unwrap().blocks_rows, rows);
+        let rt = engine.read().unwrap();
+        assert_eq!(get_block_by_root(&rt, root).unwrap().as_deref(), Some(ssz));
+        let (got_slot, region) = slot_by_root(&rt, root).unwrap().unwrap();
+        assert_eq!(got_slot, Slot::new(slot));
+        assert_eq!(region, BlockRegion::Cold);
+        assert_eq!(
+            rt.get(TABLE_BLOCK_SLOT_BY_ROOT, &encode_root_key(root))
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            index,
+            "cold reverse index must not be rewritten as hot"
+        );
+        assert!(
+            rt.get(
+                TABLE_BLOCKS_HOT,
+                &encode_hot_block_key(Slot::new(slot), root)
+            )
+            .unwrap()
+            .is_none(),
+            "an upgrade must not insert a hot row"
+        );
+        let cold = blocks_shard_table(block_shard_id(Slot::new(slot)));
+        assert_eq!(
+            rt.get(&cold, &encode_cold_block_key(Slot::new(slot)))
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            ssz
+        );
+    }
+
+    /// Genesis plus one cold child. Shared by the in-process upgrade and the
+    /// collision child so the parent can reopen the child's store.
+    fn cold_collision_ids() -> (Root, Root, Root, Root) {
+        (
+            Root::from_array([0x71; 32]),
+            Root::from_array([0x72; 32]),
+            Root::from_array([0x73; 32]),
+            Root::from_array([0x74; 32]),
+        )
+    }
+
+    async fn cold_reimport_different_bytes_child(dir: PathBuf) {
+        let (g, a, state_g, state_a) = cold_collision_ids();
+        // Immediate, not None: the process aborts on the colliding commit, and
+        // None can drop the planted body before the parent reopens this dir.
+        let engine = Arc::new(
+            Engine::open(
+                &dir,
+                EngineOptions::default().with_durability(Durability::Immediate),
+            )
+            .unwrap(),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_writer(
+            Arc::clone(&engine),
+            metrics(),
+            WriterBounds::default(),
+            WriterFaults::default(),
+            shutdown_rx,
+            false,
+        );
+        ArchiveWriter::ensure_write_cursor(&engine).unwrap();
+        let archive = ArchiveWriter::new(handle, Arc::clone(&engine));
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        plant_cold_body(&engine, 1, &g, &a, &state_a);
+        let mut import = durable_import(
+            1,
+            &g,
+            &a,
+            &state_a,
+            DaVerdict::Available,
+            b"scalars-bad",
+            true,
+        );
+        let other = Root::from_array([0x75; 32]);
+        import.state_root = other.into_array();
+        import.ssz = Bytes::from(synth_block(1, &g, &other));
+        let result = archive.commit_import(import).await;
+        let _ = shutdown_tx.send(true);
+        panic!("different bytes under a cold root must abort before commit, got {result:?}");
+    }
+
+    /// A body already durable in the cold region is an upgrade: same bytes
+    /// refresh da/scalars and may rewrite canonical, without a hot row or a
+    /// new reverse-index value. Different bytes stay a process-fatal collision
+    /// and commit nothing.
+    #[tokio::test]
+    async fn cold_reimport_keeps_the_cold_index_and_refuses_different_bytes() {
+        if std::env::var_os("CC_COLD_REIMPORT_CHILD").is_some() {
+            let dir = PathBuf::from(std::env::var("CC_COLD_REIMPORT_DIR").unwrap());
+            cold_reimport_different_bytes_child(dir).await;
+            return;
+        }
+
+        let (dir, engine, archive, shutdown_tx) = block_archive("cold-upgrade");
+        let g = Root::from_array([0x61; 32]);
+        let a = Root::from_array([0x62; 32]);
+        let state_g = Root::from_array([0x63; 32]);
+        let state_a = Root::from_array([0x64; 32]);
+        let above = Root::from_array([0x65; 32]);
+        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        let ssz = plant_cold_body(&engine, 1, &g, &a, &state_a);
+        {
+            let rt = engine.read().unwrap();
+            let mut batch = engine.batch();
+            put_canonical(&rt, &mut batch, Slot::new(2), &above).unwrap();
+            drop(rt);
+            engine.commit(batch).unwrap();
+        }
+        let rows = measure_class_stats(&engine).unwrap().blocks_rows;
+        let index = {
+            let rt = engine.read().unwrap();
+            assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), None);
+            assert_eq!(get_canonical(&rt, Slot::new(2)).unwrap(), Some(above));
+            rt.get(TABLE_BLOCK_SLOT_BY_ROOT, &encode_root_key(&a))
+                .unwrap()
+                .unwrap()
+        };
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Deferred,
+                b"scalars-cold-v1",
+                false,
+            ))
+            .await
+            .expect("same bytes of a cold body are an upgrade");
+
+        assert_cold_index_untouched(&engine, 1, &a, &ssz, &index, rows);
+        {
+            let rt = engine.read().unwrap();
+            assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), None);
+            assert_eq!(
+                get_canonical(&rt, Slot::new(2)).unwrap(),
+                Some(above),
+                "head: None must not delete canonical rows above the body"
+            );
+            assert_eq!(get_state_root(&rt, Slot::new(1)).unwrap(), Some(state_a));
+            let (da, da_slot) = get_da_status(&rt, &a).unwrap().unwrap();
+            assert_eq!(da, DaStatus::Deferred);
+            assert_eq!(da_slot, Slot::new(1));
+            assert_eq!(
+                rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                b"scalars-cold-v1"
+            );
+        }
+        let mid = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(mid.seq, before.seq + 1);
+
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &a,
+                &state_a,
+                DaVerdict::Available,
+                b"scalars-cold-v2",
+                true,
+            ))
+            .await
+            .expect("head: Some on a cold body still rewrites canonical");
+
+        assert_cold_index_untouched(&engine, 1, &a, &ssz, &index, rows);
+        {
+            let rt = engine.read().unwrap();
+            assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), Some(a));
+            assert_eq!(
+                get_canonical(&rt, Slot::new(2)).unwrap(),
+                None,
+                "head: Some must delete canonical rows above the body"
+            );
+            assert_eq!(get_canonical(&rt, Slot::new(0)).unwrap(), Some(g));
+            let (da, _) = get_da_status(&rt, &a).unwrap().unwrap();
+            assert_eq!(da, DaStatus::Available);
+            assert_eq!(
+                rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                b"scalars-cold-v2"
+            );
+        }
+        let after = load_write_cursor(&engine).unwrap().unwrap();
+        assert_eq!(after.seq, mid.seq + 1);
+        assert_eq!(after.root, a);
+        assert_eq!(after.slot, Slot::new(1));
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Different bytes abort the writer process. Run that in a child so
+        // this test process survives, then reopen the store.
+        let collision_dir = tmp_dir("cold-collision");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("archive_write::tests::cold_reimport_keeps_the_cold_index_and_refuses_different_bytes")
+            .env("CC_COLD_REIMPORT_CHILD", "1")
+            .env("CC_COLD_REIMPORT_DIR", &collision_dir)
+            .output()
+            .unwrap();
+        let signaled = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                output.status.signal() == Some(6)
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        assert!(
+            signaled,
+            "different cold bytes must SIGABRT; status {:?} stderr {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (g, a, _state_g, state_a) = cold_collision_ids();
+        let engine = Engine::open(
+            &collision_dir,
+            EngineOptions::default().with_durability(Durability::Immediate),
+        )
+        .unwrap();
+        let ssz = synth_block(1, &g, &state_a);
+        {
+            let rt = engine.read().unwrap();
+            assert_eq!(
+                get_block_by_root(&rt, &a).unwrap().as_deref(),
+                Some(ssz.as_slice())
+            );
+            assert_eq!(slot_by_root(&rt, &a).unwrap().unwrap().1, BlockRegion::Cold);
+            assert!(
+                rt.get(TABLE_BLOCKS_HOT, &encode_hot_block_key(Slot::new(1), &a))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(get_da_status(&rt, &a).unwrap().is_none());
+            assert_ne!(
+                rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                b"scalars-bad",
+                "the colliding unit must not commit its scalars"
+            );
+            assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), None);
+            assert_eq!(get_canonical(&rt, Slot::new(0)).unwrap(), Some(g));
+        }
+        assert_eq!(load_write_cursor(&engine).unwrap().unwrap().seq, 1);
+        assert_eq!(measure_class_stats(&engine).unwrap().blocks_rows, 2);
+        let _ = std::fs::remove_dir_all(&collision_dir);
     }
 }
