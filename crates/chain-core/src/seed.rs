@@ -876,6 +876,32 @@ mod tests {
     }
 
     #[test]
+    fn seed_shares_one_transition_context_per_replay_set() {
+        let src = include_str!("seed.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        let apply = production
+            .split("fn apply_durable_seed")
+            .nth(1)
+            .expect("apply_durable_seed");
+        let body = apply.split("fn decode_fc_scalars").next().unwrap();
+        assert_eq!(
+            body.matches("TransitionContext::new").count(),
+            1,
+            "seed shares one TransitionContext per replay set; no per-branch rebuild"
+        );
+        let constructed = body
+            .find("let ctx = TransitionContext::new")
+            .expect("shared context");
+        let replay = body
+            .find("for (i, rb) in input.blocks")
+            .expect("slot-sorted replay");
+        assert!(
+            constructed < replay,
+            "the shared context is built once, before the replay loop"
+        );
+    }
+
+    #[test]
     fn seed_decode_tops_up_pubkey_cache_before_on_block() {
         let src = include_str!("seed.rs");
         let production = src.split("#[cfg(test)]").next().unwrap();

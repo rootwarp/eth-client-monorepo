@@ -509,14 +509,26 @@ pub fn get_consolidation_churn_limit<P: Preset>(
 /// Resolve a validator index by pubkey via [`cc_types::PubkeyIndexMap`], falling
 /// back to a linear registry scan that is counted on the map (CC-12d).
 ///
-/// Prefer this when a miss is possible; `process_sync_aggregate` uses the map
-/// only (no scan). The map lives on `TransitionContext` (S2-A-10 / S2-A-11).
+/// A hit is revalidated against `state`: the validator at the cached index must
+/// carry `pubkey`. A mismatch — one context shared across sibling registries —
+/// falls through to the scan. The stale mapping is left in place when the scan
+/// misses, so the other sibling still hits. Prefer this when a miss is possible;
+/// `process_sync_aggregate` uses the map only (no scan). The map lives on
+/// `TransitionContext` (S2-A-10 / S2-A-11).
 pub fn get_validator_index_by_pubkey<P: Preset>(
     state: &BeaconState<P>,
     pubkey: &cc_types::primitives::BlsPublicKey,
     cache: &RefCell<cc_types::PubkeyIndexMap>,
 ) -> Option<ValidatorIndex> {
-    if let Some(idx) = cache.borrow().get(pubkey) {
+    let validated_hit = {
+        let map = cache.borrow();
+        map.get(pubkey).filter(|idx| {
+            state
+                .validators_get(idx.as_u64() as usize)
+                .is_some_and(|v| &v.pubkey == pubkey)
+        })
+    };
+    if let Some(idx) = validated_hit {
         return Some(idx);
     }
     cache.borrow_mut().note_linear_scan();

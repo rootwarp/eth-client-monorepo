@@ -492,6 +492,54 @@ mod tests {
         let mut map = PubkeyIndexMap::default();
         map.import_from_registry(&state);
         assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.imported_len(),
+            2,
+            "fill progress is tracked apart from map.len()"
+        );
         assert_eq!(map.get(&pk), Some(ValidatorIndex::new(0)));
+        map.import_from_registry(&state);
+        assert_eq!(map.imported_len(), 2);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn import_from_registry_does_not_skip_tail_when_map_len_is_ahead() {
+        let mut state = registry_state(2);
+        let mut map = PubkeyIndexMap::default();
+        map.import_from_registry(&state);
+        assert_eq!(map.imported_len(), 2);
+        assert_eq!(map.len(), 2);
+
+        let extra = BlsPublicKey::from_array([0xEE; 48]);
+        map.insert(extra, ValidatorIndex::new(1));
+        assert_eq!(map.len(), 3);
+        assert_eq!(
+            map.imported_len(),
+            2,
+            "a scan insert must not advance fill progress"
+        );
+
+        let mut raw = [0u8; 48];
+        raw[0] = 9;
+        let pk_c = BlsPublicKey::from_array(raw);
+        state
+            .validators_push(Validator {
+                pubkey: pk_c,
+                ..Validator::default()
+            })
+            .unwrap();
+        map.import_from_registry(&state);
+        assert_eq!(map.get(&pk_c), Some(ValidatorIndex::new(2)));
+        assert_eq!(map.imported_len(), 3);
+        assert_ne!(map.imported_len(), map.len());
+
+        let short = registry_state(1);
+        map.import_from_registry(&short);
+        assert_eq!(
+            map.imported_len(),
+            3,
+            "a shorter registry must not rewind fill progress"
+        );
     }
 }

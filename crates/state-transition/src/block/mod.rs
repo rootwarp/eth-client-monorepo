@@ -470,6 +470,116 @@ mod tests {
         assert_eq!(ctx.pubkeys().get(&pk), Some(ValidatorIndex::new(0)));
     }
 
+    /// One [`TransitionContext`] across two sibling registries.
+    ///
+    /// Unreachable on a valid chain: post-Electra `process_pending_deposits`
+    /// applies a deposit only once its slot is finalized, so two siblings
+    /// cannot disagree about a registry index. This state is synthetic.
+    /// A future reader must not re-tier the row off it.
+    #[test]
+    fn shared_transition_context_revalidates_sibling_registry_hits() {
+        use crate::helpers::accessors::get_validator_index_by_pubkey;
+
+        // Unreachable on a valid chain: post-Electra `process_pending_deposits`
+        // applies a deposit only once its slot is finalized, so two siblings
+        // cannot disagree about a registry index. Synthetic state only — do not
+        // re-tier this row off it.
+        fn pubkey_byte(b: u8) -> BlsPublicKey {
+            let mut raw = [0u8; 48];
+            raw[0] = b;
+            BlsPublicKey::from_array(raw)
+        }
+        fn push_validator(state: &mut BeaconState<Minimal>, pubkey: BlsPublicKey) {
+            state
+                .validators_push(Validator {
+                    pubkey,
+                    ..Validator::default()
+                })
+                .unwrap();
+        }
+
+        let prefix = pubkey_byte(1);
+        let pk_a = pubkey_byte(2);
+        let pk_b = pubkey_byte(3);
+        let pk_c = pubkey_byte(4);
+
+        let mut sibling_a = BeaconState::<Minimal>::default();
+        push_validator(&mut sibling_a, prefix);
+        push_validator(&mut sibling_a, pk_a);
+        let mut sibling_b = BeaconState::<Minimal>::default();
+        push_validator(&mut sibling_b, prefix);
+        push_validator(&mut sibling_b, pk_b);
+
+        let config = minimal_test_config();
+        let engine = AcceptEngine;
+        let ctx = TransitionContext::<Minimal>::new(&config, &engine);
+        ctx.top_up_pubkey_cache(&sibling_a);
+        ctx.top_up_pubkey_cache(&sibling_b);
+
+        let on_b = get_validator_index_by_pubkey(&sibling_b, &pk_a, ctx.pubkey_index_map());
+        assert_eq!(
+            on_b, None,
+            "one context reused across two sibling registries resolved {on_b:?} \
+             (the wrong index) for the other branch's pubkey"
+        );
+        assert!(
+            ctx.pubkeys().linear_scan_count() >= 1,
+            "a pubkey-cache hit that mismatches the supplied registry must fall back to a scan"
+        );
+
+        assert_eq!(
+            get_validator_index_by_pubkey(&sibling_b, &pk_b, ctx.pubkey_index_map()),
+            Some(ValidatorIndex::new(1)),
+            "sibling B's own pubkey must resolve to the index it appended"
+        );
+        assert_eq!(
+            get_validator_index_by_pubkey(&sibling_a, &pk_a, ctx.pubkey_index_map()),
+            Some(ValidatorIndex::new(1)),
+            "sibling A's own pubkey must still resolve after the shared context saw B"
+        );
+        assert_eq!(
+            get_validator_index_by_pubkey(&sibling_a, &pk_b, ctx.pubkey_index_map()),
+            None,
+            "sibling B's pubkey must not resolve on sibling A"
+        );
+        assert_eq!(
+            get_validator_index_by_pubkey(&sibling_a, &prefix, ctx.pubkey_index_map()),
+            Some(ValidatorIndex::new(0))
+        );
+        assert_eq!(
+            get_validator_index_by_pubkey(&sibling_b, &prefix, ctx.pubkey_index_map()),
+            Some(ValidatorIndex::new(0))
+        );
+
+        // The cross-branch insert grows cardinality past the walked prefix.
+        // Fill progress is not `map.len()`: extending A must import `pk_c`
+        // without another registry scan.
+        let cardinality = ctx.pubkeys().len();
+        assert!(
+            cardinality > sibling_a.validators_len(),
+            "cross-branch insert must make map.len() ({cardinality}) exceed the walked prefix"
+        );
+        assert_eq!(ctx.pubkeys().imported_len(), sibling_a.validators_len());
+        assert_ne!(
+            ctx.pubkeys().imported_len(),
+            cardinality,
+            "fill progress is tracked apart from map.len()"
+        );
+        let scans_before_extend = ctx.pubkeys().linear_scan_count();
+        push_validator(&mut sibling_a, pk_c);
+        ctx.top_up_pubkey_cache(&sibling_a);
+        assert_eq!(
+            get_validator_index_by_pubkey(&sibling_a, &pk_c, ctx.pubkey_index_map()),
+            Some(ValidatorIndex::new(2))
+        );
+        assert_eq!(
+            ctx.pubkeys().linear_scan_count(),
+            scans_before_extend,
+            "fill progress is tracked apart from map.len(); the new index must be imported, not scanned"
+        );
+        assert_eq!(ctx.pubkeys().imported_len(), sibling_a.validators_len());
+    }
+
     fn minimal_test_config() -> ChainConfig {
         use cc_types::config::{BlobParameters, BlobSchedule, PresetName};
         use cc_types::primitives::{Epoch, ExecutionAddress, ForkVersion};

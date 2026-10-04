@@ -511,6 +511,12 @@ impl FieldRootCache {
 #[derive(Clone, Default)]
 pub struct PubkeyIndexMap {
     map: HashMap<BlsPublicKey, ValidatorIndex>,
+    /// Validator slots walked by [`Self::import_from_registry`].
+    ///
+    /// Independent of [`Self::len`]: duplicate pubkeys and scan inserts from
+    /// another registry make cardinality the wrong cursor. A shared context
+    /// must not skip a later append, and a shorter sibling must not rewind.
+    imported_len: usize,
     /// How many times a full-registry linear scan was performed as a map miss
     /// fallback. Used by CC-12d to assert `process_sync_aggregate` never scans.
     linear_scan_count: u64,
@@ -520,6 +526,7 @@ impl fmt::Debug for PubkeyIndexMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PubkeyIndexMap")
             .field("len", &self.map.len())
+            .field("imported_len", &self.imported_len)
             .field("linear_scan_count", &self.linear_scan_count)
             .finish()
     }
@@ -539,6 +546,11 @@ impl PubkeyIndexMap {
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// Slots walked by [`Self::import_from_registry`], not [`Self::len`].
+    pub fn imported_len(&self) -> usize {
+        self.imported_len
     }
 
     /// Empty map.
@@ -572,15 +584,22 @@ impl PubkeyIndexMap {
 
     /// Fill from `state.validators`. Append-only and idempotent (S2-A-10).
     ///
-    /// Walks only `self.len()..validators_len()` so a second call after a
-    /// full fill is O(new). First-wins on a duplicate pubkey (same as
-    /// `get_validator_index_by_pubkey`'s registry scan). Never removes.
+    /// Walks only `self.imported_len()..validators_len()` so a second call
+    /// after a full fill is O(new). The cursor is not [`Self::len`]: a
+    /// duplicate pubkey or a scan insert from another registry must not skip
+    /// the unwalked tail, and a shorter sibling must not rewind it. First-wins
+    /// on a duplicate pubkey (same as `get_validator_index_by_pubkey`'s
+    /// registry scan). Never removes. A disagreed index is left for hit
+    /// revalidation; this does not rebuild the map.
     pub fn import_from_registry<P: crate::preset::Preset>(
         &mut self,
         state: &super::BeaconState<P>,
     ) {
-        let start = self.len();
         let len = state.validators_len();
+        let start = self.imported_len;
+        if start >= len {
+            return;
+        }
         for i in start..len {
             let Some(v) = state.validators_get(i) else {
                 continue;
@@ -589,6 +608,7 @@ impl PubkeyIndexMap {
                 .entry(v.pubkey)
                 .or_insert(ValidatorIndex::new(i as u64));
         }
+        self.imported_len = len;
     }
 }
 
