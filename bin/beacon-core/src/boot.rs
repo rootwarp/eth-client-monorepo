@@ -1,10 +1,12 @@
 //! Boot sequence ([ARCH] §4.2).
 //!
 //! ```text
-//! open redb  →  durable_set  →  seed_from_durable
-//!            |  empty: AnchorSource → verify_anchor → commit_anchor
-//!                     → seed_from_durable
-//!            →  start_writer + chain-core  →  serve
+//! load_or_create node key
+//!   → open (schema + config-digest; I-node-id pending)
+//!   → peek_node_id → pair (I-node-id; refuse aborts)
+//!   → durable_set → seed_from_durable
+//!        | empty: AnchorSource → verify_anchor → commit_anchor
+//!   → start_writer + chain-core → serve
 //! ```
 //!
 //! [`boot`] runs that sequence and returns. [`run`] is the only env-config
@@ -38,7 +40,10 @@ use cc_chain_core::seed::{
 use cc_chain_core::service::ChainServiceImpl;
 use cc_config::ServiceConfig;
 use cc_proto::chain::chain_service_server::ChainServiceServer;
-use cc_storage_core::{OpenOpts, OpenedStore, StorageMetrics, StorageRuntime, durable_set, open};
+use cc_storage_core::{
+    NodeIdExpectation, OpenOpts, OpenedStore, StorageMetrics, StorageRuntime, durable_set,
+    load_or_create_node_key, open,
+};
 use cc_types::config::ChainConfig as NetworkChainConfig;
 use cc_types::config::PresetName;
 use cc_types::preset::{Mainnet, Minimal, Preset};
@@ -66,8 +71,10 @@ const KNOWN_METHODS: &[&str] = &[
 /// Ordered boot phases. [`BootPhase::Open`] is always first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootPhase {
-    /// `storage_core::open` returned. No writer / core yet.
+    /// `storage_core::open` returned. `I-node-id` is still pending.
     Open,
+    /// `I-node-id` compared. Nothing starts between [`Open`](Self::Open) and this.
+    Pair,
     /// Durable set loaded (`None` = empty store).
     DurableSet,
     /// Single writer started.
@@ -133,10 +140,26 @@ pub fn boot_in_process(
     start_writer: bool,
 ) -> anyhow::Result<Booted> {
     let mut phases = Vec::new();
-    let opened = open_and_stamp(cfg)?;
-    phases.push(BootPhase::Open);
-
     let chain = bundled_hoodi_config()?;
+    let node_id = NodeIdExpectation::from_configured_path(cfg.node_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?;
+    let mut pending = open(
+        &cfg.data_dir,
+        OpenOpts {
+            durability: cfg.durability.clone(),
+            check_invariants: cfg.check_invariants,
+            snapshot_ring: cfg.snapshot_ring,
+            genesis_validators_root: cfg.genesis_validators_root.clone(),
+            node_id,
+            chain: Some(chain.clone()),
+            ..OpenOpts::default()
+        },
+    )?;
+    phases.push(BootPhase::Open);
+    let _peek = pending.peek_node_id()?;
+    let opened = pending.pair(node_id)?;
+    phases.push(BootPhase::Pair);
+
     let _durable = durable_set(&opened, &chain)?;
     phases.push(BootPhase::DurableSet);
 
@@ -331,24 +354,6 @@ impl BeaconCoreConfig {
     }
 }
 
-fn open_and_stamp(cfg: &BootConfig) -> anyhow::Result<OpenedStore> {
-    let opened = open(
-        &cfg.data_dir,
-        OpenOpts {
-            durability: cfg.durability.clone(),
-            check_invariants: cfg.check_invariants,
-            snapshot_ring: cfg.snapshot_ring,
-            genesis_validators_root: cfg.genesis_validators_root.clone(),
-            node_key_path: cfg.node_key_path.clone(),
-            ..OpenOpts::default()
-        },
-    )?;
-    if let Some(id) = opened.configured_node_id() {
-        opened.persist_anchor_node_id(id)?;
-    }
-    Ok(opened)
-}
-
 fn load_network(cfg: &BeaconCoreConfig) -> anyhow::Result<NetworkChainConfig> {
     if let Some(chain) = cfg.chain_config.clone() {
         return Ok(chain);
@@ -378,35 +383,6 @@ fn bundled_hoodi_config() -> anyhow::Result<NetworkChainConfig> {
             .map_err(|e2| anyhow::anyhow!("bundled hoodi-config.yaml: {e2}"))
         }
     }
-}
-
-/// Ensure the I-node-id key file exists (32 raw bytes, same surface as storage).
-fn ensure_node_key(path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
-    if path.exists() {
-        let bytes = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("node_key_path {}: {e}", path.display()))?;
-        if bytes.len() != 32 {
-            anyhow::bail!(
-                "node_key_path {} has length {}, expected 32",
-                path.display(),
-                bytes.len()
-            );
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        return Ok(arr);
-    }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("node_key_path parent {}: {e}", parent.display()))?;
-    }
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("node key generate: {e}"))?;
-    std::fs::write(path, bytes)
-        .map_err(|e| anyhow::anyhow!("node_key_path write {}: {e}", path.display()))?;
-    Ok(bytes)
 }
 
 fn map_da(status: cc_storage_core::DurableDaStatus) -> SeedDaStatus {
@@ -566,19 +542,26 @@ async fn boot_with_preset<P: Preset + 'static>(
         cc_engine_api::EngineApi::prepare_with_chain_config(&cfg.engine, network.clone())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Open redb before telemetry bind / writer / chain-core.
-    // I-node-id: key file is the 32-byte identity surface (ADR-P4-13).
-    let _node_key = ensure_node_key(&cfg.node_key_path)?;
-    let boot_cfg = BootConfig {
-        data_dir: cfg.data_dir.clone(),
-        durability: cfg.durability.clone(),
-        check_invariants: cfg.check_invariants,
-        snapshot_ring: cfg.snapshot_ring,
-        genesis_validators_root: cfg.genesis_validators_root.clone(),
-        node_key_path: Some(cfg.node_key_path.clone()),
-        writer_process_fatal: true,
-    };
-    let opened = open_and_stamp(&boot_cfg)?;
+    // Key first, then open. Schema and digest gates run inside open.
+    // I-node-id runs at pair, before telemetry, the writer, or chain-core.
+    // Pairing stays on the legacy root. The fingerprint is not compared.
+    let loaded = load_or_create_node_key(&cfg.node_key_path)?;
+    let _fingerprint = loaded.fingerprint();
+    let node_id = NodeIdExpectation::Present(loaded.legacy());
+    let mut pending = open(
+        &cfg.data_dir,
+        OpenOpts {
+            durability: cfg.durability.clone(),
+            check_invariants: cfg.check_invariants,
+            snapshot_ring: cfg.snapshot_ring,
+            genesis_validators_root: cfg.genesis_validators_root.clone(),
+            node_id,
+            chain: Some(network.clone()),
+            ..OpenOpts::default()
+        },
+    )?;
+    let _peek = pending.peek_node_id()?;
+    let opened = pending.pair(node_id)?;
     let mut durable = durable_set(&opened, &network)?;
 
     let mut bs = cc_bootstrap::init(SERVICE, TelemetrySettings::from(&cfg.service))?;

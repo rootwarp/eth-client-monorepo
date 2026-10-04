@@ -1,11 +1,7 @@
 //! p2p and the shared node-key crate agree on one key file.
 //!
-//! beacon-core still has its own `ensure_node_key` until J-02 and is not called
-//! here. A key beacon-core creates with `std::fs::write` is mode `0644` under a
-//! typical umask, which this crate refuses. J-02 is what points that call site
-//! at `cc-node-key`. Until then the shared contract is: the crate and p2p both
-//! refuse `0644`, both accept `0400`, and a key the crate creates is `0600`
-//! and loads through p2p.
+//! The crate and p2p both refuse `0644`, both accept `0400`, and a key the
+//! crate creates is `0600` and loads through p2p.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

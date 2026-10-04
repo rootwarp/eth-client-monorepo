@@ -1,8 +1,8 @@
 //! File contract for the shared node key.
 //!
-//! beacon-core still has its own `ensure_node_key` until J-02, so this test
-//! does not call that binary. The crate is the implementation both hosts will
-//! use. p2p calls it now. A `0644` key is refused; a stricter `0400` key is
+//! p2p and the composer wrapper (`load_or_create_node_key` in
+//! `crates/storage-core/src/boot.rs`) call this crate. The storage host's
+//! open path does not. A `0644` key is refused; a stricter `0400` key is
 //! accepted; a key this crate creates is mode `0600`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]

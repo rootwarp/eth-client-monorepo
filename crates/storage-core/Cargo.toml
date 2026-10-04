@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = ["grpc"]
 # Serve / boot host. Writer + ArchiveWrite stay proto-free (S2-A-14).
-grpc = ["dep:cc-proto", "dep:tonic", "dep:cc-bootstrap", "cc-seam/ipc"]
+grpc = ["dep:cc-proto", "dep:tonic", "dep:cc-bootstrap", "dep:cc-node-key", "cc-seam/ipc"]
 
 [dependencies]
 # S2-B-03: production host. No JWT signer / HTTP client ([ARCH] §6.2 — not grandfathered).
@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 cc-bootstrap = { workspace = true, optional = true }
 cc-seam = { path = "../seam", default-features = false }
 cc-config = { workspace = true }
+cc-node-key = { workspace = true, optional = true }
 cc-proto = { workspace = true, optional = true }
 cc-state-transition = { workspace = true }
 cc-store = { workspace = true }

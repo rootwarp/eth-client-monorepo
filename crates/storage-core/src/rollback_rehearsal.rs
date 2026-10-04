@@ -26,11 +26,10 @@ mod tests {
     use prometheus_client::registry::Registry;
     use tokio::sync::watch;
 
-    use crate::durable_set::{
-        load_expected_node_id_from_key_path, refuse_missing_key_if_anchor_present,
-    };
+    use crate::durable_set::refuse_missing_key_if_anchor_present;
     use crate::metrics::StorageMetrics;
-    use crate::open::{OpenOpts, open};
+    use crate::node_id::NodeIdExpectation;
+    use crate::open::{OpenOpts, OpenedStore, open};
     use crate::test_tmpdir::unique_temp_dir;
     use crate::writer::{
         CommitUnit, StagedBlock, WriterBounds, WriterFaults, load_write_cursor, spawn_writer,
@@ -47,16 +46,43 @@ mod tests {
         ConfigDigestInput::with_mainnet_scalars(chain, Root::ZERO)
     }
 
-    fn current_writer_opts(node_key: PathBuf) -> OpenOpts {
+    fn current_writer_opts(node_key: &Path) -> OpenOpts {
+        let node_id =
+            NodeIdExpectation::from_configured_path(Some(node_key)).expect("test node key");
         OpenOpts {
             durability: "immediate".to_owned(),
             check_invariants: true,
             snapshot_ring: 4,
             max_open_scan_rows: cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS,
             genesis_validators_root: None,
-            node_key_path: Some(node_key),
+            node_id,
             chain: None,
         }
+    }
+
+    fn open_paired(dir: &Path, opts: OpenOpts) -> anyhow::Result<OpenedStore> {
+        let expectation = opts.node_id;
+        let mut pending = open(dir, opts)?;
+        let _ = pending.peek_node_id()?;
+        pending.pair(expectation)
+    }
+
+    /// Raw 32-byte read used by the `e854b1d` opener. Not the current API.
+    fn legacy_bytes(node_key: &Path) -> Result<Option<Root>, String> {
+        if !node_key.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(node_key).map_err(|e| e.to_string())?;
+        if bytes.len() != 32 {
+            return Err(format!(
+                "node key at {} has length {}, expected 32",
+                node_key.display(),
+                bytes.len()
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(Some(Root::from_array(arr)))
     }
 
     /// `e854b1d` `crates/storage-core/src/boot.rs` `open_store`:
@@ -64,7 +90,7 @@ mod tests {
     fn previous_topology_open(data_dir: &Path, node_key: &Path) -> Result<Store, String> {
         let durability = Durability::parse("immediate").map_err(|e| e.to_string())?;
         let digest_input = hoodi_digest_input();
-        let expected_node_id = load_expected_node_id_from_key_path(Some(node_key))?;
+        let expected_node_id = legacy_bytes(node_key)?;
         let opts = StoreOpenOptions::from_config(
             EngineOptions::default().with_durability(durability),
             &digest_input,
@@ -75,7 +101,15 @@ mod tests {
         .with_max_open_scan_rows(cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS)
         .with_expected_node_id(expected_node_id);
         let store = Store::open(data_dir, opts).map_err(|e| e.to_string())?;
-        refuse_missing_key_if_anchor_present(store.engine(), Some(node_key))?;
+        let expectation = if node_key.exists() {
+            match expected_node_id {
+                Some(root) => NodeIdExpectation::Present(root),
+                None => NodeIdExpectation::Unset,
+            }
+        } else {
+            NodeIdExpectation::ConfiguredButMissing
+        };
+        refuse_missing_key_if_anchor_present(store.engine(), expectation)?;
         Ok(store)
     }
 
@@ -154,7 +188,7 @@ mod tests {
         std::fs::write(&key_path, node_id.as_slice()).unwrap();
 
         let opened =
-            open(&dir, current_writer_opts(key_path.clone())).expect("current Store::open");
+            open_paired(&dir, current_writer_opts(&key_path)).expect("current Store::open");
         opened.persist_anchor_node_id(node_id).unwrap();
 
         let engine = Arc::new(opened.into_engine());
@@ -258,7 +292,7 @@ mod tests {
         // The rollback binary opened above. This binary must not: the store holds
         // a block and has no side keys, so legacy `config_digest` equality is not
         // an open. No GVR was configured, and that is not `Root::ZERO`.
-        let err = open(&dir, current_writer_opts(key_path))
+        let err = open_paired(&dir, current_writer_opts(&key_path))
             .expect_err("populated store must not open on the legacy constant");
         let msg = err.to_string();
         assert!(
@@ -292,12 +326,12 @@ mod tests {
         let node_id = Root::from_array([0x51u8; 32]);
         std::fs::write(&key_path, node_id.as_slice()).unwrap();
 
-        let mut opts = current_writer_opts(key_path.clone());
+        let mut opts = current_writer_opts(&key_path);
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../crates/types/tests/fixtures/hoodi-config.yaml");
         opts.chain = Some(ChainConfig::from_yaml_file(&fixture).unwrap());
         opts.genesis_validators_root = Some(format!("0x{}", "ab".repeat(32)));
-        let opened = open(&dir, opts).expect("current open stamps side keys");
+        let opened = open_paired(&dir, opts).expect("current open stamps side keys");
         opened.persist_anchor_node_id(node_id).unwrap();
         {
             let rt = opened.engine().read().unwrap();

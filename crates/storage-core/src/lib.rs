@@ -28,6 +28,7 @@ mod durable_set;
 mod history;
 mod metrics;
 mod migrate;
+mod node_id;
 mod open;
 mod prune;
 mod replay;
@@ -42,11 +43,12 @@ mod writer;
 
 pub use archive_write::{ArchiveWriter, ServedCanonicalBlock};
 #[cfg(feature = "grpc")]
-pub use boot::run;
+pub use boot::{LoadedNodeKey, load_or_create_node_key, run};
 pub use durable_set::{DurableBlock, DurableDaStatus};
 pub use metrics::StorageMetrics;
+pub use node_id::{NodeIdExpectation, NodeIdScheme};
 pub use open::{
-    CursorSnap, DurableFrontier, DurableSet, OpenOpts, OpenedStore, StorageRuntime,
+    CursorSnap, DurableFrontier, DurableSet, OpenOpts, OpenedStore, PendingStore, StorageRuntime,
     durable_frontier, durable_set, open, reopen_durable_frontier, start_writer,
     start_writer_from_store,
 };

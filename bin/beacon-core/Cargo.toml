@@ -31,7 +31,6 @@ cc-proto = { workspace = true }
 cc-seam = { workspace = true }
 cc-storage-core = { workspace = true }
 cc-types = { workspace = true }
-getrandom = { workspace = true }
 prometheus-client = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }

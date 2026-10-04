@@ -1,10 +1,12 @@
 //! Public store open + durable-set load ([ARCH] §4.2 / S2-J-01).
 //!
-//! `bin/beacon-core` calls [`open`] **before** any subsystem starts. Fail-closed
-//! gates (schema / digest / `I-node-id`) are unchanged from the storage host.
+//! `bin/beacon-core` calls [`open`] **before** any subsystem starts. Schema and
+//! config-digest gates run here. A [`NodeIdExpectation::Present`] mismatch is
+//! refused here, before side-key writes. [`PendingStore::pair`] stamps a legacy
+//! id that was absent or already equal.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use cc_store::blocks::{get_block_by_root, get_state_root};
@@ -25,22 +27,22 @@ use tokio::sync::watch;
 
 use crate::archive_write::ArchiveWriter;
 use crate::durable_set::{
-    DurableDaStatus, DurableSetContext, load_expected_node_id_from_key_path,
-    refuse_missing_key_if_anchor_present,
+    DurableDaStatus, DurableSetContext, refuse_missing_key_if_anchor_present,
 };
 use crate::metrics::StorageMetrics;
+use crate::node_id::{NodeIdExpectation, NodeIdScheme};
 use crate::resume::{self, ResumeError};
 use crate::writer::{WriterBounds, WriterFaults, WriterHandle, spawn_writer};
 
 /// Options for [`open`]. Fail-closed gates match the storage host.
 ///
-/// [`Debug`] is hand-written. This struct holds the key path, not the key
-/// bytes; `expected_node_id` lives on [`OpenedStore`] and is redacted there.
+/// [`Debug`] is hand-written. [`OpenOpts::node_id`] redacts a present root.
 #[derive(Clone)]
 pub struct OpenOpts {
     /// Engine durability token (`immediate` | `paranoid`).
     pub durability: String,
-    /// Run §2.7 invariants at open (includes `I-node-id` when a node key is set).
+    /// Run §2.7 invariants at open. A Present `I-node-id` mismatch is refused in
+    /// [`open`]; [`PendingStore::pair`] stamps an id that was absent or already equal.
     pub check_invariants: bool,
     /// Snapshot ring depth for `I-ring`.
     pub snapshot_ring: u64,
@@ -50,13 +52,14 @@ pub struct OpenOpts {
     ///
     /// Absent is not [`Root::ZERO`]. A populated store without this value is refused.
     pub genesis_validators_root: Option<String>,
-    /// Path to the 32-byte p2p node key (`I-node-id`).
-    pub node_key_path: Option<PathBuf>,
-    /// Running network for the identity and schedule digests.
+    /// Legacy node-id expectation. Compared in [`PendingStore::pair`], not here.
+    pub node_id: NodeIdExpectation,
+    /// Running network for the identity and schedule digests, and for
+    /// `seconds_per_slot` on the writer deadline.
     ///
-    /// `None` is not a fixture fallback. The caller has not supplied a network
-    /// (beacon-core threads its loaded network separately). `meta.config_digest`
-    /// stays [`legacy_config_digest`] either way.
+    /// `None` is not a fixture fallback. `meta.config_digest` stays
+    /// [`legacy_config_digest`] either way. The commit deadline is
+    /// `2 * chain.seconds_per_slot` only when this is `Some`.
     pub chain: Option<ChainConfig>,
 }
 
@@ -68,7 +71,7 @@ impl fmt::Debug for OpenOpts {
             .field("snapshot_ring", &self.snapshot_ring)
             .field("max_open_scan_rows", &self.max_open_scan_rows)
             .field("genesis_validators_root", &self.genesis_validators_root)
-            .field("node_key_path", &self.node_key_path)
+            .field("node_id", &self.node_id)
             .field(
                 "chain",
                 &self.chain.as_ref().map(|chain| chain.config_name.as_str()),
@@ -85,7 +88,7 @@ impl Default for OpenOpts {
             snapshot_ring: 4,
             max_open_scan_rows: cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS,
             genesis_validators_root: None,
-            node_key_path: None,
+            node_id: NodeIdExpectation::Unset,
             chain: None,
         }
     }
@@ -96,7 +99,6 @@ impl Default for OpenOpts {
 /// [`Debug`] is hand-written: `expected_node_id` is the raw node key.
 pub struct OpenedStore {
     store: Store,
-    node_key_path: Option<PathBuf>,
     snapshot_ring: u64,
     max_open_scan_rows: u64,
     expected_node_id: Option<Root>,
@@ -104,13 +106,10 @@ pub struct OpenedStore {
     identity_digest: Option<Root>,
     /// Schedule digest of [`OpenOpts::chain`], when a network was supplied.
     schedule_digest: Option<Root>,
-    /// Slot length of [`OpenOpts::chain`], else the mainnet-shaped default.
+    /// Slot length of [`OpenOpts::chain`], else [`crate::prune::DEFAULT_SECONDS_PER_SLOT`].
     ///
     /// When a chain is supplied the commit deadline is `2 * seconds_per_slot`.
-    /// `None` uses [`crate::prune::DEFAULT_SECONDS_PER_SLOT`] (12). That
-    /// matches Hoodi and mainnet and is wrong for any other slot duration
-    /// until the loaded network is passed into [`open`]. Beacon-core still
-    /// opens with `chain: None`; this change does not pass `ChainConfig`.
+    /// Do not hardcode the slot length: Hoodi and mainnet happen to be 12.
     seconds_per_slot: u64,
 }
 
@@ -118,7 +117,6 @@ impl fmt::Debug for OpenedStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenedStore")
             .field("store", &self.store)
-            .field("node_key_path", &self.node_key_path)
             .field("snapshot_ring", &self.snapshot_ring)
             .field("max_open_scan_rows", &self.max_open_scan_rows)
             .field(
@@ -151,7 +149,7 @@ impl OpenedStore {
         self.store.into_engine()
     }
 
-    /// Node id loaded from `node_key_path` at [`open`], if any.
+    /// Legacy root passed to [`PendingStore::pair`], if it was [`NodeIdExpectation::Present`].
     #[must_use]
     pub fn configured_node_id(&self) -> Option<Root> {
         self.expected_node_id
@@ -218,6 +216,94 @@ impl OpenedStore {
         engine
             .commit(batch)
             .map_err(|e| anyhow::anyhow!("persist node_id: {e}"))
+    }
+}
+
+/// Store whose schema and config-digest gates have passed.
+///
+/// A [`NodeIdExpectation::Present`] mismatch never produces this handle.
+/// [`PendingStore::pair`] stamps an id that is absent or already equal.
+/// [`start_writer`] takes [`OpenedStore`], so this handle cannot start a writer.
+/// Dropping it without [`PendingStore::pair`] is a debug assertion.
+#[must_use = "call pair() before starting a subsystem"]
+pub struct PendingStore {
+    inner: Option<PendingInner>,
+    paired: bool,
+}
+
+struct PendingInner {
+    store: Store,
+    snapshot_ring: u64,
+    max_open_scan_rows: u64,
+    identity_digest: Option<Root>,
+    schedule_digest: Option<Root>,
+    seconds_per_slot: u64,
+}
+
+impl fmt::Debug for PendingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingStore")
+            .field("paired", &self.paired)
+            .field("open", &self.inner.is_some())
+            .finish()
+    }
+}
+
+impl PendingStore {
+    /// Read-only identity. `None` is an unstamped store. No scheme row means
+    /// [`NodeIdScheme::Legacy`]. Does not write.
+    pub fn peek_node_id(&mut self) -> anyhow::Result<Option<(Root, NodeIdScheme)>> {
+        let Some(inner) = self.inner.as_ref() else {
+            self.paired = true;
+            anyhow::bail!("pending store already consumed");
+        };
+        match read_stored_node_id(inner.store.engine()) {
+            Ok(Some(root)) => Ok(Some((root, NodeIdScheme::Legacy))),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                // A read error must not become a drop assertion on `?`.
+                self.paired = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Run `I-node-id` against the legacy root and, on [`NodeIdExpectation::Present`],
+    /// stamp `meta.node_id` when the stored id matches or is absent.
+    ///
+    /// A mismatch does not write. The compare is not gated on `check_invariants`.
+    /// [`NodeIdExpectation::Unset`] and [`NodeIdExpectation::ConfiguredButMissing`]
+    /// do not stamp. The fingerprint is not compared.
+    pub fn pair(mut self, expected: NodeIdExpectation) -> anyhow::Result<OpenedStore> {
+        self.paired = true;
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("pending store already consumed"))?;
+        // `open` already refused a Present mismatch. Repeat the compare so a
+        // different id passed only to `pair` cannot stamp.
+        refuse_legacy_node_id_mismatch(inner.store.engine(), expected)?;
+        let opened = OpenedStore {
+            store: inner.store,
+            snapshot_ring: inner.snapshot_ring,
+            max_open_scan_rows: inner.max_open_scan_rows,
+            expected_node_id: expected.legacy_root(),
+            identity_digest: inner.identity_digest,
+            schedule_digest: inner.schedule_digest,
+            seconds_per_slot: inner.seconds_per_slot,
+        };
+        if let Some(id) = expected.legacy_root() {
+            opened.persist_anchor_node_id(id)?;
+        }
+        Ok(opened)
+    }
+}
+
+impl Drop for PendingStore {
+    fn drop(&mut self) {
+        // Release the redb lock before the assertion can panic.
+        self.inner.take();
+        debug_assert!(self.paired, "pending store dropped without pair()");
     }
 }
 
@@ -414,21 +500,19 @@ fn root_bytes(root: &cc_types::Root) -> [u8; 32] {
     out
 }
 
-/// Open (or create) the store. Fail-closed gates run here, before any subsystem.
-pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<OpenedStore> {
+/// Open (or create) the store. Schema and config-digest gates run here.
+///
+/// A [`NodeIdExpectation::Present`] mismatch is refused before side-key writes.
+/// [`StoreOpenOptions::with_expected_node_id`] stays `None`: the store layer
+/// does not own this compare. [`PendingStore::pair`] is still mandatory and
+/// stamps a legacy id that was absent or already equal.
+pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<PendingStore> {
     let data_dir = data_dir.as_ref();
     let durability =
         Durability::parse(&opts.durability).map_err(|e| anyhow::anyhow!("durability: {e}"))?;
     // Absent GVR stays absent. Root::ZERO is the legacy constant's input, not a substitute.
     let gvr = parse_gvr(opts.genesis_validators_root.as_deref())?;
-    let expected_node_id = load_expected_node_id_from_key_path(opts.node_key_path.as_deref())
-        .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?;
-    if expected_node_id.is_some() {
-        tracing::info!(
-            path = ?opts.node_key_path,
-            "I-node-id node key loaded from node_key_path"
-        );
-    }
+    tracing::debug!(node_id = ?opts.node_id, "store open");
     // The on-disk legacy key stays the constant so a pre-fold binary still opens.
     // The running network is digested separately and is not written under that key.
     let store_opts = StoreOpenOptions::with_digest(
@@ -438,12 +522,16 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
     .with_check_invariants(opts.check_invariants)
     .with_snapshot_ring(opts.snapshot_ring.max(1))
     .with_max_open_scan_rows(opts.max_open_scan_rows.max(1))
-    .with_expected_node_id(expected_node_id);
+    .with_expected_node_id(None);
     let store =
         Store::open(data_dir, store_opts).map_err(|e| anyhow::anyhow!("store open: {e}"))?;
-    refuse_missing_key_if_anchor_present(store.engine(), opts.node_key_path.as_deref())
+    refuse_missing_key_if_anchor_present(store.engine(), opts.node_id)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // ADR-R-11. This runs inside `open`, before `start_writer` or any subsystem.
+    // Side keys are one-shot. Refuse a different legacy id before any of them
+    // are written, including when `check_invariants` is false. A matching or
+    // absent id still hits the digest gates below, so a wrong network is
+    // refused before pair can stamp node_id.
+    refuse_legacy_node_id_mismatch(store.engine(), opts.node_id)?;
     let anchor_gvr = anchor_genesis_validators_root(store.engine(), opts.chain.as_ref(), gvr)
         .map_err(|e| anyhow::anyhow!("store open: {e}"))?;
     reconcile_config_side_keys(store.engine(), opts.chain.as_ref(), gvr, anchor_gvr)
@@ -476,16 +564,63 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
         .as_ref()
         .map(|chain| chain.seconds_per_slot.max(1))
         .unwrap_or(crate::prune::DEFAULT_SECONDS_PER_SLOT.max(1));
-    Ok(OpenedStore {
-        store,
-        node_key_path: opts.node_key_path,
-        snapshot_ring: opts.snapshot_ring.max(1),
-        max_open_scan_rows: opts.max_open_scan_rows.max(1),
-        expected_node_id,
-        identity_digest,
-        schedule_digest,
-        seconds_per_slot,
+    Ok(PendingStore {
+        paired: false,
+        inner: Some(PendingInner {
+            store,
+            snapshot_ring: opts.snapshot_ring.max(1),
+            max_open_scan_rows: opts.max_open_scan_rows.max(1),
+            identity_digest,
+            schedule_digest,
+            seconds_per_slot,
+        }),
     })
+}
+
+/// `Present` versus the stored legacy id. Absent, or equal, is not a refusal.
+/// Not gated on `check_invariants`. Does not write.
+fn refuse_legacy_node_id_mismatch(
+    engine: &Engine,
+    expected: NodeIdExpectation,
+) -> anyhow::Result<()> {
+    let Some(want) = expected.legacy_root() else {
+        return Ok(());
+    };
+    if let Some(found) = read_stored_node_id(engine)?
+        && found != want
+    {
+        anyhow::bail!(
+            "I-node-id (crates/store/src/invariants.rs): \
+             stored node_id <redacted> does not match the configured node key"
+        );
+    }
+    Ok(())
+}
+
+/// `meta.node_id`, else `AnchorInfo.node_id`. Same preference as `I-node-id`.
+fn read_stored_node_id(engine: &Engine) -> anyhow::Result<Option<Root>> {
+    use cc_store::SszDecode;
+    use cc_store::meta::{AnchorInfo, KEY_ANCHOR_INFO, KEY_NODE_ID, TABLE_META};
+    let rt = engine
+        .read()
+        .map_err(|e| anyhow::anyhow!("read identity: {e}"))?;
+    if let Some(bytes) = rt
+        .get(TABLE_META, KEY_NODE_ID.as_bytes())
+        .map_err(|e| anyhow::anyhow!("read node_id: {e}"))?
+    {
+        let id =
+            Root::from_ssz_bytes(&bytes).map_err(|e| anyhow::anyhow!("node_id decode: {e:?}"))?;
+        return Ok(Some(id));
+    }
+    if let Some(bytes) = rt
+        .get(TABLE_META, KEY_ANCHOR_INFO.as_bytes())
+        .map_err(|e| anyhow::anyhow!("read AnchorInfo: {e}"))?
+    {
+        let anchor = AnchorInfo::from_ssz_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("AnchorInfo decode: {e:?}"))?;
+        return Ok(Some(anchor.node_id));
+    }
+    Ok(None)
 }
 
 /// Load the durable set from an already-opened store. `None` = empty (checkpoint).
@@ -496,7 +631,8 @@ pub fn durable_set(db: &OpenedStore, chain: &ChainConfig) -> anyhow::Result<Opti
     }
     let ctx = DurableSetContext {
         expected_node_id: db.expected_node_id,
-        node_key_path: db.node_key_path.clone(),
+        // Missing-key refusal already ran in `open`. The path is not retained.
+        node_key_path: None,
         enr_seq_path: None,
         snapshot_ring: db.snapshot_ring,
         max_open_scan_rows: db.max_open_scan_rows,
@@ -518,7 +654,7 @@ pub fn durable_set(db: &OpenedStore, chain: &ChainConfig) -> anyhow::Result<Opti
     }))
 }
 
-/// Start the **one** writer against the opened handle. Call only after [`open`].
+/// Start the **one** writer against the paired handle. Call only after [`PendingStore::pair`].
 pub fn start_writer(
     db: OpenedStore,
     metrics: StorageMetrics,
@@ -632,20 +768,123 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use std::path::PathBuf;
+
     use crate::test_tmpdir::unique_temp_dir;
     use cc_store::schedule_side_key_bytes;
     use prometheus_client::registry::Registry;
 
-    fn test_opts(node_key: Option<PathBuf>) -> OpenOpts {
+    /// Tests pair immediately. Call [`super::open`] to hold the pending handle.
+    fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<OpenedStore> {
+        let expectation = opts.node_id;
+        let mut pending = super::open(data_dir, opts)?;
+        let _ = pending.peek_node_id()?;
+        pending.pair(expectation)
+    }
+
+    fn test_opts(node_id: NodeIdExpectation) -> OpenOpts {
         OpenOpts {
             durability: "immediate".to_owned(),
             check_invariants: true,
             snapshot_ring: 4,
             max_open_scan_rows: cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS,
             genesis_validators_root: None,
-            node_key_path: node_key,
+            node_id,
             chain: None,
         }
+    }
+
+    #[test]
+    fn peek_reads_legacy_stamp_without_writing_again() {
+        let dir = unique_temp_dir("pending-peek");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = Root::from_array([0x11; 32]);
+        let mut pending = super::open(&dir, test_opts(NodeIdExpectation::Present(id))).unwrap();
+        assert_eq!(pending.peek_node_id().unwrap(), None);
+        drop(pending.pair(NodeIdExpectation::Present(id)).unwrap());
+
+        let mut pending = super::open(&dir, test_opts(NodeIdExpectation::Present(id))).unwrap();
+        assert_eq!(
+            pending.peek_node_id().unwrap(),
+            Some((id, NodeIdScheme::Legacy))
+        );
+        drop(pending.pair(NodeIdExpectation::Present(id)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_a_pending_store_without_pair_is_a_debug_failure() {
+        let dir = unique_temp_dir("pending-drop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pending = super::open(&dir, test_opts(NodeIdExpectation::Unset)).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(pending)));
+        if cfg!(debug_assertions) {
+            assert!(result.is_err(), "debug drop without pair must assert");
+        } else {
+            assert!(result.is_ok(), "release drop without pair must not assert");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seconds_per_slot_follows_the_supplied_chain() {
+        let dir = unique_temp_dir("slot-len");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut chain = fixture_chain("hoodi-config.yaml");
+        chain.seconds_per_slot = 6;
+        let mut opts = test_opts(NodeIdExpectation::Unset);
+        opts.chain = Some(chain);
+        let opened = open(&dir, opts).unwrap();
+        assert_eq!(opened.seconds_per_slot, 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// History-less store, legacy id already stamped, no side keys. A different
+    /// `Present` id must refuse before `stamp_empty` writes them. The compare
+    /// is not gated on `check_invariants`.
+    #[test]
+    fn present_mismatch_on_historyless_store_writes_no_side_keys() {
+        use cc_store::SszDecode;
+        use cc_store::meta::{KEY_NODE_ID, TABLE_META};
+
+        let dir = unique_temp_dir("node-id-before-side-keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stored = Root::from_array([0x11; 32]);
+        let opened = open(&dir, test_opts(NodeIdExpectation::Present(stored))).unwrap();
+        drop(opened);
+        assert!(meta_is_absent(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2));
+        assert!(meta_is_absent(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST));
+
+        let mut opts = test_opts(NodeIdExpectation::Present(Root::from_array([0x22; 32])));
+        opts.check_invariants = false;
+        opts.chain = Some(fixture_chain("hoodi-config.yaml"));
+        opts.genesis_validators_root = Some(gvr_hex(0x44));
+        let err = open(&dir, opts).expect_err("node-id mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("node_id") || msg.contains("I-node-id"),
+            "{msg}"
+        );
+        assert!(
+            meta_is_absent(&dir, cc_store::meta::KEY_CONFIG_DIGEST_V2),
+            "config_digest_v2 must stay absent"
+        );
+        assert!(
+            meta_is_absent(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            "schedule side key must stay absent"
+        );
+        let engine =
+            cc_store::engine::Engine::open(&dir, cc_store::engine::EngineOptions::default())
+                .unwrap();
+        let rt = engine.read().unwrap();
+        let id = Root::from_ssz_bytes(
+            &rt.get(TABLE_META, KEY_NODE_ID.as_bytes())
+                .unwrap()
+                .expect("stored node id"),
+        )
+        .unwrap();
+        assert_eq!(id, stored);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -656,13 +895,17 @@ mod tests {
         let id_a = Root::from_array([0xAAu8; 32]);
         std::fs::write(&key_a, id_a.as_slice()).unwrap();
 
-        let opened = open(&dir, test_opts(Some(key_a.clone()))).expect("first open");
+        let opened = open(&dir, test_opts(NodeIdExpectation::Present(id_a))).expect("first open");
         opened.persist_anchor_node_id(id_a).unwrap();
         drop(opened);
 
         let key_b = dir.join("node_key_b");
         std::fs::write(&key_b, [0xBBu8; 32]).unwrap();
-        let err = open(&dir, test_opts(Some(key_b))).expect_err("I-node-id must refuse");
+        let err = open(
+            &dir,
+            test_opts(NodeIdExpectation::Present(Root::from_array([0xBBu8; 32]))),
+        )
+        .expect_err("I-node-id must refuse");
         let msg = err.to_string();
         assert!(
             msg.contains("node_id") || msg.contains("I-node-id"),
@@ -675,8 +918,9 @@ mod tests {
     fn open_holds_exclusive_handle() {
         let dir = unique_temp_dir("s2-j-01-excl");
         std::fs::create_dir_all(&dir).unwrap();
-        let first = open(&dir, test_opts(None)).expect("first open");
-        let err = open(&dir, test_opts(None)).expect_err("second live open must fail");
+        let first = open(&dir, test_opts(NodeIdExpectation::Unset)).expect("first open");
+        let err = open(&dir, test_opts(NodeIdExpectation::Unset))
+            .expect_err("second live open must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("locked") || msg.contains("Database"),
@@ -690,7 +934,7 @@ mod tests {
     async fn start_writer_is_one_handle() {
         let dir = unique_temp_dir("s2-j-01-writer");
         std::fs::create_dir_all(&dir).unwrap();
-        let opened = open(&dir, test_opts(None)).unwrap();
+        let opened = open(&dir, test_opts(NodeIdExpectation::Unset)).unwrap();
         let mut registry = Registry::default();
         let metrics = StorageMetrics::register(&mut registry);
         let rt = start_writer(opened, metrics, false);
@@ -732,7 +976,7 @@ mod tests {
         let id_a = Root::from_array([0xAAu8; 32]);
         std::fs::write(&key_a, id_a.as_slice()).unwrap();
 
-        let opened = open(&dir, test_opts(Some(key_a.clone()))).expect("first open");
+        let opened = open(&dir, test_opts(NodeIdExpectation::Present(id_a))).expect("first open");
         put_canonical_slot(&opened, 100, 0x10);
         put_canonical_slot(&opened, 110, 0x11);
         {
@@ -766,7 +1010,7 @@ mod tests {
 
         // Host open refuses: the store holds canonical rows and no GVR.
         // The store layer still opens, so the refusal is not I-contig.
-        let err = open(&dir, test_opts(Some(key_a.clone())))
+        let err = open(&dir, test_opts(NodeIdExpectation::Present(id_a)))
             .expect_err("populated store must not open on the legacy constant");
         assert!(
             err.to_string().contains("genesis_validators_root"),
@@ -786,14 +1030,25 @@ mod tests {
         .expect("I-contig stays vacuous on gappy canonical");
         drop(direct);
 
-        let key_b = dir.join("node_key_b");
-        std::fs::write(&key_b, [0xBBu8; 32]).unwrap();
-        let err = open(&dir, test_opts(Some(key_b))).expect_err("I-node-id must refuse");
-        let msg = err.to_string();
+        let other = Root::from_array([0xBBu8; 32]);
+        let err = open(&dir, test_opts(NodeIdExpectation::Present(other)))
+            .expect_err("a different node id is refused before side-key writes");
         assert!(
-            msg.contains("node_id") || msg.contains("I-node-id"),
-            "second identity must fail I-node-id, got: {msg}"
+            err.to_string().contains("node_id") || err.to_string().contains("I-node-id"),
+            "Present mismatch is refused before the digest gate: {err}"
         );
+        {
+            use cc_store::engine::{Engine, EngineOptions};
+            let engine = Engine::open(&dir, EngineOptions::default()).unwrap();
+            let rt = engine.read().unwrap();
+            let stored = Root::from_ssz_bytes(
+                &rt.get(TABLE_META, KEY_NODE_ID.as_bytes())
+                    .unwrap()
+                    .expect("stamp wrote node_id"),
+            )
+            .unwrap();
+            assert_eq!(stored, id_a, "digest refusal must not rewrite node_id");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -808,7 +1063,7 @@ mod tests {
         let id_a = Root::from_array([0xAAu8; 32]);
         std::fs::write(&key_a, id_a.as_slice()).unwrap();
 
-        let opened = open(&dir, test_opts(Some(key_a.clone()))).expect("first open");
+        let opened = open(&dir, test_opts(NodeIdExpectation::Present(id_a))).expect("first open");
         put_canonical_slot(&opened, 1_000_000, 0xCC);
         opened.persist_anchor_node_id(id_a).unwrap();
         {
@@ -822,7 +1077,7 @@ mod tests {
         }
         drop(opened);
 
-        let err = open(&dir, test_opts(Some(key_a.clone())))
+        let err = open(&dir, test_opts(NodeIdExpectation::Present(id_a)))
             .expect_err("populated store must not open on the legacy constant");
         assert!(
             err.to_string().contains("genesis_validators_root"),
@@ -842,13 +1097,12 @@ mod tests {
         .expect("restart at the store layer must not plant slot 0 / fail I-contig");
         drop(direct);
 
-        let key_b = dir.join("node_key_b");
-        std::fs::write(&key_b, [0xBBu8; 32]).unwrap();
-        let err = open(&dir, test_opts(Some(key_b))).expect_err("I-node-id must refuse");
-        let msg = err.to_string();
+        let other = Root::from_array([0xBBu8; 32]);
+        let err = open(&dir, test_opts(NodeIdExpectation::Present(other)))
+            .expect_err("a different node id is refused before side-key writes");
         assert!(
-            msg.contains("node_id") || msg.contains("I-node-id"),
-            "second identity must fail I-node-id, got: {msg}"
+            err.to_string().contains("node_id") || err.to_string().contains("I-node-id"),
+            "Present mismatch is refused before the digest gate: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -885,7 +1139,7 @@ mod tests {
         let configured = Root::from_array(secret_b);
         std::fs::write(&key_a, secret_a).unwrap();
 
-        let opened = open(&dir, test_opts(Some(key_a))).expect("first open");
+        let opened = open(&dir, test_opts(NodeIdExpectation::Present(stored))).expect("first open");
         opened
             .persist_anchor_node_id(stored)
             .expect("stamp secret-bearing meta.node_id");
@@ -905,7 +1159,7 @@ mod tests {
 
         let key_b = dir.join("node_key_b");
         std::fs::write(&key_b, secret_b).unwrap();
-        let err = open(&dir, test_opts(Some(key_b)))
+        let err = open(&dir, test_opts(NodeIdExpectation::Present(configured)))
             .expect_err("existing secret-bearing meta.node_id must refuse, not be ignored");
         let chain = format!("{err:#}");
         assert!(
@@ -945,7 +1199,7 @@ mod tests {
 
         let dir = unique_temp_dir("s2r-anchor-node-id-redact");
         std::fs::create_dir_all(&dir).unwrap();
-        let opened = open(&dir, test_opts(None)).expect("open");
+        let opened = open(&dir, test_opts(NodeIdExpectation::Unset)).expect("open");
         let stored = Root::from_array([0xDDu8; 32]);
         let anchor = AnchorInfo {
             anchor_slot: Slot::new(1),
@@ -978,9 +1232,8 @@ mod tests {
         );
     }
 
-    /// `{:?}` of every type that can carry `expected_node_id` prints `<redacted>`,
-    /// not the 32 key bytes. `OpenOpts` has no such field; its hand-written
-    /// `Debug` must still not grow a hex dump of a key path's contents.
+    /// `{:?}` of every type that can carry a node id prints `<redacted>`,
+    /// not the 32 key bytes.
     #[test]
     fn debug_redacts_expected_node_id() {
         use crate::durable_set::DurableSetContext;
@@ -992,7 +1245,7 @@ mod tests {
         let secret = [0xCCu8; 32];
         let root = Root::from_array(secret);
         std::fs::write(&key, secret).unwrap();
-        let opts = test_opts(Some(key.clone()));
+        let opts = test_opts(NodeIdExpectation::Present(root));
         let opened = open(&dir, opts.clone()).expect("open");
 
         let opened_dbg = format!("{opened:?}");
@@ -1036,8 +1289,10 @@ mod tests {
 
         let opts_dbg = format!("{opts:?}");
         assert!(
-            opts_dbg.contains("OpenOpts") && opts_dbg.contains("node_key_path"),
-            "OpenOpts Debug must stay hand-written and name the path: {opts_dbg}"
+            opts_dbg.contains("OpenOpts")
+                && opts_dbg.contains("node_id")
+                && opts_dbg.contains("<redacted>"),
+            "OpenOpts Debug must redact a present node id: {opts_dbg}"
         );
         assert!(
             !opts_dbg.contains(&root.to_string()) && !contains_32_byte_hex(&opts_dbg),
@@ -1092,10 +1347,10 @@ mod tests {
         std::fs::create_dir_all(&hoodi_dir).unwrap();
         std::fs::create_dir_all(&mainnet_dir).unwrap();
 
-        let mut hoodi_opts = test_opts(None);
+        let mut hoodi_opts = test_opts(NodeIdExpectation::Unset);
         hoodi_opts.chain = Some(fixture_chain("hoodi-config.yaml"));
         hoodi_opts.genesis_validators_root = Some(gvr.clone());
-        let mut mainnet_opts = test_opts(None);
+        let mut mainnet_opts = test_opts(NodeIdExpectation::Unset);
         mainnet_opts.chain = Some(fixture_chain("mainnet-config.yaml"));
         mainnet_opts.genesis_validators_root = Some(gvr);
 
@@ -1124,7 +1379,7 @@ mod tests {
     fn populated_store_without_gvr_is_refused() {
         let dir = unique_temp_dir("populated-no-gvr");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut opts = test_opts(None);
+        let mut opts = test_opts(NodeIdExpectation::Unset);
         opts.check_invariants = false;
         let opened = open(&dir, opts.clone()).expect("empty open");
         {
@@ -1154,7 +1409,7 @@ mod tests {
     fn populated_store_reopens_on_matching_side_keys_not_the_legacy_constant() {
         let dir = unique_temp_dir("populated-with-gvr");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut opts = test_opts(None);
+        let mut opts = test_opts(NodeIdExpectation::Unset);
         opts.check_invariants = false;
         opts.chain = Some(fixture_chain("hoodi-config.yaml"));
         opts.genesis_validators_root = Some(gvr_hex(0xab));
@@ -1197,7 +1452,7 @@ mod tests {
 
         let dir = unique_temp_dir("side-key-empty");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut opts = test_opts(None);
+        let mut opts = test_opts(NodeIdExpectation::Unset);
         opts.check_invariants = false;
         let chain = fixture_chain("hoodi-config.yaml");
         let gvr = gvr_hex(0x11);
@@ -1329,6 +1584,49 @@ mod tests {
         let (dir, mut opts) = stamped_populated("id-churn", chain, &gvr, None);
         opts.chain.as_mut().unwrap().churn_limit_quotient = 1;
         open(&dir, opts).expect("the live-payload scalars are in neither bucket");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Identity matches and a schedule move is strictly above finalized, so
+    /// reconcile would re-stamp. A different legacy id must refuse first and
+    /// leave the schedule bytes alone.
+    #[test]
+    fn present_mismatch_does_not_restamp_schedule_on_populated_store() {
+        use cc_store::SszDecode;
+        use cc_store::SszEncode;
+        use cc_store::engine::{Engine, EngineOptions};
+        use cc_store::meta::{KEY_NODE_ID, TABLE_META};
+
+        let gvr = gvr_hex(0x44);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let (dir, mut opts) =
+            stamped_populated("node-id-before-schedule", chain, &gvr, Some(1_000));
+        let stored = Root::from_array([0x11; 32]);
+        {
+            let engine = Engine::open(&dir, EngineOptions::default()).unwrap();
+            let mut batch = engine.batch();
+            batch.put(TABLE_META, KEY_NODE_ID.as_bytes(), &stored.as_ssz_bytes());
+            engine.commit(batch).unwrap();
+        }
+        let schedule_before = read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST);
+        opts.node_id = NodeIdExpectation::Present(Root::from_array([0x22; 32]));
+        opts.chain.as_mut().unwrap().fulu_fork_epoch = cc_types::Epoch::new(80_000);
+        let err = open(&dir, opts).expect_err("node id refuses before schedule re-stamp");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("node_id") || msg.contains("I-node-id"),
+            "{msg}"
+        );
+        assert_eq!(
+            read_meta(&dir, cc_store::meta::KEY_SCHEDULE_DIGEST),
+            schedule_before
+        );
+        let engine = Engine::open(&dir, EngineOptions::default()).unwrap();
+        let rt = engine.read().unwrap();
+        let id =
+            Root::from_ssz_bytes(&rt.get(TABLE_META, KEY_NODE_ID.as_bytes()).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(id, stored);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1546,7 +1844,7 @@ mod tests {
     fn populated_store_whose_legacy_digest_is_not_the_constant_is_refused() {
         let dir = unique_temp_dir("non-legacy");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut opts = test_opts(None);
+        let mut opts = test_opts(NodeIdExpectation::Unset);
         opts.check_invariants = false;
         let opened = open(&dir, opts.clone()).expect("empty open without a network");
         drop(opened);
@@ -1574,7 +1872,7 @@ mod tests {
     fn legacy_constant_without_anchor_state_is_not_restamped() {
         let dir = unique_temp_dir("legacy-no-anchor");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut opts = test_opts(None);
+        let mut opts = test_opts(NodeIdExpectation::Unset);
         opts.check_invariants = false;
         let opened = open(&dir, opts.clone()).expect("empty");
         {
@@ -1607,7 +1905,7 @@ mod tests {
     ) -> (PathBuf, OpenOpts) {
         let dir = unique_temp_dir(label);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut opts = test_opts(None);
+        let mut opts = test_opts(NodeIdExpectation::Unset);
         opts.check_invariants = false;
         opts.chain = Some(chain);
         opts.genesis_validators_root = Some(gvr.to_owned());

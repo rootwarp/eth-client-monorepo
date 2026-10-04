@@ -41,6 +41,41 @@ fn boot_cfg(dir: PathBuf, node_key: Option<PathBuf>) -> BootConfig {
     }
 }
 
+/// `open` returns with I-node-id still pending. Pairing is the next phase.
+/// No durable load, writer, or chain phase may sit between them.
+#[tokio::test]
+async fn nothing_starts_between_open_and_pair() {
+    let dir = unique_temp_dir("beacon-core-pair-order");
+    std::fs::create_dir_all(&dir).unwrap();
+    let booted = boot_in_process(&boot_cfg(dir.clone(), None), metrics(), true).unwrap();
+    let open_at = booted
+        .phases
+        .iter()
+        .position(|phase| *phase == BootPhase::Open)
+        .expect("open");
+    let pair_at = booted
+        .phases
+        .iter()
+        .position(|phase| *phase == BootPhase::Pair)
+        .expect("pair");
+    assert_eq!(
+        pair_at,
+        open_at + 1,
+        "nothing may start between open and pair: {:?}",
+        booted.phases
+    );
+    for phase in [BootPhase::DurableSet, BootPhase::Writer, BootPhase::Chain] {
+        if let Some(at) = booted.phases.iter().position(|p| *p == phase) {
+            assert!(
+                at > pair_at,
+                "{phase:?} started before pair: {:?}",
+                booted.phases
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn open_completes_before_any_subsystem_starts() {
     let dir = unique_temp_dir("beacon-core-order");
@@ -69,7 +104,7 @@ fn second_opener_of_same_data_dir_fails_inode_id() {
     let id_a = Root::from_array([0x11u8; 32]);
     std::fs::write(&key_a, id_a.as_slice()).unwrap();
 
-    // Production stamp: open_and_stamp persists meta.node_id from the key.
+    // Pair stamps meta.node_id from the legacy key bytes.
     let first = boot_in_process(&boot_cfg(dir.clone(), Some(key_a)), metrics(), false).unwrap();
     drop(first);
 
@@ -97,7 +132,25 @@ async fn boot_against_temp_dir_returns() {
         dir.path().join("store.redb").is_file(),
         "boot opened redb under the temp dir"
     );
+    let key = dir.path().join("node_key");
+    let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "a key this binary creates is mode 0600");
     drop(node);
+}
+
+/// A store stamped from a raw 32-byte key still opens. Pairing stays on those bytes.
+#[test]
+fn legacy_stamped_store_opens_again() {
+    let dir = unique_temp_dir("beacon-core-legacy-reopen");
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("node_key");
+    std::fs::write(&key, [0x11u8; 32]).unwrap();
+    let first =
+        boot_in_process(&boot_cfg(dir.clone(), Some(key.clone())), metrics(), false).unwrap();
+    drop(first);
+    boot_in_process(&boot_cfg(dir.clone(), Some(key)), metrics(), false)
+        .expect("S2 legacy stamp reopens");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 struct TempDir(PathBuf);

@@ -453,8 +453,8 @@ fn stamp_empty(
     genesis_validators_root: Option<Root>,
 ) -> Result<(), StoreError> {
     let (Some(chain), Some(gvr)) = (chain, genesis_validators_root) else {
-        // No running network yet (beacon-core threads it later), or no GVR.
-        // Do not stamp `Root::ZERO`. An empty store has nothing to contradict.
+        // No network, or no GVR. Do not stamp `Root::ZERO`.
+        // An empty store has nothing to contradict.
         return Ok(());
     };
     stamp_both(engine, chain, gvr)

@@ -362,11 +362,10 @@ for STORE_SRC in "$ROOT/crates/store/src" "$ROOT/crates/storage-core/src"; do
 done
 
 # Node-key leaf: a stranger crate must not name the rust crate. services/p2p
-# loads the file (this crate's caller). crates/storage-core/src/boot.rs is the
-# only storage-core file allowed to name it, for a later caller — it does not
-# name it yet. beacon-core keeps its own copy until that call site moves, so
-# it is not on the allow list. The leaf crate may name itself. Comment and doc
-# lines are skipped, same shape as the consensus-type grep above.
+# loads the file. crates/storage-core/src/boot.rs is the only storage-core
+# file allowed to name it: the composer calls `load_or_create_node_key` there
+# so bin/beacon-core does not name the crate. The leaf crate may name itself.
+# Comment and doc lines are skipped, same shape as the consensus-type grep above.
 while IFS= read -r hit; do
   [[ -z "$hit" ]] && continue
   case "$hit" in
@@ -446,7 +445,7 @@ allowed_deps() {
     # S2-B-03: append cc-config (boot) + cc-state-transition (replay); never re-sort.
     # S2-A-05: append cc-seam (ArchiveWrite ingest; never re-sort).
     # Not JWT/HTTP-grandfathered.
-    cc-storage-core)      echo "cc-store cc-proto cc-bootstrap cc-types cc-config cc-state-transition cc-seam" ;;
+    cc-storage-core)      echo "cc-store cc-proto cc-bootstrap cc-types cc-config cc-state-transition cc-seam cc-node-key" ;;
     # S2-J-01: thin composer. Not JWT/HTTP-grandfathered. cc-chain is checkpoint
     # sync only (HTTP stays in that crate).
     # Composer ArchiveWrite call. Dev-deps: signing + state transition for the

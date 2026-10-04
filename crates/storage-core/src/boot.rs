@@ -12,7 +12,8 @@
 //! `services/storage` stays a thin shim so the previous topology remains
 //! runnable (`[ARCH]` §9.1).
 
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use crate::archive_write::ArchiveWriter;
 use crate::durable_set;
 use crate::metrics::{self, StorageMetrics};
 use crate::migrate::{self, MigrationConfig, Migrator};
+use crate::node_id::NodeIdExpectation;
 use crate::prune::{
     DEFAULT_DISK_ALARM_BYTES, DEFAULT_PRUNE_BLOCKS_EPOCHS, DEFAULT_PRUNE_COLUMNS_EPOCHS,
     DEFAULT_PRUNE_MARGIN_EPOCHS, PruneConfig, Pruner,
@@ -37,7 +39,7 @@ use cc_bootstrap::{
 use cc_config::ServiceConfig;
 use cc_proto::storage::storage_service_server::StorageServiceServer;
 use cc_store::{BlockServeWindowCfg, SplitLock, Store, check_min_epochs_for_block_requests};
-use cc_types::ChainConfig;
+use cc_types::{ChainConfig, Root};
 use serde::Deserialize;
 use tokio::sync::watch;
 use tonic::service::Routes;
@@ -406,14 +408,64 @@ impl StorageConfig {
     }
 }
 
+/// Key this process loaded or created. Both values are redacted in [`Debug`].
+///
+/// `legacy` is the raw 32-byte secret, which is still the pairing value.
+/// `fingerprint` is computed and not compared or written.
+pub struct LoadedNodeKey {
+    legacy: Root,
+    fingerprint: Root,
+}
+
+impl LoadedNodeKey {
+    /// Raw 32-byte secret as a root. This is what [`crate::PendingStore::pair`] compares.
+    #[must_use]
+    pub fn legacy(&self) -> Root {
+        self.legacy
+    }
+
+    /// D-22a fingerprint. Not a pairing input.
+    #[must_use]
+    pub fn fingerprint(&self) -> Root {
+        self.fingerprint
+    }
+}
+
+impl fmt::Debug for LoadedNodeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadedNodeKey")
+            .field("legacy", &"<redacted>")
+            .field("fingerprint", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Composer entry for the node-key leaf. Creates at mode `0600`.
+///
+/// The secret does not leave this value except as [`LoadedNodeKey::legacy`],
+/// which the composer passes to [`NodeIdExpectation::Present`].
+pub fn load_or_create_node_key(path: &Path) -> anyhow::Result<LoadedNodeKey> {
+    let key = cc_node_key::load_or_create(path).map_err(|e| anyhow::anyhow!("node key: {e}"))?;
+    let secret = key.to_bytes();
+    let fingerprint = cc_node_key::node_id_fingerprint(&secret)
+        .map_err(|e| anyhow::anyhow!("node key fingerprint: {e}"))?;
+    Ok(LoadedNodeKey {
+        legacy: Root::from_array(secret),
+        fingerprint: Root::from_hash256(fingerprint),
+    })
+}
+
 /// Open the store under `data_dir` with durability + the configured network.
 ///
-/// When [`StorageConfig::node_key_path`] is set and present, loads the expected
-/// NodeId surface for **I-node-id** (§1.7) so a mismatched key refuses open.
+/// The node id is the raw 32-byte file when that file exists. Mode and curve
+/// checks belong to [`load_or_create_node_key`], which the composer calls.
+/// This host still pairs a legacy 32-byte file, including one written at `0644`.
 ///
 /// `chain` is the digest input. There is no fixture fallback.
 fn open_store(cfg: &StorageConfig, chain: &ChainConfig) -> anyhow::Result<Store> {
-    Ok(crate::open(
+    let node_id = NodeIdExpectation::from_configured_path(cfg.node_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?;
+    let mut pending = crate::open(
         &cfg.data_dir,
         crate::OpenOpts {
             durability: cfg.durability.clone(),
@@ -421,11 +473,12 @@ fn open_store(cfg: &StorageConfig, chain: &ChainConfig) -> anyhow::Result<Store>
             snapshot_ring: cfg.snapshot_ring.max(1),
             max_open_scan_rows: cfg.max_open_scan_rows,
             genesis_validators_root: cfg.genesis_validators_root.clone(),
-            node_key_path: cfg.node_key_path.clone(),
+            node_id,
             chain: Some(chain.clone()),
         },
-    )?
-    .into_store())
+    )?;
+    let _ = pending.peek_node_id()?;
+    Ok(pending.pair(node_id)?.into_store())
 }
 
 /// Load the network the digest and the retention floor both require.
@@ -505,11 +558,11 @@ pub async fn run() -> anyhow::Result<()> {
                 );
                 // CC-45b: schema check + durable-set load. E4 push is gone.
                 let durable_ctx = durable_set::DurableSetContext {
-                    expected_node_id: durable_set::load_expected_node_id_from_key_path(
+                    expected_node_id: NodeIdExpectation::from_configured_path(
                         cfg.node_key_path.as_deref(),
                     )
-                    .ok()
-                    .flatten(),
+                    .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?
+                    .legacy_root(),
                     node_key_path: cfg.node_key_path.clone(),
                     enr_seq_path: None,
                     snapshot_ring: cfg.snapshot_ring.max(1),
@@ -1341,6 +1394,68 @@ mod config_tests {
         cfg.durability = "immediate".into();
         open_store(&cfg, &hoodi_chain()).expect("first boot with missing key must still open");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 32-byte legacy key (no mode or curve check) pairs, then reopens.
+    #[test]
+    fn open_store_legacy_key_reopens() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-storage-open-legacy-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("node_key");
+        std::fs::write(&key_path, [0x11u8; 32]).unwrap();
+
+        let mut cfg = {
+            let path = storage_toml_path();
+            let _g = env_lock();
+            unsafe {
+                std::env::remove_var("CC_STORAGE_NODE_KEY_PATH");
+            }
+            cc_config::load_from::<StorageConfig>("storage", &path).unwrap()
+        };
+        cfg.data_dir = dir.clone();
+        cfg.node_key_path = Some(key_path);
+        cfg.check_invariants = true;
+        cfg.durability = "immediate".into();
+        drop(open_store(&cfg, &hoodi_chain()).expect("legacy 32-byte key pairs"));
+        open_store(&cfg, &hoodi_chain()).expect("same legacy key reopens");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The composer wrapper creates a mode-0600 key the leaf will load again.
+    #[cfg(unix)]
+    #[test]
+    fn load_or_create_node_key_is_0600_and_redacts() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-storage-node-key-create-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node_key");
+        let loaded = load_or_create_node_key(&path).expect("create");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let dbg = format!("{loaded:?}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        assert!(
+            !dbg.contains(&loaded.legacy().to_string()),
+            "debug leaked the legacy root: {dbg}"
+        );
+        assert_ne!(loaded.fingerprint(), loaded.legacy());
+        let again = cc_node_key::load_or_create(&path).expect("leaf accepts the created key");
+        assert_eq!(again.to_bytes().as_slice(), loaded.legacy().as_slice());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

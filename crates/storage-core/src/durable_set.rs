@@ -44,6 +44,8 @@ use cc_store::meta::{
 use cc_store::snapshots::{list_snapshot_slots, newest_snapshot};
 use cc_store::{DaStatus, Root, Slot, SszDecode};
 
+use crate::node_id::NodeIdExpectation;
+
 // ---------------------------------------------------------------------------
 // Enum — the single named list (exactly twelve variants)
 // ---------------------------------------------------------------------------
@@ -925,41 +927,6 @@ fn assess_node_id_pairing(
     }
 }
 
-/// Load the expected NodeId surface from a 32-byte node key file (CC-20b / §1.7).
-///
-/// Matches the CC-4H / `I-node-id` pairing surface used by
-/// [`StoreOpenOptions::expected_node_id`]: the 32 raw bytes of the key file are
-/// the Root compared against `AnchorInfo.node_id`. Missing path / missing file
-/// → `Ok(None)`. Callers must then [`refuse_missing_key_if_anchor_present`] so a
-/// populated store does not skip I-node-id; first boot (no `AnchorInfo`) may.
-pub(crate) fn load_expected_node_id_from_key_path(
-    path: Option<&Path>,
-) -> Result<Option<Root>, String> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    if path.as_os_str().is_empty() {
-        return Ok(None);
-    }
-    if !path.exists() {
-        // First boot before p2p creates the key — skip here; the caller
-        // fail-closes if AnchorInfo is already present.
-        return Ok(None);
-    }
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("node key read failed at {}: {e}", path.display()))?;
-    if bytes.len() != 32 {
-        return Err(format!(
-            "node key at {} has length {}, expected 32",
-            path.display(),
-            bytes.len()
-        ));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(Some(Root::from_array(arr)))
-}
-
 /// Configured `node_key_path` is set, the file is missing, and `AnchorInfo`
 /// is already in the store — I-node-id must refuse, not skip.
 fn missing_key_with_anchor_detail(
@@ -984,18 +951,32 @@ fn missing_key_with_anchor_detail(
     )))
 }
 
-/// Fail-closed after `Store::open` when the key path is configured, the file
-/// is gone, and the store already has `AnchorInfo`. First boot (no anchor)
-/// still skips.
+/// Fail-closed after `Store::open` when the key was configured but missing
+/// and the store already has identity. First boot (no anchor, no `node_id`)
+/// still skips. The path itself is not read — the caller passes
+/// [`NodeIdExpectation::ConfiguredButMissing`].
 pub(crate) fn refuse_missing_key_if_anchor_present(
     engine: &Engine,
-    path: Option<&Path>,
+    expectation: NodeIdExpectation,
 ) -> Result<(), String> {
-    match missing_key_with_anchor_detail(engine, path) {
-        Ok(None) => Ok(()),
-        Ok(Some(msg)) => Err(msg),
+    if !matches!(expectation, NodeIdExpectation::ConfiguredButMissing) {
+        return Ok(());
+    }
+    match anchor_or_node_id_present(engine) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(
+            "I-node-id (crates/store/src/invariants.rs): node key missing \
+             but store has identity"
+                .to_owned(),
+        ),
         Err(e) => Err(format!("I-node-id: failed to read AnchorInfo: {e}")),
     }
+}
+
+fn anchor_or_node_id_present(engine: &Engine) -> Result<bool, StoreError> {
+    let has_anchor = read_meta_ssz::<AnchorInfo>(engine, KEY_ANCHOR_INFO)?.is_some();
+    let has_node_id = read_meta_ssz::<Root>(engine, KEY_NODE_ID)?.is_some();
+    Ok(has_anchor || has_node_id)
 }
 
 /// Derive `<node_key_path>.seq` the same way p2p does (CC-4E).
@@ -1015,6 +996,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use crate::node_id::NodeIdExpectation;
     use cc_store::canonical::TABLE_CANONICAL;
     use cc_store::columns::{encode_da_status_value, put_da_status};
     use cc_store::engine::{Durability, EngineOptions};
@@ -1643,8 +1625,9 @@ mod tests {
 
         // Production open path: load expected id from the (replaced) key file and
         // refuse Store::open with check_invariants. Bytes stay out of the error.
-        let loaded = load_expected_node_id_from_key_path(Some(&f.node_key_path))
+        let loaded = NodeIdExpectation::from_configured_path(Some(&f.node_key_path))
             .unwrap()
+            .legacy_root()
             .expect("key file present");
         assert_eq!(loaded, from_key);
         let inv_ctx = InvariantContext {
@@ -1732,7 +1715,7 @@ mod tests {
                 "must cite I-node-id and identity: {detail}"
             );
         }
-        refuse_missing_key_if_anchor_present(f.engine(), Some(&f.node_key_path))
+        refuse_missing_key_if_anchor_present(f.engine(), NodeIdExpectation::ConfiguredButMissing)
             .expect_err("populated store must refuse a missing key");
     }
 
@@ -1746,7 +1729,7 @@ mod tests {
         ctx.expected_node_id = None;
         let a = assess_item(f.engine(), DurableItem::NodeIdPairing, &ctx).unwrap();
         assert_eq!(a, ItemAssessment::Present);
-        refuse_missing_key_if_anchor_present(f.engine(), Some(&f.node_key_path))
+        refuse_missing_key_if_anchor_present(f.engine(), NodeIdExpectation::ConfiguredButMissing)
             .expect("first boot may skip");
     }
 

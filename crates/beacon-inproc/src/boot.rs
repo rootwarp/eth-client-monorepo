@@ -109,7 +109,7 @@ fn open_store(cfg: &BootConfig) -> anyhow::Result<OpenedStore> {
     // Absent GVR stays absent. The running network is threaded by beacon-core later;
     // this opener does not read a source-tree fixture in its place.
     let gvr_present = parse_gvr(cfg.genesis_validators_root.as_deref())?.is_some();
-    let expected_node_id = load_expected_node_id_from_key_path(cfg.node_key_path.as_deref())
+    let expected_node_id = legacy_node_id_from_file(cfg.node_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?;
     if expected_node_id.is_some() {
         tracing::info!(
@@ -203,7 +203,7 @@ fn is_store_empty(engine: &Engine) -> anyhow::Result<bool> {
     Ok(!has_fc && has_snap.is_none())
 }
 
-fn load_expected_node_id_from_key_path(path: Option<&Path>) -> Result<Option<Root>, String> {
+fn legacy_node_id_from_file(path: Option<&Path>) -> Result<Option<Root>, String> {
     let Some(path) = path else {
         return Ok(None);
     };

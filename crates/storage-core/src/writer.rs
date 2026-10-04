@@ -953,7 +953,7 @@ pub(crate) fn load_write_cursor(engine: &Engine) -> Result<Option<WriteCursor>, 
 
 /// `Uninitialized`: no `AnchorInfo` and no block row.
 ///
-/// Tolerates everything `open_and_stamp` writes (schema, digest, node id,
+/// Tolerates everything open and pair write (schema, digest, node id,
 /// write cursor). This is the `commit_anchor` precondition, not the
 /// restart tri-state.
 pub(crate) fn store_is_uninitialized(engine: &Engine) -> Result<bool, StoreError> {

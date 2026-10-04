@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cc_storage_core::{OpenOpts, open};
+use cc_storage_core::{NodeIdExpectation, OpenOpts, OpenedStore, open};
 use cc_store::engine::{Engine, EngineOptions};
 use cc_store::meta::{KEY_CONFIG_DIGEST, KEY_CONFIG_DIGEST_V2, KEY_SCHEDULE_DIGEST, TABLE_META};
 use cc_store::{
@@ -53,9 +53,16 @@ fn opts(chain: ChainConfig, gvr: &str) -> OpenOpts {
         snapshot_ring: 4,
         max_open_scan_rows: cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS,
         genesis_validators_root: Some(gvr.to_owned()),
-        node_key_path: None,
+        node_id: NodeIdExpectation::Unset,
         chain: Some(chain),
     }
+}
+
+fn open_paired(dir: &std::path::Path, opts: OpenOpts) -> anyhow::Result<OpenedStore> {
+    let expectation = opts.node_id;
+    let mut pending = open(dir, opts)?;
+    let _ = pending.peek_node_id()?;
+    pending.pair(expectation)
 }
 
 fn snapshot_with_gvr(gvr: Root) -> Vec<u8> {
@@ -100,13 +107,13 @@ fn legacy_constant_restamps_when_anchor_gvr_matches() {
         check_invariants: false,
         ..OpenOpts::default()
     };
-    let opened = open(&dir, bare).expect("empty legacy store");
+    let opened = open_paired(&dir, bare).expect("empty legacy store");
     put_snapshot(opened.engine(), Slot::new(8), &snapshot_with_gvr(gvr), 4).unwrap();
     drop(opened);
 
     let mut chain = hoodi_chain();
     let gvr_text = gvr_hex(0x44);
-    let err = open(&dir, opts(chain.clone(), &gvr_text))
+    let err = open_paired(&dir, opts(chain.clone(), &gvr_text))
         .expect_err("a matching anchor GVR must not stamp a populated store");
     let msg = err.to_string();
     assert!(
@@ -128,7 +135,8 @@ fn legacy_constant_restamps_when_anchor_gvr_matches() {
 
     // A different seconds_per_slot is still not copied onto the populated store.
     chain.seconds_per_slot = 6;
-    let err = open(&dir, opts(chain, &gvr_text)).expect_err("identity fields stay unstamped");
+    let err =
+        open_paired(&dir, opts(chain, &gvr_text)).expect_err("identity fields stay unstamped");
     assert!(
         !err.to_string().contains("identity digest mismatch"),
         "{err}"
@@ -142,7 +150,7 @@ fn legacy_constant_restamps_when_anchor_gvr_matches() {
 fn legacy_constant_refuses_when_anchor_gvr_differs() {
     let dir = unique_temp_dir("legacy-mismatch");
     std::fs::create_dir_all(&dir).unwrap();
-    let opened = open(
+    let opened = open_paired(
         &dir,
         OpenOpts {
             check_invariants: false,
@@ -159,7 +167,7 @@ fn legacy_constant_refuses_when_anchor_gvr_differs() {
     .unwrap();
     drop(opened);
 
-    let err = open(&dir, opts(hoodi_chain(), &gvr_hex(0x45)))
+    let err = open_paired(&dir, opts(hoodi_chain(), &gvr_hex(0x45)))
         .expect_err("a disagreeing anchor GVR must not re-stamp");
     let msg = err.to_string();
     assert!(
