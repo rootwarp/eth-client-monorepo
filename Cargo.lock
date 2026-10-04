@@ -968,6 +968,7 @@ dependencies = [
  "cc-config",
  "cc-crypto",
  "cc-engine-api",
+ "cc-fork-choice",
  "cc-proto",
  "cc-seam",
  "cc-state-transition",

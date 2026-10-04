@@ -298,6 +298,104 @@ fn sign_proposer(
     }
 }
 
+/// Anchor state `boot` commits. The post-state of a [`ChainLink`] is the
+/// parent for the next call.
+pub(crate) fn anchor_state(fixture: &AnchorFixture) -> BeaconState<Minimal> {
+    BeaconState::<Minimal>::from_ssz_bytes_hydrated(ForkName::Fulu, &fixture.state_ssz)
+        .expect("anchor state")
+}
+
+/// One signed block and the post-state it produces.
+pub(crate) struct ChainLink {
+    pub signed: SignedBeaconBlock<Minimal>,
+    pub root: Root,
+    pub state: BeaconState<Minimal>,
+}
+
+/// Next block on `parent_state`. `payload_tag` distinguishes siblings at one slot.
+pub(crate) fn extend_block(
+    fixture: &AnchorFixture,
+    parent_state: &BeaconState<Minimal>,
+    parent_root: Root,
+    payload_tag: u8,
+) -> ChainLink {
+    let engine = AcceptEngine;
+    let ctx = cc_state_transition::TransitionContext::new(&fixture.chain, &engine);
+    ctx.top_up_pubkey_cache(parent_state);
+
+    let mut st = parent_state.clone();
+    let next_slot = Slot::new(st.slot().as_u64() + 1);
+    process_slots(&mut st, next_slot, &fixture.chain).expect("process_slots");
+    let proposer = get_beacon_proposer_index(&st).expect("proposer");
+    let (withdrawals, _) = get_expected_withdrawals(&st).expect("withdrawals");
+    let epoch = get_current_epoch(&st);
+    let prev_randao = get_randao_mix(&st, epoch).expect("randao mix");
+    let timestamp =
+        compute_time_at_slot(st.genesis_time(), next_slot, fixture.chain.seconds_per_slot);
+    let parent_hash = st.latest_execution_payload_header().block_hash;
+    let randao_reveal = sign_randao(&st, &fixture.sk, epoch);
+
+    let payload = ExecutionPayload::<Minimal> {
+        parent_hash,
+        prev_randao,
+        timestamp,
+        block_number: st.latest_execution_payload_header().block_number + 1,
+        gas_limit: st.latest_execution_payload_header().gas_limit,
+        block_hash: Root::from_array([payload_tag; 32]),
+        withdrawals: VariableList::new(withdrawals).expect("withdrawals list"),
+        ..Default::default()
+    };
+    let body = BeaconBlockBody::<Minimal> {
+        randao_reveal,
+        eth1_data: st.eth1_data(),
+        execution_payload: payload,
+        sync_aggregate: SyncAggregate {
+            sync_committee_bits: Default::default(),
+            sync_committee_signature: BlsSignature::from_array(INFINITY_SIGNATURE),
+        },
+        ..Default::default()
+    };
+    let mut message = BeaconBlock {
+        slot: next_slot,
+        proposer_index: proposer,
+        parent_root,
+        state_root: Root::ZERO,
+        body,
+    };
+    let trial_signed = SignedBeaconBlock {
+        message: message.clone(),
+        signature: BlsSignature::default(),
+    };
+    let mut trial = parent_state.clone();
+    match state_transition(
+        &mut trial,
+        &trial_signed,
+        &ctx,
+        BlockSignatureStrategy::NoVerification,
+    ) {
+        Err(cc_state_transition::BlockError::StateRootMismatch { actual, .. }) => {
+            message.state_root = actual;
+        }
+        Ok(()) => message.state_root = trial.canonical_root(),
+        Err(e) => panic!("state_transition for child: {e}"),
+    }
+    let signed = sign_proposer(&st, &fixture.sk, message);
+    let root = Root::from_hash256(TreeHash::tree_hash_root(&signed.message));
+    let mut post = parent_state.clone();
+    state_transition(
+        &mut post,
+        &signed,
+        &ctx,
+        BlockSignatureStrategy::NoVerification,
+    )
+    .expect("post-state");
+    ChainLink {
+        signed,
+        root,
+        state: post,
+    }
+}
+
 /// First normal child of the anchor (slot 1). Not epoch-aligned.
 pub(crate) fn first_child(fixture: &AnchorFixture) -> SignedChild {
     let parent_state =

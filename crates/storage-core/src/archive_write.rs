@@ -37,6 +37,17 @@ use crate::writer::{
 
 pub(crate) use crate::writer::COMMIT_DEADLINE_REASON;
 
+/// One block from by-range serve: canonical lookup, then that body's SSZ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedCanonicalBlock {
+    /// Slot the canonical index named.
+    pub slot: u64,
+    /// Root stored at that slot.
+    pub root: [u8; 32],
+    /// Body bytes served for that root. Not a separate table read.
+    pub ssz: Vec<u8>,
+}
+
 /// Typed ingest adapter. Holds the live writer handle — no second mailbox.
 #[derive(Debug, Clone)]
 pub struct ArchiveWriter {
@@ -87,6 +98,43 @@ impl ArchiveWriter {
         );
         engine.commit(batch)
     }
+
+    /// By-range serve of the canonical view at the selected head.
+    ///
+    /// Same read as `GetBlocksByRange`: the split, then canonical lookup,
+    /// then the body. A direct `canonical` table scan is not this path.
+    pub fn serve_blocks_by_range(
+        &self,
+        start_slot: u64,
+        count: u64,
+    ) -> Result<Vec<ServedCanonicalBlock>, SeamError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count > cc_store::MAX_BLOCKS_BY_RANGE {
+            return Err(SeamError::InvalidArgument(format!(
+                "count {count} exceeds MAX_BLOCKS_BY_RANGE ({})",
+                cc_store::MAX_BLOCKS_BY_RANGE
+            )));
+        }
+        let rt = self
+            .engine
+            .read()
+            .map_err(|e| SeamError::Unavailable(e.to_string()))?;
+        let split = cc_store::load_split(&rt)
+            .map_err(map_store_read_err)?
+            .map(|split| split.slot);
+        let rows = cc_store::blocks_by_range(&rt, Slot::new(start_slot), count, split)
+            .map_err(map_store_read_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ServedCanonicalBlock {
+                slot: row.slot.as_u64(),
+                root: *row.root.as_array(),
+                ssz: row.ssz,
+            })
+            .collect())
+    }
 }
 
 fn staged_from_batch(batch: ColumnBatch) -> Result<StagedColumn, SeamError> {
@@ -117,6 +165,13 @@ fn staged_from_batch(batch: ColumnBatch) -> Result<StagedColumn, SeamError> {
         index,
         ssz: batch.ssz.to_vec(),
     })
+}
+
+fn map_store_read_err(err: StoreError) -> SeamError {
+    match err {
+        StoreError::Codec(msg) | StoreError::Limit(msg) => SeamError::InvalidArgument(msg),
+        other => SeamError::Unavailable(other.to_string()),
+    }
 }
 
 fn map_writer_err(err: WriterError) -> SeamError {

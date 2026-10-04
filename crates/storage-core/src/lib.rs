@@ -40,7 +40,7 @@ mod serve;
 mod test_tmpdir;
 mod writer;
 
-pub use archive_write::ArchiveWriter;
+pub use archive_write::{ArchiveWriter, ServedCanonicalBlock};
 #[cfg(feature = "grpc")]
 pub use boot::run;
 pub use durable_set::{DurableBlock, DurableDaStatus};
