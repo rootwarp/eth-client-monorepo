@@ -526,8 +526,10 @@ async fn run_writer(
 
         tokio::select! {
             biased;
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            // A dropped sender can never raise the flag, and a closed watch
+            // stays ready. Leaving this arm would spin and hold the file lock.
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
                     break;
                 }
             }

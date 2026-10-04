@@ -9,8 +9,8 @@ Typed handles and overflow contracts for internal service edges
   `commit_import`, `set_head`, `commit_snapshot`. Those four default to a
   no-op and do not write. `DaVerdict` is `Available` or `Deferred` — no
   `None`. Canonical rewrite is `head` / `set_head`, not an
-  `update_canonical` field. `IngestBlock` / `ingest_block` remain until
-  S2R-A-12 and are not the contract.
+  `update_canonical` field. Block persist is `commit_import`, not a separate
+  ingest type.
   Payload is `ColumnBatch { parent_root, slot, block_root, index, ssz }`;
   **`index` is a field**. Head is `(parent_root, slot)`: a batch may only
   extend the durable frontier, never jump it. Overflow is policy **A**:

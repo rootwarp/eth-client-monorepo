@@ -860,7 +860,7 @@ fn column_sidecar_decode_lives_in_chain_core() {
         ingest_src.contains("DataColumnSidecar"),
         "chain-core ingest names the sidecar to populate ColumnBatch"
     );
-    // The duplicate-anchor repair reaches commit_import, not ingest_block.
+    // The duplicate-anchor repair reaches commit_import.
     duplicate_anchor_reaches_commit_import();
     let fanout_src = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -881,15 +881,13 @@ fn duplicate_anchor_reaches_commit_import() {
     use cc_chain::import::{ImportCounters, encode_signed_block, import_block_with_early};
     use cc_chain::residency::Residency;
     use cc_seam::{
-        ArchiveWrite, Bytes, DaVerdict, DurableImport, HeadCause, HeadChange, IngestBlock,
-        SeamError,
+        ArchiveWrite, Bytes, DaVerdict, DurableImport, HeadCause, HeadChange, SeamError,
     };
     use cc_state_transition::BlockSignatureStrategy;
     use std::sync::Mutex;
     use tree_hash::TreeHash;
 
     struct Recording {
-        blocks: Mutex<Vec<IngestBlock>>,
         imports: Mutex<Vec<DurableImport>>,
         heads: Mutex<Vec<(HeadChange, Bytes)>>,
     }
@@ -897,15 +895,6 @@ fn duplicate_anchor_reaches_commit_import() {
     #[async_trait]
     impl ArchiveWrite for Recording {
         async fn ingest_columns(&self, _batch: cc_seam::ColumnBatch) -> Result<(), SeamError> {
-            Ok(())
-        }
-
-        async fn ingest_block(&self, block: IngestBlock) -> Result<(), SeamError> {
-            self.ingest_block_blocking(block)
-        }
-
-        fn ingest_block_blocking(&self, block: IngestBlock) -> Result<(), SeamError> {
-            self.blocks.lock().unwrap().push(block);
             Ok(())
         }
 
@@ -944,7 +933,6 @@ fn duplicate_anchor_reaches_commit_import() {
     let root = Root::from_hash256(TreeHash::tree_hash_root(&signed.message));
     let ssz = encode_signed_block(&signed);
     let archive_impl = Arc::new(Recording {
-        blocks: Mutex::new(Vec::new()),
         imports: Mutex::new(Vec::new()),
         heads: Mutex::new(Vec::new()),
     });
@@ -986,10 +974,6 @@ fn duplicate_anchor_reaches_commit_import() {
     assert_eq!(
         outcome.response.verdict,
         cc_proto::chain::ImportBlockVerdict::Duplicate as i32
-    );
-    assert!(
-        archive_impl.blocks.lock().unwrap().is_empty(),
-        "duplicate repair calls commit_import, not ingest_block"
     );
     let got = archive_impl.imports.lock().unwrap();
     assert_eq!(

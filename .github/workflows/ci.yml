@@ -91,6 +91,10 @@ jobs:
       - name: check one commit_anchor call site
         run: bash scripts/check-one-commit-anchor.sh
 
+      # Tests must not name the writer seed door (submit_p0_committed, blocking_submit_p0_committed, StagedBlock).
+      - name: check no writer seed door in tests
+        run: bash scripts/check-no-seed-door.sh
+
       # CC-28/2: no HTTP client on the block-import path; p2p tree has no reqwest.
       - name: check no HTTP on import path
         run: bash scripts/check-no-http-import-path.sh

@@ -19,7 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cc_seam::{
     ArchiveWrite, Bytes, ColumnBatch, DaVerdict, DurableImport, FailedPreconditionReason,
-    HeadChange, IngestBlock, SeamError, TrustedAnchor,
+    HeadChange, SeamError, TrustedAnchor,
 };
 use cc_store::blocks::{parent_root_at_offset, slot_at_offset, state_root_at_offset};
 use cc_store::columns::{
@@ -272,37 +272,6 @@ impl ArchiveWriter {
             .map_err(map_writer_err)
     }
 
-    fn block_unit(&self, batch: WriterBatch) -> Result<CommitUnit, SeamError> {
-        let prev = self.load_or_missing_cursor()?;
-        let (slot, root) = batch
-            .blocks
-            .last()
-            .map(|b| (b.slot, b.root))
-            .unwrap_or((prev.slot, prev.root));
-        let cursor = WriteCursor {
-            session_id: prev.session_id,
-            seq: prev.seq.saturating_add(1),
-            slot,
-            root,
-        };
-        self.unit_for_batch(batch, cursor)
-    }
-
-    async fn submit_block_batch(&self, batch: WriterBatch) -> Result<(), SeamError> {
-        let unit = self.block_unit(batch)?;
-        self.writer
-            .submit_p0_committed(unit)
-            .await
-            .map_err(map_writer_err)
-    }
-
-    fn submit_block_batch_blocking(&self, batch: WriterBatch) -> Result<(), SeamError> {
-        let unit = self.block_unit(batch)?;
-        self.writer
-            .blocking_submit_p0_committed(unit)
-            .map_err(map_writer_err)
-    }
-
     /// Async `commit_import` waits `2 * seconds_per_slot` on the P0 writer.
     ///
     /// The deadline is on this async call only. The core thread still
@@ -349,20 +318,6 @@ impl ArchiveWrite for ArchiveWriter {
             columns: vec![column],
         })
         .await
-    }
-
-    async fn ingest_block(&self, block: IngestBlock) -> Result<(), SeamError> {
-        match bind_ingest_block(&self.engine, block)? {
-            Some(batch) => self.submit_block_batch(batch).await,
-            None => Ok(()),
-        }
-    }
-
-    fn ingest_block_blocking(&self, block: IngestBlock) -> Result<(), SeamError> {
-        match bind_ingest_block(&self.engine, block)? {
-            Some(batch) => self.submit_block_batch_blocking(batch),
-            None => Ok(()),
-        }
     }
 
     async fn commit_import(&self, import: DurableImport) -> Result<(), SeamError> {
@@ -423,69 +378,6 @@ impl ArchiveWrite for ArchiveWriter {
             .await
             .map_err(map_writer_err)
     }
-}
-
-/// Bind caller `(slot, parent_root, block_root)` to the SSZ header.
-///
-/// Slot and parent_root are fixed-offset peeks. `block_root` is the caller's
-/// value — storage does not decode the body to recompute it. Continuity is
-/// `block_present` on that parent (or a distinct parent row is first in this
-/// batch). A body whose parent is not durable is refused; that write is
-/// `commit_anchor` only.
-fn bind_ingest_block(
-    engine: &Engine,
-    block: IngestBlock,
-) -> Result<Option<WriterBatch>, SeamError> {
-    let ssz = block.ssz.as_ref();
-    let ssz_slot = slot_at_offset(ssz).map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
-    let claimed_slot = Slot::new(block.slot);
-    if ssz_slot != claimed_slot {
-        return Err(SeamError::InvalidArgument(format!(
-            "slot mismatch: caller {} != SSZ header slot {}",
-            claimed_slot.as_u64(),
-            ssz_slot.as_u64()
-        )));
-    }
-
-    let ssz_parent =
-        parent_root_at_offset(ssz).map_err(|e| SeamError::InvalidArgument(e.to_string()))?;
-    let claimed_parent = Root::from_array(block.parent_root);
-    let claimed_root = Root::from_array(block.block_root);
-
-    if ssz_parent != claimed_parent {
-        return Err(SeamError::InvalidArgument(format!(
-            "parent_root mismatch: caller != SSZ header parent_root at offset {}",
-            cc_store::PARENT_ROOT_SSZ_OFFSET
-        )));
-    }
-
-    if claimed_parent == claimed_root {
-        return Err(SeamError::InvalidArgument(
-            "self-parent is not admitted; genesis is committed as an anchor".into(),
-        ));
-    }
-
-    // Already-durable body: do not submit with update_canonical (H3).
-    // rewrite_from_head from this root would delete every canonical row above.
-    if block_present(engine, &claimed_root).map_err(|e| SeamError::Unavailable(e.to_string()))? {
-        return Ok(None);
-    }
-
-    Ok(Some(WriterBatch {
-        head: Some(ContinuityHead {
-            parent_root: claimed_parent,
-            slot: claimed_slot,
-        }),
-        blocks: vec![StagedBlock {
-            slot: claimed_slot,
-            root: claimed_root,
-            ssz: block.ssz.to_vec(),
-            update_canonical: true,
-            write_state_root: false,
-            da_status: None,
-        }],
-        columns: Vec::new(),
-    }))
 }
 
 fn anchor_unit(engine: &Engine, anchor: TrustedAnchor) -> Result<CommitUnit, SeamError> {
@@ -1231,19 +1123,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_block_rejects_slot_mismatch() {
+    async fn commit_import_rejects_slot_mismatch() {
         let (dir, _engine, archive, shutdown_tx) = block_archive("slot-bind");
         let root = Root::from_array([0x42; 32]);
-        let ssz = synth_block(1, &Root::ZERO, &Root::from_array([0xF0; 32]));
-        let err = archive
-            .ingest_block(IngestBlock {
-                parent_root: root.into_array(),
-                slot: 9,
-                block_root: root.into_array(),
-                ssz: Bytes::from(ssz),
-            })
-            .await
-            .unwrap_err();
+        let state = Root::from_array([0xF0; 32]);
+        let mut import = durable_import(
+            1,
+            &Root::ZERO,
+            &root,
+            &state,
+            DaVerdict::Available,
+            b"scalars",
+            false,
+        );
+        import.slot = 9;
+        let err = archive.commit_import(import).await.unwrap_err();
         assert!(matches!(err, SeamError::InvalidArgument(_)));
         assert!(err.to_string().contains("slot mismatch"), "{err}");
         let _ = shutdown_tx.send(true);
@@ -1251,18 +1145,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_block_rejects_parent_mismatch() {
+    async fn commit_import_rejects_parent_mismatch() {
         let (dir, _engine, archive, shutdown_tx) = block_archive("parent-bind");
-        let ssz = synth_block(1, &Root::ZERO, &Root::from_array([0xF0; 32]));
-        let err = archive
-            .ingest_block(IngestBlock {
-                parent_root: [0xAB; 32],
-                slot: 1,
-                block_root: [0xCD; 32],
-                ssz: Bytes::from(ssz),
-            })
-            .await
-            .unwrap_err();
+        let state = Root::from_array([0xF0; 32]);
+        let mut import = durable_import(
+            1,
+            &Root::ZERO,
+            &Root::from_array([0xCD; 32]),
+            &state,
+            DaVerdict::Available,
+            b"scalars",
+            false,
+        );
+        import.parent_root = [0xAB; 32];
+        let err = archive.commit_import(import).await.unwrap_err();
         assert!(matches!(err, SeamError::InvalidArgument(_)));
         assert!(err.to_string().contains("parent_root mismatch"), "{err}");
         let _ = shutdown_tx.send(true);
@@ -1270,7 +1166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_block_rejects_self_parent_after_head_exists() {
+    async fn commit_import_refuses_self_parent_that_is_not_durable() {
         let (dir, engine, archive, shutdown_tx) = block_archive("self-parent");
         let g_root = Root::from_array([0x01; 32]);
         let state = Root::from_array([0xF0; 32]);
@@ -1289,18 +1185,27 @@ mod tests {
         assert!(archive.block_is_durable(g_root.into_array()).unwrap());
 
         let fake_root = Root::from_array([0x02; 32]);
-        let fake_ssz = synth_block(3, &fake_root, &Root::from_array([0xF1; 32]));
         let err = archive
-            .ingest_block(IngestBlock {
-                parent_root: fake_root.into_array(),
-                slot: 3,
-                block_root: fake_root.into_array(),
-                ssz: Bytes::from(fake_ssz),
-            })
+            .commit_import(durable_import(
+                3,
+                &fake_root,
+                &fake_root,
+                &Root::from_array([0xF1; 32]),
+                DaVerdict::Available,
+                b"scalars",
+                false,
+            ))
             .await
             .unwrap_err();
-        assert!(matches!(err, SeamError::InvalidArgument(_)));
-        assert!(err.to_string().contains("self-parent"), "{err}");
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::ParentNotDurable,
+                }
+            ),
+            "{err}"
+        );
         let rt = engine.read().unwrap();
         assert!(get_block_by_root(&rt, &fake_root).unwrap().is_none());
         let _ = shutdown_tx.send(true);
@@ -1308,7 +1213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_block_reimport_ancestor_keeps_durable_head() {
+    async fn reimport_ancestor_keeps_durable_head() {
         let (dir, engine, archive, shutdown_tx) = block_archive("h3-no-rewind");
         let g_root = Root::from_array([0x01; 32]);
         let a_root = Root::from_array([0x02; 32]);
@@ -1328,41 +1233,50 @@ mod tests {
             .unwrap();
         let a_ssz = synth_block(1, &g_root, &state);
         archive
-            .ingest_block(IngestBlock {
-                parent_root: g_root.into_array(),
-                slot: 1,
-                block_root: a_root.into_array(),
-                ssz: Bytes::from(a_ssz.clone()),
-            })
+            .commit_import(durable_import(
+                1,
+                &g_root,
+                &a_root,
+                &state,
+                DaVerdict::Available,
+                b"scalars-a",
+                true,
+            ))
             .await
             .unwrap();
         let b_ssz = synth_block(2, &a_root, &state);
         archive
-            .ingest_block(IngestBlock {
-                parent_root: a_root.into_array(),
-                slot: 2,
-                block_root: b_root.into_array(),
-                ssz: Bytes::from(b_ssz.clone()),
-            })
+            .commit_import(durable_import(
+                2,
+                &a_root,
+                &b_root,
+                &state,
+                DaVerdict::Available,
+                b"scalars-b",
+                true,
+            ))
             .await
             .unwrap();
 
         archive
-            .ingest_block(IngestBlock {
-                parent_root: g_root.into_array(),
-                slot: 1,
-                block_root: a_root.into_array(),
-                ssz: Bytes::from(a_ssz.clone()),
-            })
+            .commit_import(durable_import(
+                1,
+                &g_root,
+                &a_root,
+                &state,
+                DaVerdict::Available,
+                b"scalars-a2",
+                false,
+            ))
             .await
-            .expect("re-ingest of durable A must not fail");
+            .expect("re-import of durable A must not fail");
 
         let rt = engine.read().unwrap();
         assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), Some(a_root));
         assert_eq!(
             get_canonical(&rt, Slot::new(2)).unwrap(),
             Some(b_root),
-            "re-ingest of A must not rewind durable head off B"
+            "re-import of A must not rewind durable head off B"
         );
         assert_eq!(
             get_block_by_root(&rt, &a_root).unwrap().as_deref(),
@@ -1377,7 +1291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_block_persists_caller_block_root_without_decode() {
+    async fn commit_import_persists_caller_block_root_without_decode() {
         let (dir, engine, archive, shutdown_tx) = block_archive("caller-root");
         let anchor_root = Root::from_array([0x41; 32]);
         let state = Root::from_array([0xF0; 32]);
@@ -1396,12 +1310,15 @@ mod tests {
         let root = Root::from_array([0x42; 32]);
         let ssz = synth_block(1, &anchor_root, &state);
         archive
-            .ingest_block(IngestBlock {
-                parent_root: anchor_root.into_array(),
-                slot: 1,
-                block_root: root.into_array(),
-                ssz: Bytes::from(ssz.clone()),
-            })
+            .commit_import(durable_import(
+                1,
+                &anchor_root,
+                &root,
+                &state,
+                DaVerdict::Available,
+                b"scalars",
+                true,
+            ))
             .await
             .expect("caller block_root is the bind; storage must not decode the body");
         let rt = engine.read().unwrap();
@@ -1457,10 +1374,10 @@ mod tests {
         }
     }
 
-    /// Non-genesis anchor: `ArchiveWrite` ingest cannot seed it. `commit_anchor`
-    /// does, once, and the ordinary continuity check then admits the child.
+    /// An empty store refuses `commit_import`. `commit_anchor` seeds once,
+    /// then the child is admitted.
     #[tokio::test]
-    async fn non_genesis_anchor_ingest_fails_commit_anchor_admits_child() {
+    async fn empty_store_refuses_import_then_anchor_admits_child() {
         let (dir, engine, archive, shutdown_tx) = block_archive("nongenesis-anchor");
         let parent = Root::from_array([0x11; 32]);
         let root = Root::from_array([0x42; 32]);
@@ -1470,17 +1387,25 @@ mod tests {
         let state_ssz = b"anchor-state-ssz".to_vec();
 
         let err = archive
-            .ingest_block(IngestBlock {
-                parent_root: parent.into_array(),
+            .commit_import(durable_import(
                 slot,
-                block_root: root.into_array(),
-                ssz: Bytes::from(block.clone()),
-            })
+                &parent,
+                &root,
+                &state,
+                DaVerdict::Available,
+                b"scalars",
+                true,
+            ))
             .await
             .unwrap_err();
         assert!(
-            matches!(err, SeamError::InvalidArgument(_)),
-            "non-genesis anchor must not seed through ingest: {err}"
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreIncomplete,
+                }
+            ),
+            "empty store must not seed through commit_import: {err}"
         );
         assert!(!archive.block_is_durable(root.into_array()).unwrap());
 
@@ -1523,16 +1448,18 @@ mod tests {
         });
 
         let child_root = Root::from_array([0x43; 32]);
-        let child = synth_block(slot + 1, &root, &state);
         archive
-            .ingest_block(IngestBlock {
-                parent_root: root.into_array(),
-                slot: slot + 1,
-                block_root: child_root.into_array(),
-                ssz: Bytes::from(child),
-            })
+            .commit_import(durable_import(
+                slot + 1,
+                &root,
+                &child_root,
+                &state,
+                DaVerdict::Available,
+                b"scalars-child",
+                true,
+            ))
             .await
-            .expect("unchanged continuity check admits the anchor's first child");
+            .expect("parent durability admits the anchor's first child");
         assert!(archive.block_is_durable(child_root.into_array()).unwrap());
 
         let _ = shutdown_tx.send(true);
@@ -1897,16 +1824,16 @@ mod tests {
         }
     }
 
-    async fn ingest_signed(
+    async fn seed_chain(
         archive: &ArchiveWriter,
         slot: u64,
         parent: &Root,
         root: &Root,
         state: &Root,
     ) {
-        let ssz = synth_block(slot, parent, state);
-        // Ingest no longer admits a self-parent. Genesis is commit_anchor.
+        // A body whose parent is itself is an anchor, not an import.
         if parent == root {
+            let ssz = synth_block(slot, parent, state);
             archive
                 .commit_anchor(trusted_anchor(
                     root,
@@ -1921,19 +1848,21 @@ mod tests {
             return;
         }
         archive
-            .ingest_block(IngestBlock {
-                parent_root: parent.into_array(),
+            .commit_import(durable_import(
                 slot,
-                block_root: root.into_array(),
-                ssz: Bytes::from(ssz),
-            })
+                parent,
+                root,
+                state,
+                DaVerdict::Available,
+                b"scalars-seed",
+                true,
+            ))
             .await
             .unwrap();
     }
 
-    /// Old ingest rewrites `canonical[slot]` for a losing sibling. `commit_import`
-    /// with `head: None` must store the body and leave that row, and every row
-    /// above it, untouched.
+    /// `commit_import` with `head: None` stores the body and leaves canonical
+    /// rows, including every row above the sibling, untouched.
     #[tokio::test]
     async fn losing_sibling_head_none_does_not_rewrite_canonical() {
         let state_g = Root::from_array([0xF0; 32]);
@@ -1945,32 +1874,12 @@ mod tests {
         let b = Root::from_array([0x03; 32]);
         let sibling = Root::from_array([0x04; 32]);
 
-        // Old behavior, still the ingest path: a losing sibling at the head
-        // slot becomes canonical[slot].
-        {
-            let (dir, engine, archive, shutdown_tx) = block_archive("sibling-old");
-            ingest_signed(&archive, 0, &g, &g, &state_g).await;
-            ingest_signed(&archive, 1, &g, &a, &state_a).await;
-            ingest_signed(&archive, 2, &a, &b, &state_b).await;
-            ingest_signed(&archive, 2, &a, &sibling, &state_s).await;
-            let rt = engine.read().unwrap();
-            assert_eq!(
-                get_canonical(&rt, Slot::new(2)).unwrap(),
-                Some(sibling),
-                "ingest_block still rewrites canonical[slot] for a losing sibling"
-            );
-            assert!(get_block_by_root(&rt, &sibling).unwrap().is_some());
-            let _ = shutdown_tx.send(true);
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        // New behavior: the same sibling with head: None is durable and
-        // canonical[slot] plus every row above it stay put.
+        // The sibling with head: None is durable and canonical rows stay put.
         {
             let (dir, engine, archive, shutdown_tx) = block_archive("sibling-new");
-            ingest_signed(&archive, 0, &g, &g, &state_g).await;
-            ingest_signed(&archive, 1, &g, &a, &state_a).await;
-            ingest_signed(&archive, 2, &a, &b, &state_b).await;
+            seed_chain(&archive, 0, &g, &g, &state_g).await;
+            seed_chain(&archive, 1, &g, &a, &state_a).await;
+            seed_chain(&archive, 2, &a, &b, &state_b).await;
             let rt = engine.read().unwrap();
             assert_eq!(get_canonical(&rt, Slot::new(1)).unwrap(), Some(a));
             assert_eq!(get_canonical(&rt, Slot::new(2)).unwrap(), Some(b));
@@ -2000,8 +1909,8 @@ mod tests {
             assert!(get_block_by_root(&rt, &sibling).unwrap().is_some());
             assert_eq!(
                 get_state_root(&rt, Slot::new(2)).unwrap(),
-                Some(state_s),
-                "state_roots[slot] is written with the body"
+                Some(state_b),
+                "head: None must not replace the canonical slot's state root"
             );
             let (da, da_slot) = get_da_status(&rt, &sibling).unwrap().unwrap();
             assert_eq!(da, DaStatus::Deferred);
@@ -2067,7 +1976,7 @@ mod tests {
         let state_g = Root::from_array([0xA0; 32]);
         let state_a = Root::from_array([0xA1; 32]);
         let state_s = Root::from_array([0xA2; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         archive
             .commit_import(durable_import(
                 1,
@@ -2111,7 +2020,7 @@ mod tests {
         let state_a = Root::from_array([0xB1; 32]);
         let state_b = Root::from_array([0xB2; 32]);
         let state_s = Root::from_array([0xB3; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         archive
             .commit_import(durable_import(
                 1,
@@ -2168,7 +2077,7 @@ mod tests {
         let a = Root::from_array([0x32; 32]);
         let state_g = Root::from_array([0xC0; 32]);
         let state_a = Root::from_array([0xC1; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         archive
             .commit_import(durable_import(
                 1,
@@ -2240,7 +2149,7 @@ mod tests {
         let state_g = Root::from_array([0xD0; 32]);
         let state_a = Root::from_array([0xD1; 32]);
         let state_b = Root::from_array([0xD2; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         archive
             .commit_import(durable_import(
                 1,
@@ -2300,7 +2209,7 @@ mod tests {
         let (dir, engine, archive, shutdown_tx) = block_archive("head-refuse");
         let g = Root::from_array([0x51; 32]);
         let state_g = Root::from_array([0xE0; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         let before = load_write_cursor(&engine).unwrap().unwrap();
         let scalars_before = {
             let rt = engine.read().unwrap();
@@ -2378,7 +2287,7 @@ mod tests {
         let state_a = Root::from_array([0xE2; 32]);
         let state_b = Root::from_array([0xE3; 32]);
         let state_s = Root::from_array([0xE4; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         archive
             .commit_import(durable_import(
                 1,
@@ -2473,7 +2382,7 @@ mod tests {
         let archive = ArchiveWriter::new(handle, Arc::clone(&engine));
         let g = Root::from_array([0x71; 32]);
         let state_g = Root::from_array([0xE5; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         let before = load_write_cursor(&engine).unwrap().unwrap();
         let scalars_before = {
             let rt = engine.read().unwrap();
@@ -2517,7 +2426,7 @@ mod tests {
         let a = Root::from_array([0x82; 32]);
         let state_g = Root::from_array([0xE7; 32]);
         let state_a = Root::from_array([0xE8; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         archive
             .commit_import(durable_import(
                 1,
@@ -2565,7 +2474,7 @@ mod tests {
         let (dir, engine, archive, shutdown_tx) = block_archive("parent-missing");
         let g = Root::from_array([0x91; 32]);
         let state_g = Root::from_array([0xE9; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         let before = load_write_cursor(&engine).unwrap().unwrap();
         let missing = Root::from_array([0x92; 32]);
         let child = Root::from_array([0x93; 32]);
@@ -2602,7 +2511,7 @@ mod tests {
         let (dir, engine, archive, shutdown_tx) = block_archive("head-other");
         let g = Root::from_array([0xA1; 32]);
         let state_g = Root::from_array([0xEB; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         let before = load_write_cursor(&engine).unwrap().unwrap();
         let a = Root::from_array([0xA2; 32]);
         let mut import = durable_import(
@@ -2687,7 +2596,7 @@ mod tests {
         let (dir, _engine, archive, shutdown_tx) = block_archive("precondition-parent");
         let parent = Root::from_array([0x21; 32]);
         let state = Root::from_array([0x22; 32]);
-        ingest_signed(&archive, 0, &parent, &parent, &state).await;
+        seed_chain(&archive, 0, &parent, &parent, &state).await;
         archive
             .import_precondition(parent.into_array())
             .expect("durable parent is admitted");
@@ -2804,7 +2713,7 @@ mod tests {
         );
         ArchiveWriter::ensure_write_cursor(&engine).unwrap();
         let archive = ArchiveWriter::new(handle, Arc::clone(&engine));
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         plant_cold_body(&engine, 1, &g, &a, &state_a);
         let mut import = durable_import(
             1,
@@ -2841,7 +2750,7 @@ mod tests {
         let state_g = Root::from_array([0x63; 32]);
         let state_a = Root::from_array([0x64; 32]);
         let above = Root::from_array([0x65; 32]);
-        ingest_signed(&archive, 0, &g, &g, &state_g).await;
+        seed_chain(&archive, 0, &g, &g, &state_g).await;
         let ssz = plant_cold_body(&engine, 1, &g, &a, &state_a);
         {
             let rt = engine.read().unwrap();

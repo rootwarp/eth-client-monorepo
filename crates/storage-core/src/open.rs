@@ -7,7 +7,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use cc_store::blocks::{get_block_by_root, get_state_root};
 use cc_store::canonical::get_canonical;
+use cc_store::columns::{DaStatus, get_da_status};
 use cc_store::engine::{Durability, Engine, EngineOptions};
 use cc_store::meta::{
     ForkChoiceScalars, KEY_FC_SCALARS, KEY_WRITE_CURSOR, TABLE_META, WriteCursor,
@@ -23,7 +25,8 @@ use tokio::sync::watch;
 
 use crate::archive_write::ArchiveWriter;
 use crate::durable_set::{
-    DurableSetContext, load_expected_node_id_from_key_path, refuse_missing_key_if_anchor_present,
+    DurableDaStatus, DurableSetContext, load_expected_node_id_from_key_path,
+    refuse_missing_key_if_anchor_present,
 };
 use crate::metrics::StorageMetrics;
 use crate::resume::{self, ResumeError};
@@ -306,6 +309,12 @@ pub struct DurableFrontier {
     pub head_slot: u64,
     /// `canonical[slot]` for each requested slot, in order. `None` is no row.
     pub canonical: Vec<Option<[u8; 32]>>,
+    /// Body at `canonical[slot]`, aligned with [`Self::canonical`].
+    pub bodies: Vec<Option<Vec<u8>>>,
+    /// `state_roots[slot]` for each requested slot.
+    pub state_roots: Vec<Option<[u8; 32]>>,
+    /// DA verdict for `canonical[slot]`'s root. `None` when that row is absent.
+    pub da_status: Vec<Option<DurableDaStatus>>,
 }
 
 /// Read the durable head, cursor, and canonical rows at `canonical_slots`.
@@ -344,6 +353,27 @@ pub fn durable_frontier(
             .map_err(|e| anyhow::anyhow!("canonical slot {slot}: {e}"))?;
         canonical.push(row.as_ref().map(root_bytes));
     }
+    let mut bodies = Vec::with_capacity(canonical.len());
+    let mut state_roots = Vec::with_capacity(canonical.len());
+    let mut da_status = Vec::with_capacity(canonical.len());
+    for (slot, canon) in canonical_slots.iter().zip(&canonical) {
+        let state = get_state_root(&rt, Slot::new(*slot))
+            .map_err(|e| anyhow::anyhow!("state root slot {slot}: {e}"))?;
+        state_roots.push(state.as_ref().map(root_bytes));
+        let Some(root_arr) = canon else {
+            bodies.push(None);
+            da_status.push(None);
+            continue;
+        };
+        let root = cc_types::Root::from_array(*root_arr);
+        let body = get_block_by_root(&rt, &root).map_err(|e| anyhow::anyhow!("block body: {e}"))?;
+        bodies.push(body);
+        let da = get_da_status(&rt, &root).map_err(|e| anyhow::anyhow!("da status: {e}"))?;
+        da_status.push(da.map(|(status, _)| match status {
+            DaStatus::Available => DurableDaStatus::Available,
+            DaStatus::Deferred => DurableDaStatus::Deferred,
+        }));
+    }
     Ok(DurableFrontier {
         cursor,
         scalars_present: scalars.is_some(),
@@ -353,7 +383,24 @@ pub fn durable_frontier(
             .unwrap_or([0; 32]),
         head_slot: scalars.as_ref().map(|s| s.head_slot.as_u64()).unwrap_or(0),
         canonical,
+        bodies,
+        state_roots,
+        da_status,
     })
+}
+
+/// Read [`durable_frontier`] after the writer has released the file.
+///
+/// This is the engine open, not `boot`: a second `boot` is one bootstrap
+/// per process, and a populated store without a genesis validators root is
+/// refused by the boot gates. The committed rows are still in the file.
+pub fn reopen_durable_frontier(
+    data_dir: &Path,
+    canonical_slots: &[u64],
+) -> anyhow::Result<DurableFrontier> {
+    let engine = Engine::open(data_dir, EngineOptions::default())
+        .map_err(|e| anyhow::anyhow!("reopen store: {e}"))?;
+    durable_frontier(&engine, canonical_slots)
 }
 
 fn read_meta(rt: &cc_store::engine::ReadTxn, key: &str) -> anyhow::Result<Option<Vec<u8>>> {

@@ -295,25 +295,6 @@ pub trait P2pEgress: Send + Sync + 'static {
     fn update_view(&self, view: ChainView);
 }
 
-/// Signed-block ingest unit for the archive writer (S2-A-14).
-///
-/// Same continuity bind as [`ColumnBatch`]: a batch may only extend the
-/// durable frontier. The old genesis rule (`parent_root == block_root`) is
-/// struck: genesis is an anchor ([`TrustedAnchor`]). Callers that still
-/// remap a zero parent have not moved off this type yet.
-///
-/// Removed in S2R-A-12, with the last caller. Replaced by [`DurableImport`]
-/// and [`ArchiveWrite::commit_import`], not widened. `import.rs` calls this
-/// until S2R-A-05; `import_durable.rs` until S2R-A-12. Do not add callers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IngestBlock {
-    /// Parent the block attaches to.
-    pub parent_root: Root,
-    pub slot: u64,
-    pub block_root: Root,
-    pub ssz: Bytes,
-}
-
 /// Typed column ingest unit. **`index` is a field, not a byte-offset guess**
 /// (`[ARCH]` §4.3 / S2-A-04).
 ///
@@ -436,26 +417,6 @@ pub struct Snapshot {
 #[async_trait]
 pub trait ArchiveWrite: Send + Sync + 'static {
     async fn ingest_columns(&self, batch: ColumnBatch) -> Result<(), SeamError>;
-
-    /// Persist an imported signed block through the live P0 writer.
-    ///
-    /// Default is a no-op so column-only test doubles stay valid. Production
-    /// [`ArchiveWriter`] submits a `CommitUnit` (mailbox + one batch).
-    ///
-    /// Removed in S2R-A-12. Do not add callers; new work uses
-    /// [`Self::commit_import`].
-    async fn ingest_block(&self, block: IngestBlock) -> Result<(), SeamError> {
-        let _ = block;
-        Ok(())
-    }
-
-    /// Sync ingest for the core OS thread (not a tokio worker).
-    ///
-    /// Removed in S2R-A-12, with [`Self::ingest_block`].
-    fn ingest_block_blocking(&self, block: IngestBlock) -> Result<(), SeamError> {
-        let _ = block;
-        Ok(())
-    }
 
     /// Whether this block's durable rows (body) are already in the store.
     ///
