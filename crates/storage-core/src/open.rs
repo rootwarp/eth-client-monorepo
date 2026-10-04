@@ -27,7 +27,7 @@ use tokio::sync::watch;
 
 use crate::archive_write::ArchiveWriter;
 use crate::durable_set::{
-    DurableDaStatus, DurableSetContext, refuse_missing_key_if_anchor_present,
+    DurableDaStatus, DurableSetContext, ItemAssessment, refuse_missing_key_if_anchor_present,
 };
 use crate::metrics::StorageMetrics;
 use crate::node_id::{NodeIdExpectation, NodeIdScheme};
@@ -623,11 +623,22 @@ fn read_stored_node_id(engine: &Engine) -> anyhow::Result<Option<Root>> {
     Ok(None)
 }
 
-/// Load the durable set from an already-opened store. `None` = empty (checkpoint).
+/// Load the durable set from an already-opened store. `None` = uninitialized (checkpoint).
+///
+/// `Incomplete` is an error naming the `DurableItem`. It is not `None`.
 pub fn durable_set(db: &OpenedStore, chain: &ChainConfig) -> anyhow::Result<Option<DurableSet>> {
     let engine = db.store.engine();
-    if resume::is_store_empty(engine).map_err(|e| anyhow::anyhow!("{e}"))? {
-        return Ok(None);
+    match resume::classify(engine).map_err(|e| anyhow::anyhow!("{e}"))? {
+        resume::RestartState::Uninitialized => return Ok(None),
+        resume::RestartState::Incomplete(assessment) => {
+            let detail = match assessment {
+                ItemAssessment::NamedFailure { detail, .. }
+                | ItemAssessment::Degradation { detail, .. } => detail,
+                ItemAssessment::Present => "restart classification incomplete".to_owned(),
+            };
+            anyhow::bail!("{detail}");
+        }
+        resume::RestartState::Complete => {}
     }
     let ctx = DurableSetContext {
         expected_node_id: db.expected_node_id,
@@ -961,6 +972,23 @@ mod tests {
             put_canonical(&rt, &mut batch, slot, &root).unwrap();
         }
         engine.commit(batch).unwrap();
+    }
+
+    /// Bodies without an anchor are not the checkpoint arm.
+    #[test]
+    fn durable_set_on_bodies_without_anchor_names_the_item() {
+        let dir = unique_temp_dir("bodies-no-anchor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = open(&dir, test_opts(NodeIdExpectation::Unset)).expect("empty open");
+        let chain = fixture_chain("hoodi-config.yaml");
+        assert!(durable_set(&opened, &chain).unwrap().is_none());
+        put_canonical_slot(&opened, 3, 0xAB);
+        let err = durable_set(&opened, &chain).unwrap_err();
+        assert!(
+            err.to_string().contains("anchor"),
+            "incomplete must name the item, not return None: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Gappy parent-walk canonical (slots 100 and 110) must survive same-key

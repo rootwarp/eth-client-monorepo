@@ -27,9 +27,12 @@ use cc_store::columns::{
     column_parent_root_at_offset,
 };
 use cc_store::engine::{Engine, StoreError};
-use cc_store::meta::{AnchorInfo, KEY_NODE_ID, SnapshotCompletion, Split, TABLE_META, WriteCursor};
+use cc_store::meta::{
+    AnchorInfo, ForkChoiceScalars, KEY_NODE_ID, SnapshotCompletion, Split, TABLE_META, WriteCursor,
+};
 use cc_store::{DaStatus, Root, Slot, SszDecode, SszEncode, get_block_by_root};
 
+use crate::resume::{RestartState, classify};
 use crate::writer::{
     CommitUnit, StagedAnchor, StagedBlock, StagedColumn, StagedForkChoiceScalars, WriterError,
     WriterHandle, block_present, load_write_cursor, store_is_uninitialized,
@@ -339,9 +342,9 @@ impl ArchiveWrite for ArchiveWriter {
     }
 
     fn import_precondition(&self, parent_root: cc_seam::Root) -> Result<(), SeamError> {
-        // Same predicate `commit_import` already applies. Not the restart
-        // tri-state: an empty store is `STORE_INCOMPLETE`, then a missing
-        // parent on a store that holds a body is `PARENT_NOT_DURABLE`.
+        // Same predicate `commit_import` already applies. A store that is not
+        // `Complete` is `STORE_INCOMPLETE`, then a missing parent is
+        // `PARENT_NOT_DURABLE`.
         admit_import_store(&self.engine)?;
         match block_present(&self.engine, &Root::from_array(parent_root)) {
             Ok(true) => Ok(()),
@@ -499,6 +502,15 @@ fn precondition(reason: FailedPreconditionReason) -> SeamError {
     SeamError::FailedPrecondition { reason }
 }
 
+/// A committed scalar blob must still decode, or the next admit is `Incomplete`.
+fn require_fork_choice_scalars(bytes: &[u8]) -> Result<(), SeamError> {
+    ForkChoiceScalars::from_ssz_bytes(bytes)
+        .map(|_| ())
+        .map_err(|err| {
+            SeamError::InvalidArgument(format!("ForkChoiceScalars decode failed: {err:?}"))
+        })
+}
+
 fn da_status_of(verdict: DaVerdict) -> DaStatus {
     match verdict {
         DaVerdict::Available => DaStatus::Available,
@@ -506,25 +518,18 @@ fn da_status_of(verdict: DaVerdict) -> DaStatus {
     }
 }
 
-/// Empty stores are [`FailedPreconditionReason::StoreIncomplete`].
+/// `commit_import` and `set_head` are legal only on [`RestartState::Complete`].
 ///
-/// A store that already holds a body admits `commit_import` and `set_head`.
-/// The restart tri-state replaces this predicate; head durability is separate
-/// and is not relaxed here.
+/// `Uninitialized` and `Incomplete` are both
+/// [`FailedPreconditionReason::StoreIncomplete`]. Head durability is a
+/// separate check and is not relaxed here.
 fn admit_import_store(engine: &Engine) -> Result<(), SeamError> {
-    if store_has_durable_body(engine)? {
-        Ok(())
-    } else {
-        Err(precondition(FailedPreconditionReason::StoreIncomplete))
+    match classify(engine).map_err(|e| SeamError::Unavailable(e.to_string()))? {
+        RestartState::Complete => Ok(()),
+        RestartState::Uninitialized | RestartState::Incomplete(_) => {
+            Err(precondition(FailedPreconditionReason::StoreIncomplete))
+        }
     }
-}
-
-fn store_has_durable_body(engine: &Engine) -> Result<bool, SeamError> {
-    let rt = engine
-        .read()
-        .map_err(|e| SeamError::Unavailable(e.to_string()))?;
-    rt.has_any(cc_store::TABLE_BLOCK_SLOT_BY_ROOT)
-        .map_err(|e| SeamError::Unavailable(e.to_string()))
 }
 
 fn next_cursor(engine: &Engine, slot: Slot, root: Root) -> Result<WriteCursor, SeamError> {
@@ -605,6 +610,7 @@ fn bind_durable_import(engine: &Engine, import: DurableImport) -> Result<CommitU
         Some(_) => true,
         None => false,
     };
+    require_fork_choice_scalars(import.scalars.as_ref())?;
 
     let claimed_root = Root::from_array(import.block_root);
     let cursor = next_cursor(engine, ssz_slot, claimed_root)?;
@@ -646,6 +652,7 @@ fn bind_set_head(
             "head_slot does not match the durable body".into(),
         ));
     }
+    require_fork_choice_scalars(scalars.as_ref())?;
     let cursor = next_cursor(engine, slot, root)?;
     Ok(CommitUnit {
         blocks: Vec::new(),
@@ -1239,7 +1246,7 @@ mod tests {
                 &a_root,
                 &state,
                 DaVerdict::Available,
-                b"scalars-a",
+                &scalars_ssz(&a_root, 1),
                 true,
             ))
             .await
@@ -1252,7 +1259,7 @@ mod tests {
                 &b_root,
                 &state,
                 DaVerdict::Available,
-                b"scalars-b",
+                &scalars_ssz(&b_root, 2),
                 true,
             ))
             .await
@@ -1265,7 +1272,7 @@ mod tests {
                 &a_root,
                 &state,
                 DaVerdict::Available,
-                b"scalars-a2",
+                &scalars_ssz(&a_root, 1),
                 false,
             ))
             .await
@@ -1316,7 +1323,7 @@ mod tests {
                 &root,
                 &state,
                 DaVerdict::Available,
-                b"scalars",
+                &scalars_ssz(&root, 1),
                 true,
             ))
             .await
@@ -1337,12 +1344,16 @@ mod tests {
     }
 
     fn scalars_ssz(head: &Root, slot: u64) -> Vec<u8> {
+        scalars_ssz_time(head, slot, slot)
+    }
+
+    fn scalars_ssz_time(head: &Root, slot: u64, time: u64) -> Vec<u8> {
         let checkpoint = Checkpoint {
             epoch: Epoch::new(slot / 32),
             root: *head,
         };
         ForkChoiceScalars {
-            time: slot,
+            time,
             proposer_boost_root: Root::ZERO,
             justified: checkpoint,
             finalized: checkpoint,
@@ -1455,7 +1466,7 @@ mod tests {
                 &child_root,
                 &state,
                 DaVerdict::Available,
-                b"scalars-child",
+                &scalars_ssz(&child_root, slot + 1),
                 true,
             ))
             .await
@@ -1847,6 +1858,7 @@ mod tests {
                 .expect("self-parent genesis is commit_anchor");
             return;
         }
+        let scalars = scalars_ssz(root, slot);
         archive
             .commit_import(durable_import(
                 slot,
@@ -1854,7 +1866,7 @@ mod tests {
                 root,
                 state,
                 DaVerdict::Available,
-                b"scalars-seed",
+                &scalars,
                 true,
             ))
             .await
@@ -1886,6 +1898,7 @@ mod tests {
             drop(rt);
 
             let before = load_write_cursor(&engine).unwrap().unwrap();
+            let sibling_scalars = scalars_ssz(&b, 2);
             archive
                 .commit_import(durable_import(
                     2,
@@ -1893,7 +1906,7 @@ mod tests {
                     &sibling,
                     &state_s,
                     DaVerdict::Deferred,
-                    b"scalars-sibling",
+                    &sibling_scalars,
                     false,
                 ))
                 .await
@@ -1920,7 +1933,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .as_slice(),
-                b"scalars-sibling"
+                sibling_scalars.as_slice()
             );
             drop(rt);
             let after = load_write_cursor(&engine).unwrap().unwrap();
@@ -1937,7 +1950,7 @@ mod tests {
                     &shorter,
                     &Root::from_array([0xF4; 32]),
                     DaVerdict::Available,
-                    b"scalars-shorter",
+                    &scalars_ssz(&shorter, 1),
                     false,
                 ))
                 .await
@@ -1984,7 +1997,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Available,
-                b"scalars-a",
+                &scalars_ssz(&a, 1),
                 true,
             ))
             .await
@@ -1996,7 +2009,7 @@ mod tests {
                 &sibling,
                 &state_s,
                 DaVerdict::Deferred,
-                b"scalars-s",
+                &scalars_ssz(&sibling, 1),
                 false,
             ))
             .await
@@ -2028,7 +2041,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Available,
-                b"scalars-a",
+                &scalars_ssz(&a, 1),
                 true,
             ))
             .await
@@ -2040,7 +2053,7 @@ mod tests {
                 &b,
                 &state_b,
                 DaVerdict::Available,
-                b"scalars-b",
+                &scalars_ssz(&b, 2),
                 true,
             ))
             .await
@@ -2052,7 +2065,7 @@ mod tests {
                 &sibling,
                 &state_s,
                 DaVerdict::Deferred,
-                b"scalars-s",
+                &scalars_ssz(&sibling, 1),
                 true,
             ))
             .await
@@ -2085,7 +2098,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Deferred,
-                b"scalars-v1",
+                &scalars_ssz(&a, 1),
                 false,
             ))
             .await
@@ -2099,6 +2112,7 @@ mod tests {
             get_block_by_root(&rt, &a).unwrap().unwrap()
         };
         let before = load_write_cursor(&engine).unwrap().unwrap();
+        let v2 = scalars_ssz_time(&a, 1, 9);
         archive
             .commit_import(durable_import(
                 1,
@@ -2106,7 +2120,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Available,
-                b"scalars-v2",
+                &v2,
                 false,
             ))
             .await
@@ -2125,7 +2139,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .as_slice(),
-            b"scalars-v2"
+            v2.as_slice()
         );
         assert_eq!(get_state_root(&rt, Slot::new(1)).unwrap(), Some(state_a));
         assert_eq!(
@@ -2157,7 +2171,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Deferred,
-                b"scalars-a",
+                &scalars_ssz(&a, 1),
                 false,
             ))
             .await
@@ -2169,12 +2183,13 @@ mod tests {
                 &b,
                 &state_b,
                 DaVerdict::Available,
-                b"scalars-b",
+                &scalars_ssz(&b, 2),
                 true,
             ))
             .await
             .unwrap();
         let rows = measure_class_stats(&engine).unwrap().blocks_rows;
+        let a2 = scalars_ssz_time(&a, 1, 9);
         archive
             .commit_import(durable_import(
                 1,
@@ -2182,7 +2197,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Available,
-                b"scalars-a2",
+                &a2,
                 true,
             ))
             .await
@@ -2198,7 +2213,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .as_slice(),
-            b"scalars-a2"
+            a2.as_slice()
         );
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2295,7 +2310,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Available,
-                b"scalars-a",
+                &scalars_ssz(&a, 1),
                 true,
             ))
             .await
@@ -2307,7 +2322,7 @@ mod tests {
                 &b,
                 &state_b,
                 DaVerdict::Available,
-                b"scalars-b",
+                &scalars_ssz(&b, 2),
                 true,
             ))
             .await
@@ -2319,7 +2334,7 @@ mod tests {
                 &sibling,
                 &state_s,
                 DaVerdict::Deferred,
-                b"scalars-s",
+                &scalars_ssz(&sibling, 1),
                 false,
             ))
             .await
@@ -2333,7 +2348,7 @@ mod tests {
                     head_slot: 1,
                     cause: HeadCause::Attestation,
                 },
-                Bytes::from_static(b"scalars-head"),
+                Bytes::from(scalars_ssz(&sibling, 1)),
             )
             .await
             .unwrap();
@@ -2347,7 +2362,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .as_slice(),
-            b"scalars-head"
+            scalars_ssz(&sibling, 1).as_slice()
         );
         // set_head does not insert a body and does not move state_roots.
         assert_eq!(get_state_root(&rt, Slot::new(1)).unwrap(), Some(state_a));
@@ -2397,7 +2412,7 @@ mod tests {
                 &a,
                 &Root::from_array([0xE6; 32]),
                 DaVerdict::Available,
-                b"scalars-fail",
+                &scalars_ssz(&a, 1),
                 true,
             ))
             .await
@@ -2427,6 +2442,7 @@ mod tests {
         let state_g = Root::from_array([0xE7; 32]);
         let state_a = Root::from_array([0xE8; 32]);
         seed_chain(&archive, 0, &g, &g, &state_g).await;
+        let avail_scalars = scalars_ssz(&a, 1);
         archive
             .commit_import(durable_import(
                 1,
@@ -2434,7 +2450,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Available,
-                b"scalars-avail",
+                &avail_scalars,
                 false,
             ))
             .await
@@ -2447,7 +2463,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Deferred,
-                b"scalars-demote",
+                &scalars_ssz(&a, 1),
                 false,
             ))
             .await
@@ -2463,7 +2479,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .as_slice(),
-            b"scalars-avail"
+            avail_scalars.as_slice()
         );
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2572,6 +2588,132 @@ mod tests {
             ),
             "{err}"
         );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Conformance case 12. A body without the `Complete` set is not an empty
+    /// store and is not a legal import. The parent is durable, so the refusal
+    /// is the store, not `PARENT_NOT_DURABLE`.
+    #[tokio::test]
+    async fn commit_import_on_incomplete_store_is_failed_precondition() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("import-incomplete");
+        let parent = Root::from_array([0xC1; 32]);
+        let parent_state = Root::from_array([0xF1; 32]);
+        let parent_ssz = synth_block(4, &Root::from_array([0x10; 32]), &parent_state);
+        {
+            let rt = engine.read().unwrap();
+            let mut batch = engine.batch();
+            put_block(
+                &rt,
+                &mut batch,
+                Slot::new(4),
+                &parent,
+                &parent_ssz,
+                BlockRegion::Hot,
+                false,
+            )
+            .unwrap();
+            drop(rt);
+            engine.commit(batch).unwrap();
+        }
+        let before = load_write_cursor(&engine).unwrap().unwrap();
+        let child = Root::from_array([0xC2; 32]);
+        let err = archive
+            .commit_import(durable_import(
+                5,
+                &parent,
+                &child,
+                &Root::from_array([0xF2; 32]),
+                DaVerdict::Available,
+                b"scalars",
+                true,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SeamError::FailedPrecondition {
+                    reason: FailedPreconditionReason::StoreIncomplete,
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "seam failed precondition: STORE_INCOMPLETE"
+        );
+        assert_eq!(load_write_cursor(&engine).unwrap().unwrap(), before);
+        let rt = engine.read().unwrap();
+        assert!(get_block_by_root(&rt, &child).unwrap().is_none());
+        assert_eq!(
+            get_block_by_root(&rt, &parent).unwrap().as_deref(),
+            Some(parent_ssz.as_slice())
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opaque scalar bytes must not commit. The next admit would be `Incomplete`.
+    #[tokio::test]
+    async fn undecodable_scalars_are_rejected_before_commit() {
+        let (dir, engine, archive, shutdown_tx) = block_archive("bad-scalars");
+        let g = Root::from_array([0xD1; 32]);
+        let state = Root::from_array([0xD2; 32]);
+        seed_chain(&archive, 0, &g, &g, &state).await;
+        let before = {
+            let rt = engine.read().unwrap();
+            rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes()).unwrap()
+        };
+        let child = Root::from_array([0xD3; 32]);
+        let err = archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &child,
+                &state,
+                DaVerdict::Available,
+                b"not-ssz",
+                true,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeamError::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains("ForkChoiceScalars"), "{err}");
+        {
+            let rt = engine.read().unwrap();
+            assert!(get_block_by_root(&rt, &child).unwrap().is_none());
+            assert_eq!(
+                rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes()).unwrap(),
+                before
+            );
+        }
+        archive
+            .commit_import(durable_import(
+                1,
+                &g,
+                &child,
+                &state,
+                DaVerdict::Available,
+                &scalars_ssz(&child, 1),
+                true,
+            ))
+            .await
+            .unwrap();
+        let err = archive
+            .set_head(
+                HeadChange {
+                    head_root: child.into_array(),
+                    head_slot: 1,
+                    cause: HeadCause::Attestation,
+                },
+                Bytes::from_static(b"not-ssz"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeamError::InvalidArgument(_)), "{err}");
+        assert!(err.to_string().contains("ForkChoiceScalars"), "{err}");
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2721,7 +2863,7 @@ mod tests {
             &a,
             &state_a,
             DaVerdict::Available,
-            b"scalars-bad",
+            &scalars_ssz(&a, 1),
             true,
         );
         let other = Root::from_array([0x75; 32]);
@@ -2769,6 +2911,7 @@ mod tests {
                 .unwrap()
         };
         let before = load_write_cursor(&engine).unwrap().unwrap();
+        let cold_v1 = scalars_ssz(&a, 1);
 
         archive
             .commit_import(durable_import(
@@ -2777,7 +2920,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Deferred,
-                b"scalars-cold-v1",
+                &cold_v1,
                 false,
             ))
             .await
@@ -2801,7 +2944,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .as_slice(),
-                b"scalars-cold-v1"
+                cold_v1.as_slice()
             );
         }
         let mid = load_write_cursor(&engine).unwrap().unwrap();
@@ -2814,7 +2957,7 @@ mod tests {
                 &a,
                 &state_a,
                 DaVerdict::Available,
-                b"scalars-cold-v2",
+                &scalars_ssz_time(&a, 1, 9),
                 true,
             ))
             .await
@@ -2837,7 +2980,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .as_slice(),
-                b"scalars-cold-v2"
+                scalars_ssz_time(&a, 1, 9).as_slice()
             );
         }
         let after = load_write_cursor(&engine).unwrap().unwrap();
@@ -2951,19 +3094,52 @@ mod tests {
         let child = Root::from_array([0x22; 32]);
         let state = Root::from_array([0xF4; 32]);
         {
+            // Admit refuses an incomplete store before the writer can stall.
             let ssz = synth_block(0, &Root::ZERO, &state);
+            let slot = Slot::new(0);
             let rt = engine.read().unwrap();
             let mut batch = engine.batch();
             put_block(
                 &rt,
                 &mut batch,
-                Slot::new(0),
+                slot,
                 &parent,
                 &ssz,
                 BlockRegion::Hot,
                 false,
             )
             .unwrap();
+            cc_store::put_da_status(&rt, &mut batch, &parent, DaStatus::Available, slot).unwrap();
+            let snap = b"deadline-snap";
+            batch.put(
+                cc_store::TABLE_SNAPSHOTS,
+                &cc_store::encode_snapshot_key(slot),
+                snap,
+            );
+            cc_store::put_snapshot_completion(
+                &mut batch,
+                &SnapshotCompletion {
+                    slot,
+                    state_root: state,
+                    bytes: snap.len() as u64,
+                },
+            );
+            let anchor = AnchorInfo {
+                anchor_slot: slot,
+                anchor_root: parent,
+                anchor_state_root: state,
+                ..AnchorInfo::default()
+            };
+            batch.put(
+                TABLE_META,
+                KEY_ANCHOR_INFO.as_bytes(),
+                &anchor.as_ssz_bytes(),
+            );
+            batch.put(
+                TABLE_META,
+                KEY_FC_SCALARS.as_bytes(),
+                &scalars_ssz(&parent, 0),
+            );
             drop(rt);
             engine.commit(batch).unwrap();
         }
@@ -2978,7 +3154,7 @@ mod tests {
                 &child,
                 &state,
                 DaVerdict::Available,
-                b"scalars-deadline",
+                &scalars_ssz(&child, 1),
                 true,
             ))
             .await

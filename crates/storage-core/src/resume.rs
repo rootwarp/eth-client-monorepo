@@ -18,14 +18,14 @@ use std::time::{Duration, Instant};
 
 use cc_store::blocks::{TABLE_BLOCKS_HOT, get_block_by_root};
 use cc_store::canonical::get_canonical;
-use cc_store::engine::Engine;
+use cc_store::engine::{Engine, StoreError};
 use cc_store::keys::{BlockRegion, decode_block_slot_by_root_value, encode_hot_block_key};
 use cc_store::meta::{
     AnchorInfo, ForkChoiceScalars, KEY_ANCHOR_INFO, KEY_CONFIG_DIGEST, KEY_FC_SCALARS,
     KEY_SCHEMA_VERSION, KEY_SPLIT, KEY_WRITE_CURSOR, Split, TABLE_META, WriteCursor,
 };
-use cc_store::snapshots::newest_snapshot;
-use cc_store::{Root, Slot, SszDecode, TABLE_BLOCK_SLOT_BY_ROOT};
+use cc_store::snapshots::{completed_snapshot, newest_snapshot};
+use cc_store::{Root, Slot, SszDecode, TABLE_BLOCK_SLOT_BY_ROOT, get_da_status};
 use cc_types::{ChainConfig, Mainnet, Minimal, Preset, PresetName};
 use tracing::{error, info};
 
@@ -107,20 +107,32 @@ pub(crate) fn run_resume_sequence(
     schema_check(engine, durable_ctx)?;
     observe_phase(metrics, RestartPhase::SchemaCheck, t0.elapsed());
 
-    // ── empty-store branch ──────────────────────────────────────────────────
-    if is_store_empty(engine)? {
-        info!("resume: store empty — no durable seed (4-container chain checkpoint-syncs)");
-        observe_phase(metrics, RestartPhase::RestoreSend, Duration::ZERO);
-        observe_phase(metrics, RestartPhase::SnapshotLoad, Duration::ZERO);
-        observe_phase(metrics, RestartPhase::ChainReplay, Duration::ZERO);
-        observe_phase(metrics, RestartPhase::ForkchoiceRebuild, Duration::ZERO);
-        observe_phase(metrics, RestartPhase::Resubscribe, Duration::ZERO);
-        return Ok(ResumeOutcome {
-            empty: true,
-            head_root: Root::ZERO,
-            head_slot: 0,
-            write_cursor: None,
-        });
+    // Uninitialized is the checkpoint arm. Incomplete names the item and
+    // does not look empty.
+    match classify(engine).map_err(|e| ResumeError::Store(e.to_string()))? {
+        RestartState::Uninitialized => {
+            info!("resume: store empty — no durable seed (4-container chain checkpoint-syncs)");
+            observe_phase(metrics, RestartPhase::RestoreSend, Duration::ZERO);
+            observe_phase(metrics, RestartPhase::SnapshotLoad, Duration::ZERO);
+            observe_phase(metrics, RestartPhase::ChainReplay, Duration::ZERO);
+            observe_phase(metrics, RestartPhase::ForkchoiceRebuild, Duration::ZERO);
+            observe_phase(metrics, RestartPhase::Resubscribe, Duration::ZERO);
+            return Ok(ResumeOutcome {
+                empty: true,
+                head_root: Root::ZERO,
+                head_slot: 0,
+                write_cursor: None,
+            });
+        }
+        RestartState::Incomplete(assessment) => {
+            let detail = match assessment {
+                ItemAssessment::NamedFailure { detail, .. }
+                | ItemAssessment::Degradation { detail, .. } => detail,
+                ItemAssessment::Present => "restart classification incomplete".to_owned(),
+            };
+            return Err(ResumeError::Store(detail));
+        }
+        RestartState::Complete => {}
     }
 
     // ── snapshot_load ───────────────────────────────────────────────────────
@@ -176,7 +188,11 @@ fn schema_check(engine: &Engine, ctx: &DurableSetContext) -> Result<(), ResumeEr
     }
 }
 
-/// Empty when no fork-choice scalars and no snapshot (fresh store after open).
+/// `!has_fc && !has_snap`. A body with no scalars still reports empty.
+///
+/// Not the restart decision. [`classify`] is. No production caller.
+#[cfg_attr(not(test), allow(dead_code))]
+#[deprecated(note = "use classify")]
 pub(crate) fn is_store_empty(engine: &Engine) -> Result<bool, ResumeError> {
     let rt = engine
         .read()
@@ -189,6 +205,142 @@ pub(crate) fn is_store_empty(engine: &Engine) -> Result<bool, ResumeError> {
         .map_err(|e| ResumeError::Store(e.to_string()))?
         .is_some();
     Ok(!has_fc && !has_snap)
+}
+
+/// Restart classification. Not derived from whether scalars are absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestartState {
+    /// No `AnchorInfo` and no block row.
+    ///
+    /// Schema, digest, side keys, node id, and a seeded write cursor do not
+    /// count: a successful open of an empty store writes those before any anchor.
+    Uninitialized,
+    /// Anchor, completed snapshot, scalars, and `da_status` for every body in
+    /// `[snap_slot, scalars.head_slot]`, including the anchor slot.
+    Complete,
+    /// Anything else. The assessment names the failing [`DurableItem`].
+    Incomplete(ItemAssessment),
+}
+
+/// Classify the store for restart.
+///
+/// `Uninitialized` is [`crate::writer::store_is_uninitialized`]. `Complete`
+/// reads the snapshot completion marker, not a partial ring entry. The
+/// `da_status` walk includes `snap_slot`.
+pub(crate) fn classify(engine: &Engine) -> Result<RestartState, StoreError> {
+    if crate::writer::store_is_uninitialized(engine)? {
+        return Ok(RestartState::Uninitialized);
+    }
+    if let Some(failure) = anchor_failure(engine)? {
+        return Ok(RestartState::Incomplete(failure));
+    }
+    let rt = engine.read()?;
+    let Some((marker, _)) = completed_snapshot(&rt)? else {
+        return Ok(RestartState::Incomplete(named_failure(
+            DurableItem::LatestSnapshot,
+            "durable item `latest_snapshot` missing: completion marker absent \
+             or snapshot bytes do not match it",
+        )));
+    };
+    let snap_slot = marker.slot;
+    let Some(scalar_bytes) = rt.get(TABLE_META, KEY_FC_SCALARS.as_bytes())? else {
+        return Ok(RestartState::Incomplete(named_failure(
+            DurableItem::ForkChoice,
+            "durable item `fork_choice` missing: meta key `fc_scalars` absent",
+        )));
+    };
+    let scalars = match ForkChoiceScalars::from_ssz_bytes(&scalar_bytes) {
+        Ok(scalars) => scalars,
+        Err(err) => {
+            return Ok(RestartState::Incomplete(named_failure(
+                DurableItem::ForkChoice,
+                format!("durable item `fork_choice`: ForkChoiceScalars decode failed: {err:?}"),
+            )));
+        }
+    };
+    if scalars.head_slot.as_u64() < snap_slot.as_u64() {
+        return Ok(RestartState::Incomplete(named_failure(
+            DurableItem::ForkChoice,
+            format!(
+                "durable item `fork_choice`: head_slot {} is below snapshot slot {}",
+                scalars.head_slot.as_u64(),
+                snap_slot.as_u64()
+            ),
+        )));
+    }
+    if let Some(root) = body_missing_da_status(&rt, snap_slot, scalars.head_slot)? {
+        return Ok(RestartState::Incomplete(named_failure(
+            DurableItem::DaStatus,
+            format!(
+                "durable item `da_status` missing for body {root} in [{}, {}]",
+                snap_slot.as_u64(),
+                scalars.head_slot.as_u64()
+            ),
+        )));
+    }
+    Ok(RestartState::Complete)
+}
+
+fn anchor_failure(engine: &Engine) -> Result<Option<ItemAssessment>, StoreError> {
+    match assess_item(engine, DurableItem::Anchor, &DurableSetContext::new())? {
+        ItemAssessment::Present => Ok(None),
+        failure @ ItemAssessment::NamedFailure { .. } => Ok(Some(failure)),
+        ItemAssessment::Degradation { detail, .. } => {
+            Ok(Some(named_failure(DurableItem::Anchor, detail)))
+        }
+    }
+}
+
+fn named_failure(item: DurableItem, detail: impl Into<String>) -> ItemAssessment {
+    let detail = detail.into();
+    let detail = if detail.contains(item.as_str()) {
+        detail
+    } else {
+        format!("durable item `{}`: {detail}", item.as_str())
+    };
+    ItemAssessment::NamedFailure { item, detail }
+}
+
+/// First body in `[snap_slot, head_slot]` with no `da_status` row.
+///
+/// `snap_slot` is included. The anchor slot is not skipped.
+fn body_missing_da_status(
+    rt: &cc_store::engine::ReadTxn,
+    snap_slot: Slot,
+    head_slot: Slot,
+) -> Result<Option<Root>, StoreError> {
+    let lo = [0u8; 32];
+    // `&[u8]` order is lexicographic, so a 32-byte key is a prefix of this
+    // longer key and sorts before it. `[0xff; 32]` stays inside the range.
+    let hi = [0xffu8; 33];
+    let start = snap_slot.as_u64();
+    let end = head_slot.as_u64();
+    let mut roots = Vec::new();
+    for item in rt.range(TABLE_BLOCK_SLOT_BY_ROOT, &lo, &hi)? {
+        let (key, value) = item?;
+        if key.len() != 32 {
+            continue;
+        }
+        let Some((slot, _)) = decode_block_slot_by_root_value(&value) else {
+            return Err(StoreError::Codec(format!(
+                "block_slot_by_root value is undecodable ({} bytes)",
+                value.len()
+            )));
+        };
+        let slot = slot.as_u64();
+        if slot < start || slot > end {
+            continue;
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&key);
+        roots.push(Root::from_array(bytes));
+    }
+    for root in roots {
+        if get_da_status(rt, &root)?.is_none() {
+            return Ok(Some(root));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn build_durable_plan(
@@ -566,9 +718,358 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn empty_store_detected() {
         let (dir, engine) = open_empty_store("empty");
         assert!(is_store_empty(&engine).unwrap());
+        let mut registry = Registry::default();
+        let metrics = StorageMetrics::register(&mut registry);
+        let outcome = run_resume_sequence(
+            &engine,
+            &metrics,
+            &DurableSetContext::new(),
+            ResumeExit::Os,
+            &test_chain(0, 0),
+        )
+        .unwrap();
+        assert!(outcome.empty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bodies and no scalars are `Incomplete`, and the error names the item.
+    ///
+    /// The deprecated predicate still reports this fixture empty. Classification
+    /// does not.
+    #[test]
+    #[allow(deprecated)]
+    fn bodies_without_scalars_are_incomplete() {
+        let (dir, engine) = open_empty_store("bodies-no-scalars");
+        let slot = Slot::new(3);
+        let root = Root::from_array([0xAB; 32]);
+        let ssz = synth_block(slot.as_u64());
+        let rt = engine.read().unwrap();
+        let mut batch = engine.batch();
+        put_block(&rt, &mut batch, slot, &root, &ssz, BlockRegion::Hot, false).unwrap();
+        drop(rt);
+        engine.commit(batch).unwrap();
+
+        assert!(
+            is_store_empty(&engine).unwrap(),
+            "deprecated predicate still classifies bodies without scalars as empty"
+        );
+        match classify(&engine).unwrap() {
+            RestartState::Incomplete(failure) => {
+                assert!(
+                    failure.is_named_failure_for(DurableItem::Anchor),
+                    "missing anchor is the first failing item, got {failure:?}"
+                );
+            }
+            other => panic!("expected Incomplete, got {other:?}"),
+        }
+        let mut registry = Registry::default();
+        let metrics = StorageMetrics::register(&mut registry);
+        let err = run_resume_sequence(
+            &engine,
+            &metrics,
+            &DurableSetContext::new(),
+            ResumeExit::Os,
+            &test_chain(0, 0),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("anchor"),
+            "resume must name the item, not checkpoint: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rows a successful open writes before any anchor stay `Uninitialized`.
+    #[test]
+    fn open_stamp_only_is_uninitialized() {
+        use crate::archive_write::ArchiveWriter;
+        use crate::node_id::NodeIdExpectation;
+        use crate::open::{OpenOpts, open};
+        use cc_store::meta::{
+            KEY_CONFIG_DIGEST, KEY_CONFIG_DIGEST_V2, KEY_NODE_ID, KEY_SCHEDULE_DIGEST,
+            KEY_SCHEMA_VERSION, KEY_WRITE_CURSOR,
+        };
+
+        let dir = tmp_dir("open-stamp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let node_id = Root::from_array([0x11; 32]);
+        let pending = open(
+            &dir,
+            OpenOpts {
+                durability: "immediate".into(),
+                check_invariants: false,
+                snapshot_ring: 4,
+                max_open_scan_rows: cc_store::DEFAULT_MAX_OPEN_SCAN_ROWS,
+                genesis_validators_root: Some(format!("0x{}", "ab".repeat(32))),
+                node_id: NodeIdExpectation::Present(node_id),
+                chain: Some(test_chain(0, 0)),
+            },
+        )
+        .unwrap();
+        let opened = pending.pair(NodeIdExpectation::Present(node_id)).unwrap();
+        ArchiveWriter::ensure_write_cursor(opened.engine()).unwrap();
+
+        let rt = opened.engine().read().unwrap();
+        for key in [
+            KEY_SCHEMA_VERSION,
+            KEY_CONFIG_DIGEST,
+            KEY_CONFIG_DIGEST_V2,
+            KEY_SCHEDULE_DIGEST,
+            KEY_NODE_ID,
+            KEY_WRITE_CURSOR,
+        ] {
+            assert!(
+                rt.get(TABLE_META, key.as_bytes()).unwrap().is_some(),
+                "open stamp must have written {key}"
+            );
+        }
+        assert!(
+            rt.get(TABLE_META, KEY_ANCHOR_INFO.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        drop(rt);
+        assert_eq!(
+            classify(opened.engine()).unwrap(),
+            RestartState::Uninitialized
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `da_status` is required at the anchor slot, not from `snap_slot + 1`.
+    #[test]
+    fn da_status_range_includes_the_anchor_slot() {
+        use cc_store::meta::SnapshotCompletion;
+
+        let (dir, engine) = open_empty_store("da-anchor-slot");
+        let snap = Slot::new(8);
+        let head = Slot::new(9);
+        let anchor_root = Root::from_array([0xA1; 32]);
+        let child_root = Root::from_array([0xB2; 32]);
+        let state = b"snap-bytes";
+        let anchor_ssz = synth_block(snap.as_u64());
+        let child_ssz = synth_block(head.as_u64());
+
+        let rt = engine.read().unwrap();
+        let mut batch = engine.batch();
+        put_block(
+            &rt,
+            &mut batch,
+            snap,
+            &anchor_root,
+            &anchor_ssz,
+            BlockRegion::Hot,
+            false,
+        )
+        .unwrap();
+        put_block(
+            &rt,
+            &mut batch,
+            head,
+            &child_root,
+            &child_ssz,
+            BlockRegion::Hot,
+            false,
+        )
+        .unwrap();
+        put_da_status(&rt, &mut batch, &child_root, DaStatus::Available, head).unwrap();
+        batch.put(
+            cc_store::TABLE_SNAPSHOTS,
+            &cc_store::encode_snapshot_key(snap),
+            state,
+        );
+        cc_store::put_snapshot_completion(
+            &mut batch,
+            &SnapshotCompletion {
+                slot: snap,
+                state_root: Root::from_array([0x22; 32]),
+                bytes: state.len() as u64,
+            },
+        );
+        let anchor = AnchorInfo {
+            anchor_slot: snap,
+            anchor_root,
+            anchor_state_root: Root::from_array([0x22; 32]),
+            ..AnchorInfo::default()
+        };
+        batch.put(
+            TABLE_META,
+            KEY_ANCHOR_INFO.as_bytes(),
+            &anchor.as_ssz_bytes(),
+        );
+        let scalars = ForkChoiceScalars {
+            head_root: child_root,
+            head_slot: head,
+            ..ForkChoiceScalars::default()
+        };
+        batch.put(
+            TABLE_META,
+            KEY_FC_SCALARS.as_bytes(),
+            &scalars.as_ssz_bytes(),
+        );
+        drop(rt);
+        engine.commit(batch).unwrap();
+
+        match classify(&engine).unwrap() {
+            RestartState::Incomplete(failure) => {
+                assert!(
+                    failure.is_named_failure_for(DurableItem::DaStatus),
+                    "anchor slot is inside the range, got {failure:?}"
+                );
+            }
+            other => panic!("missing anchor da_status must be Incomplete, got {other:?}"),
+        }
+
+        let rt = engine.read().unwrap();
+        let mut batch = engine.batch();
+        put_da_status(&rt, &mut batch, &anchor_root, DaStatus::Available, snap).unwrap();
+        drop(rt);
+        engine.commit(batch).unwrap();
+        assert_eq!(classify(&engine).unwrap(), RestartState::Complete);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reverse-index end is exclusive, and `[0xff; 32]` is a real root.
+    #[test]
+    fn all_ff_root_is_inside_the_da_range() {
+        use cc_store::meta::SnapshotCompletion;
+
+        let (dir, engine) = open_empty_store("da-ff-root");
+        let snap = Slot::new(4);
+        let anchor_root = Root::from_array([0xff; 32]);
+        let state = b"snap-ff";
+        let anchor_ssz = synth_block(snap.as_u64());
+        let rt = engine.read().unwrap();
+        let mut batch = engine.batch();
+        put_block(
+            &rt,
+            &mut batch,
+            snap,
+            &anchor_root,
+            &anchor_ssz,
+            BlockRegion::Hot,
+            false,
+        )
+        .unwrap();
+        batch.put(
+            cc_store::TABLE_SNAPSHOTS,
+            &cc_store::encode_snapshot_key(snap),
+            state,
+        );
+        cc_store::put_snapshot_completion(
+            &mut batch,
+            &SnapshotCompletion {
+                slot: snap,
+                state_root: Root::from_array([0x22; 32]),
+                bytes: state.len() as u64,
+            },
+        );
+        let anchor = AnchorInfo {
+            anchor_slot: snap,
+            anchor_root,
+            anchor_state_root: Root::from_array([0x22; 32]),
+            ..AnchorInfo::default()
+        };
+        batch.put(
+            TABLE_META,
+            KEY_ANCHOR_INFO.as_bytes(),
+            &anchor.as_ssz_bytes(),
+        );
+        let scalars = ForkChoiceScalars {
+            head_root: anchor_root,
+            head_slot: snap,
+            ..ForkChoiceScalars::default()
+        };
+        batch.put(
+            TABLE_META,
+            KEY_FC_SCALARS.as_bytes(),
+            &scalars.as_ssz_bytes(),
+        );
+        drop(rt);
+        engine.commit(batch).unwrap();
+
+        match classify(&engine).unwrap() {
+            RestartState::Incomplete(failure) => {
+                assert!(
+                    failure.is_named_failure_for(DurableItem::DaStatus),
+                    "all-ff root must be visited, got {failure:?}"
+                );
+            }
+            other => panic!("missing da_status on 0xff root must be Incomplete, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt reverse-index value is a store error, not a skipped row.
+    #[test]
+    fn undecodable_reverse_index_is_a_store_error() {
+        use cc_store::meta::SnapshotCompletion;
+
+        let (dir, engine) = open_empty_store("bad-index");
+        let snap = Slot::new(4);
+        let anchor_root = Root::from_array([0x11; 32]);
+        let state = b"snap-bad";
+        let anchor_ssz = synth_block(snap.as_u64());
+        let rt = engine.read().unwrap();
+        let mut batch = engine.batch();
+        put_block(
+            &rt,
+            &mut batch,
+            snap,
+            &anchor_root,
+            &anchor_ssz,
+            BlockRegion::Hot,
+            false,
+        )
+        .unwrap();
+        put_da_status(&rt, &mut batch, &anchor_root, DaStatus::Available, snap).unwrap();
+        batch.put(TABLE_BLOCK_SLOT_BY_ROOT, &[0x22; 32], b"not-a-slot");
+        batch.put(
+            cc_store::TABLE_SNAPSHOTS,
+            &cc_store::encode_snapshot_key(snap),
+            state,
+        );
+        cc_store::put_snapshot_completion(
+            &mut batch,
+            &SnapshotCompletion {
+                slot: snap,
+                state_root: Root::from_array([0x22; 32]),
+                bytes: state.len() as u64,
+            },
+        );
+        let anchor = AnchorInfo {
+            anchor_slot: snap,
+            anchor_root,
+            anchor_state_root: Root::from_array([0x22; 32]),
+            ..AnchorInfo::default()
+        };
+        batch.put(
+            TABLE_META,
+            KEY_ANCHOR_INFO.as_bytes(),
+            &anchor.as_ssz_bytes(),
+        );
+        let scalars = ForkChoiceScalars {
+            head_root: anchor_root,
+            head_slot: snap,
+            ..ForkChoiceScalars::default()
+        };
+        batch.put(
+            TABLE_META,
+            KEY_FC_SCALARS.as_bytes(),
+            &scalars.as_ssz_bytes(),
+        );
+        drop(rt);
+        engine.commit(batch).unwrap();
+
+        let err = classify(&engine).unwrap_err();
+        assert!(
+            err.to_string().contains("block_slot_by_root"),
+            "corrupt index must not classify Complete, got {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

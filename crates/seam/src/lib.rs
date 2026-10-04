@@ -437,9 +437,8 @@ pub trait ArchiveWrite: Send + Sync + 'static {
     /// The default admits every parent so doubles that do not model a store
     /// keep importing. Production returns the same tokens as
     /// [`Self::commit_import`]: [`FailedPreconditionReason::StoreIncomplete`]
-    /// when the store holds no durable body, then
-    /// [`FailedPreconditionReason::ParentNotDurable`]. This is not the
-    /// restart tri-state.
+    /// when the store is not `Complete`, then
+    /// [`FailedPreconditionReason::ParentNotDurable`].
     fn import_precondition(&self, parent_root: Root) -> Result<(), SeamError> {
         let _ = parent_root;
         Ok(())

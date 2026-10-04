@@ -20,6 +20,7 @@ use anchor_fixture::{
 use cc_beacon_core::boot::boot;
 use cc_chain_core::ArchiveWriteHandle;
 use cc_chain_core::head::HeadSnapshotStore;
+use cc_chain_core::import::ForkChoiceScalarsPayload;
 use cc_chain_core::invalidation::commit_engine_invalidation_head;
 use cc_fork_choice::{
     BlockImport, HarnessAvailability, get_forkchoice_store, get_head, on_block, on_tick,
@@ -30,9 +31,29 @@ use cc_seam::{
 };
 use cc_state_transition::BlockSignatureStrategy;
 use cc_storage_core::{ArchiveWriter, ServedCanonicalBlock};
+use cc_types::containers::Checkpoint;
 use cc_types::preset::Minimal;
-use cc_types::{BeaconState, ForkName, SignedBeaconBlock};
+use cc_types::primitives::{Epoch, Slot};
+use cc_types::{BeaconState, ForkName, Root, SignedBeaconBlock};
 use ssz::Encode;
+
+fn scalars_ssz(head: Root, slot: Slot) -> Vec<u8> {
+    let checkpoint = Checkpoint {
+        epoch: Epoch::new(slot.as_u64() / 32),
+        root: head,
+    };
+    ForkChoiceScalarsPayload {
+        time: slot.as_u64(),
+        proposer_boost_root: Root::ZERO,
+        justified: checkpoint,
+        finalized: checkpoint,
+        unrealized_justified: checkpoint,
+        unrealized_finalized: checkpoint,
+        head_root: head,
+        head_slot: slot,
+    }
+    .as_ssz_bytes()
+}
 
 struct TempDir(std::path::PathBuf);
 
@@ -70,7 +91,7 @@ impl<P: cc_types::preset::Preset> cc_state_transition::ExecutionEngine<P> for Ac
     }
 }
 
-fn bytes_of(root: &cc_types::Root) -> [u8; 32] {
+fn bytes_of(root: &Root) -> [u8; 32] {
     *root.as_array()
 }
 
@@ -83,7 +104,7 @@ fn durable_import(link: &ChainLink, head: bool) -> DurableImport {
         state_root: bytes_of(&link.signed.message.state_root),
         ssz: Bytes::from(link.signed.as_ssz_bytes()),
         da: DaVerdict::Available,
-        scalars: Bytes::from_static(b"m14a"),
+        scalars: Bytes::from(scalars_ssz(link.root, link.signed.message.slot)),
         head: head.then(|| HeadChange {
             head_root: root,
             head_slot: link.signed.message.slot.as_u64(),
@@ -185,7 +206,7 @@ async fn m14a_losing_branch_served_from_the_canonical_view() {
             state_root: [0x46; 32],
             ssz: Bytes::from(refusal_ssz(1, &missing_parent, &[0x46; 32])),
             da: DaVerdict::Available,
-            scalars: Bytes::from_static(b"m14a-refusal"),
+            scalars: Bytes::from(scalars_ssz(Root::from_array([0x45; 32]), Slot::new(1))),
             head: None,
         })
         .await;
@@ -282,7 +303,7 @@ async fn m14a_losing_branch_served_from_the_canonical_view() {
                 head_slot: d4.signed.message.slot.as_u64(),
                 cause: HeadCause::Attestation,
             },
-            Bytes::from_static(b"m14a-attestation"),
+            Bytes::from(scalars_ssz(d4.root, d4.signed.message.slot)),
         )
         .await
         .expect("attestation set_head");
