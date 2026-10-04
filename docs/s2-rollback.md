@@ -423,6 +423,62 @@ This file does not record a re-sync duration. None was measured here.
 
 ---
 
+## E2R.7 — pre-migration backup (in-process)
+
+The `S2-B-14` row above stays **no**. That compose drill was not run.
+This section is the in-process re-rehearsal after the fingerprint
+migration. It does not discharge E2.4 and it does not execute the
+`e854b1d` tree. The rollback target is `previous_topology_open`:
+current `Store::open` with `expected_node_id` set to the raw 32-byte
+secret, plus `refuse_missing_key_if_anchor_present`.
+
+`e2r7_drain_then_backup_opens_and_migrated_store_is_refused` ran on
+develop parent `8496ffe`.
+
+1. `pair` stamped the raw secret. `bind_node_id` was not used for that
+   stamp. A durable anchor row was committed through the writer.
+   `drain_and_shutdown()` returned `Ok`, which is only
+   `WriterStop::Drained` after the mailbox drain. The same
+   `<data_dir>/store.redb` inode was still that file, and `Store::open`
+   of that file succeeded.
+2. `store.redb` and the node key — one backup unit — were copied to a
+   backup directory **before** `bind_node_id`. The copy's inode is not
+   the live file's inode. The copy is not the same file.
+3. The live directory was reopened and `bind_node_id(legacy, fingerprint)`
+   rewrote `meta.node_id` and `AnchorInfo.node_id` to the fingerprint
+   and set scheme byte `1`, in one commit.
+4. `previous_topology_open` on the live migrated directory returned
+   `Err`. The pinned reason is:
+
+```text
+store invariant node_id violated: stored node_id <redacted> does not match the configured node key
+```
+
+   It names `node_id`. It does not contain the 64-hex form of the
+   secret or of the fingerprint.
+5. `previous_topology_open` on the backup directory returned `Ok`.
+   `SCHEMA_VERSION` is still 1. The stored node id in the backup is
+   still the secret.
+
+Do not edit the backup. `docs/key-rotation.md` (S2R-B-12) treats every
+`store.redb` backup, including every pre-migration backup, as
+containing the secret: redb is copy-on-write, and freed pages are not
+documented as zeroed. Deleting or rewriting a row does not make an old
+file safe. Rotate the node key; do not scrub the file.
+
+The live compose drill was not run (**NOT_RUN**). No re-sync duration
+was measured (**NOT_MEASURED**). This rehearsal did not measure clause
+1. The existing row under `## Clause 1 — restart trials` in
+`docs/phase-4-soak.md` stays **NOT_RUN**.
+
+| Claim | Status |
+|---|---|
+| J-08 in-process rehearsal ran | **yes** — `e2r7_drain_then_backup_opens_and_migrated_store_is_refused` on develop parent `8496ffe` |
+| Live compose drill | **NOT_RUN** |
+| Re-sync duration | **NOT_MEASURED** |
+
+---
+
 ## Checklist (operator)
 
 1. Name the live opener (`cc-beacon-core` or compose `storage`) and
