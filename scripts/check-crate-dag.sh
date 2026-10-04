@@ -449,7 +449,9 @@ allowed_deps() {
     cc-storage-core)      echo "cc-store cc-proto cc-bootstrap cc-types cc-config cc-state-transition cc-seam" ;;
     # S2-J-01: thin composer. Not JWT/HTTP-grandfathered. cc-chain is checkpoint
     # sync only (HTTP stays in that crate).
-    cc-beacon-core)       echo "cc-bootstrap cc-config cc-proto cc-types cc-chain-core cc-storage-core cc-engine-api cc-chain" ;;
+    # Composer ArchiveWrite call. Dev-deps: signing + state transition for the
+    # anchor fixture (append-only; never re-sort).
+    cc-beacon-core)       echo "cc-bootstrap cc-config cc-proto cc-types cc-chain-core cc-storage-core cc-engine-api cc-chain cc-seam cc-crypto cc-state-transition" ;;
     # S2-A-13: proto-free in-process boot harness. Never proto / tonic / JWT.
     cc-beacon-inproc)     echo "cc-store cc-types" ;;
     # S2-A-14: proto-free import → durable test crate. Never proto / tonic / JWT.

@@ -7,10 +7,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use cc_store::canonical::get_canonical;
 use cc_store::engine::{Durability, Engine, EngineOptions};
+use cc_store::meta::{
+    ForkChoiceScalars, KEY_FC_SCALARS, KEY_WRITE_CURSOR, TABLE_META, WriteCursor,
+};
 use cc_store::snapshots::newest_snapshot;
 use cc_store::{
-    AnchorGenesisValidatorsRoot, Store, StoreOpenOptions, compute_identity_digest,
+    AnchorGenesisValidatorsRoot, Slot, SszDecode, Store, StoreOpenOptions, compute_identity_digest,
     compute_schedule_digest, legacy_config_digest, legacy_open_needs_anchor_witness,
     reconcile_config_side_keys,
 };
@@ -270,6 +274,97 @@ impl StorageRuntime {
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
     }
+}
+
+/// Durable write cursor as stored under `meta.write_cursor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorSnap {
+    /// Producer session.
+    pub session_id: u64,
+    /// Monotonic sequence within the session.
+    pub seq: u64,
+    /// Slot covered by this cursor.
+    pub slot: u64,
+    /// Block root at this cursor.
+    pub root: [u8; 32],
+}
+
+/// Store head, cursor, and selected canonical rows.
+///
+/// Beacon-core has no fcU/event test spy. A refused `commit_anchor` is checked
+/// against this snapshot: the precondition returns before any core work, so
+/// these rows must not move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableFrontier {
+    /// Absent when the store has no write cursor.
+    pub cursor: Option<CursorSnap>,
+    /// `meta.fc_scalars` decoded.
+    pub scalars_present: bool,
+    /// Fork-choice head root. Zeros when scalars are absent.
+    pub head_root: [u8; 32],
+    /// Fork-choice head slot. Zero when scalars are absent.
+    pub head_slot: u64,
+    /// `canonical[slot]` for each requested slot, in order. `None` is no row.
+    pub canonical: Vec<Option<[u8; 32]>>,
+}
+
+/// Read the durable head, cursor, and canonical rows at `canonical_slots`.
+///
+/// Does not write. Callers compare two snapshots around a refused commit.
+pub fn durable_frontier(
+    engine: &Engine,
+    canonical_slots: &[u64],
+) -> anyhow::Result<DurableFrontier> {
+    let rt = engine
+        .read()
+        .map_err(|e| anyhow::anyhow!("store read: {e}"))?;
+    let cursor = match read_meta(&rt, KEY_WRITE_CURSOR)? {
+        Some(bytes) => {
+            let cursor = WriteCursor::from_ssz_bytes(&bytes)
+                .map_err(|e| anyhow::anyhow!("write cursor SSZ: {e:?}"))?;
+            Some(CursorSnap {
+                session_id: cursor.session_id,
+                seq: cursor.seq,
+                slot: cursor.slot.as_u64(),
+                root: root_bytes(&cursor.root),
+            })
+        }
+        None => None,
+    };
+    let scalars = match read_meta(&rt, KEY_FC_SCALARS)? {
+        Some(bytes) => Some(
+            ForkChoiceScalars::from_ssz_bytes(&bytes)
+                .map_err(|e| anyhow::anyhow!("fork-choice scalars SSZ: {e:?}"))?,
+        ),
+        None => None,
+    };
+    let mut canonical = Vec::with_capacity(canonical_slots.len());
+    for slot in canonical_slots {
+        let row = get_canonical(&rt, Slot::new(*slot))
+            .map_err(|e| anyhow::anyhow!("canonical slot {slot}: {e}"))?;
+        canonical.push(row.as_ref().map(root_bytes));
+    }
+    Ok(DurableFrontier {
+        cursor,
+        scalars_present: scalars.is_some(),
+        head_root: scalars
+            .as_ref()
+            .map(|s| root_bytes(&s.head_root))
+            .unwrap_or([0; 32]),
+        head_slot: scalars.as_ref().map(|s| s.head_slot.as_u64()).unwrap_or(0),
+        canonical,
+    })
+}
+
+fn read_meta(rt: &cc_store::engine::ReadTxn, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    rt.get(TABLE_META, key.as_bytes())
+        .map_err(|e| anyhow::anyhow!("meta {key}: {e}"))
+}
+
+fn root_bytes(root: &cc_types::Root) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(root.as_slice());
+    out
 }
 
 /// Open (or create) the store. Fail-closed gates run here, before any subsystem.

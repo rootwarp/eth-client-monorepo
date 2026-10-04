@@ -152,6 +152,9 @@ fn config_for_dir(root: &std::path::Path) -> BeaconCoreConfig {
         event_ring_bytes: 67_108_864,
         subscriber_queue_capacity: 256,
         checkpoint_providers: Vec::new(),
+        checkpoint_provider: None,
+        genesis_anchor: None,
+        chain_config: None,
         checkpoint_root: None,
         network_config: None,
         engine: cc_engine_api::config::EngineTransportConfig {

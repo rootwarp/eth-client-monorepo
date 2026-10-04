@@ -87,6 +87,10 @@ jobs:
       - name: check no env reads outside crates/config
         run: bash scripts/check-no-env-reads.sh
 
+      # One non-test commit_anchor( call, and it lives in the beacon-core composer.
+      - name: check one commit_anchor call site
+        run: bash scripts/check-one-commit-anchor.sh
+
       # CC-28/2: no HTTP client on the block-import path; p2p tree has no reqwest.
       - name: check no HTTP on import path
         run: bash scripts/check-no-http-import-path.sh

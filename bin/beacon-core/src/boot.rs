@@ -1,7 +1,9 @@
 //! Boot sequence ([ARCH] §4.2).
 //!
 //! ```text
-//! open redb  →  durable_set  →  seed_from_durable | checkpoint_sync
+//! open redb  →  durable_set  →  seed_from_durable
+//!            |  empty: AnchorSource → verify_anchor → commit_anchor
+//!                     → seed_from_durable
 //!            →  start_writer + chain-core  →  serve
 //! ```
 //!
@@ -18,7 +20,8 @@ use cc_bootstrap::{
     TelemetrySettings, serve_with_options,
 };
 use cc_chain::checkpoint_sync::{
-    CheckpointBootstrapConfig, bootstrap_core_from_providers_with_epoch, parse_optional_root,
+    AnchorSource, CheckpointBootstrapConfig, CheckpointClient, CheckpointProvider, VerifiedAnchor,
+    parse_optional_root, verify_anchor,
 };
 use cc_chain_core::core::{CoreConfig, CoreThread};
 use cc_chain_core::engine::DirectEngine;
@@ -37,8 +40,10 @@ use cc_config::ServiceConfig;
 use cc_proto::chain::chain_service_server::ChainServiceServer;
 use cc_storage_core::{OpenOpts, OpenedStore, StorageMetrics, StorageRuntime, durable_set, open};
 use cc_types::config::ChainConfig as NetworkChainConfig;
-use cc_types::preset::Mainnet;
-use cc_types::primitives::Root;
+use cc_types::config::PresetName;
+use cc_types::preset::{Mainnet, Minimal, Preset};
+use cc_types::primitives::{Epoch, Root};
+use cc_types::{BeaconState, ForkName, SignedBeaconBlock};
 use serde::Deserialize;
 use tokio::sync::watch;
 use tonic::service::Routes;
@@ -194,9 +199,20 @@ pub struct BeaconCoreConfig {
     /// Per-subscriber event queue.
     #[serde(default = "default_subscriber_queue_capacity")]
     pub subscriber_queue_capacity: usize,
-    /// Checkpoint sync URLs. Empty leaves the core absent on an empty store.
+    /// Checkpoint sync URLs. Empty leaves the core absent on an empty store
+    /// unless [`Self::checkpoint_provider`] or [`Self::genesis_anchor`] is set.
     #[serde(default)]
     pub checkpoint_providers: Vec<String>,
+    /// Injected checkpoint double. `run` leaves this empty and uses
+    /// [`CheckpointClient`] when [`Self::checkpoint_providers`] is non-empty.
+    #[serde(skip)]
+    pub checkpoint_provider: Option<CheckpointProviderSlot>,
+    /// Local genesis SSZ pair. Mutually exclusive with a checkpoint source.
+    #[serde(skip)]
+    pub genesis_anchor: Option<GenesisAnchorBytes>,
+    /// Chain config override. `run` leaves this empty and loads YAML or Hoodi.
+    #[serde(skip)]
+    pub chain_config: Option<NetworkChainConfig>,
     /// Optional expected checkpoint root.
     #[serde(default)]
     pub checkpoint_root: Option<String>,
@@ -209,6 +225,53 @@ pub struct BeaconCoreConfig {
     /// `MAXIMUM_GOSSIP_CLOCK_DISPARITY` in milliseconds.
     #[serde(default = "default_maximum_gossip_clock_disparity_ms")]
     pub maximum_gossip_clock_disparity_ms: u64,
+}
+
+/// In-process [`CheckpointProvider`]. Not serialized; `run` never sets it.
+pub struct CheckpointProviderSlot {
+    provider: Arc<dyn CheckpointProvider>,
+}
+
+impl std::fmt::Debug for CheckpointProviderSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CheckpointProviderSlot(..)")
+    }
+}
+
+impl CheckpointProviderSlot {
+    /// Wrap a provider double or client.
+    #[must_use]
+    pub fn new(provider: Arc<dyn CheckpointProvider>) -> Self {
+        Self { provider }
+    }
+
+    fn provider(&self) -> Arc<dyn CheckpointProvider> {
+        Arc::clone(&self.provider)
+    }
+}
+
+/// Genesis block and state SSZ for [`AnchorSource::Genesis`].
+///
+/// Parent stays the block's parent (`Root::ZERO` for genesis). This path does
+/// not remap a zero parent onto the block root.
+#[derive(Clone)]
+pub struct GenesisAnchorBytes {
+    /// `BeaconState` SSZ (Fulu).
+    pub state_ssz: Vec<u8>,
+    /// `SignedBeaconBlock` SSZ (Fulu).
+    pub block_ssz: Vec<u8>,
+    /// Optional operator block root. Same check as checkpoint sync.
+    pub expected_block_root: Option<Root>,
+}
+
+impl std::fmt::Debug for GenesisAnchorBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenesisAnchorBytes")
+            .field("state_ssz_len", &self.state_ssz.len())
+            .field("block_ssz_len", &self.block_ssz.len())
+            .field("expected_block_root", &self.expected_block_root)
+            .finish()
+    }
 }
 
 fn default_data_dir() -> PathBuf {
@@ -287,6 +350,9 @@ fn open_and_stamp(cfg: &BootConfig) -> anyhow::Result<OpenedStore> {
 }
 
 fn load_network(cfg: &BeaconCoreConfig) -> anyhow::Result<NetworkChainConfig> {
+    if let Some(chain) = cfg.chain_config.clone() {
+        return Ok(chain);
+    }
     if let Some(path) = cfg.network_config.as_deref() {
         return NetworkChainConfig::from_yaml_file(path)
             .map_err(|e| anyhow::anyhow!("failed to load network_config {path}: {e}"));
@@ -435,6 +501,7 @@ pub struct BootedNode {
     options: ServeOptions,
     core: Option<CoreConfig>,
     storage: StorageRuntime,
+    chain: ChainServiceImpl,
 }
 
 impl BootedNode {
@@ -447,9 +514,31 @@ impl BootedNode {
             options,
             core: _core,
             storage: _storage,
+            chain: _chain,
         } = self;
         serve_with_options(bootstrap, spec, routes, options, SignalTrigger::UnixSignals).await?;
         Ok(())
+    }
+
+    /// Chain service installed by [`boot`]. Clone shares the core slot.
+    #[must_use]
+    pub fn chain(&self) -> &ChainServiceImpl {
+        &self.chain
+    }
+
+    /// Archive handle on the store [`boot`] opened. Tests use this for the
+    /// second `commit_anchor`, which must not be a second composer call.
+    #[must_use]
+    pub fn archive(&self) -> cc_storage_core::ArchiveWriter {
+        self.storage.archive()
+    }
+
+    /// Store head, cursor, and canonical rows. No fcU or event spy.
+    pub fn durable_frontier(
+        &self,
+        canonical_slots: &[u64],
+    ) -> anyhow::Result<cc_storage_core::DurableFrontier> {
+        cc_storage_core::durable_frontier(self.storage.engine(), canonical_slots)
     }
 }
 
@@ -463,6 +552,16 @@ pub async fn run() -> anyhow::Result<()> {
 /// Does not read the process environment and does not listen.
 pub async fn boot(cfg: BeaconCoreConfig) -> anyhow::Result<BootedNode> {
     let network = load_network(&cfg)?;
+    match network.preset_base {
+        PresetName::Mainnet => boot_with_preset::<Mainnet>(cfg, network).await,
+        PresetName::Minimal => boot_with_preset::<Minimal>(cfg, network).await,
+    }
+}
+
+async fn boot_with_preset<P: Preset + 'static>(
+    cfg: BeaconCoreConfig,
+    network: NetworkChainConfig,
+) -> anyhow::Result<BootedNode> {
     let prepared =
         cc_engine_api::EngineApi::prepare_with_chain_config(&cfg.engine, network.clone())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -480,7 +579,7 @@ pub async fn boot(cfg: BeaconCoreConfig) -> anyhow::Result<BootedNode> {
         writer_process_fatal: true,
     };
     let opened = open_and_stamp(&boot_cfg)?;
-    let durable = durable_set(&opened, &network)?;
+    let mut durable = durable_set(&opened, &network)?;
 
     let mut bs = cc_bootstrap::init(SERVICE, TelemetrySettings::from(&cfg.service))?;
     let chain_metrics = ChainMetrics::register(&mut bs.registry);
@@ -511,7 +610,7 @@ pub async fn boot(cfg: BeaconCoreConfig) -> anyhow::Result<BootedNode> {
         maximum_gossip_clock_disparity: Duration::from_millis(
             cfg.maximum_gossip_clock_disparity_ms,
         ),
-        archive: Some(archive),
+        archive: Some(Arc::clone(&archive)),
         ..CoreConfig::default()
     };
 
@@ -524,9 +623,31 @@ pub async fn boot(cfg: BeaconCoreConfig) -> anyhow::Result<BootedNode> {
     );
     let core_owner: Arc<Mutex<CoreJoinOwner>> = Arc::new(Mutex::new(CoreJoinOwner::default()));
 
+    // Empty store: one verify, one commit, then the same durable seed arm.
+    // Checkpoint and genesis are the two `AnchorSource` arms; the call below
+    // is the only non-test `commit_anchor` call site.
+    if durable.is_none()
+        && let Some(source) = anchor_source::<P>(&cfg, &network)?
+    {
+        let verified = verify_anchor(source, &chain_metrics)
+            .await
+            .map_err(|e| anyhow::anyhow!("verify_anchor: {e}"))?;
+        archive
+            .commit_anchor(verified.trusted.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("commit_anchor: {e}"))?;
+        tracing::info!(
+            slot = verified.slot,
+            root = %verified.block_root,
+            kind = ?verified.kind,
+            "anchor committed"
+        );
+        durable = Some(durable_set_from_verified::<P>(&verified, &network));
+    }
+
     let core = match durable {
         Some(d) => {
-            let applied = seed_from_durable::<Mainnet>(
+            let applied = seed_from_durable::<P>(
                 map_durable(d),
                 network.clone(),
                 core_cfg
@@ -549,48 +670,9 @@ pub async fn boot(cfg: BeaconCoreConfig) -> anyhow::Result<BootedNode> {
             install_core(&svc, &core_owner, install)?;
             Some(core_cfg)
         }
-        None if !cfg.checkpoint_providers.is_empty() => {
-            let expected = parse_optional_root(cfg.checkpoint_root.as_deref())
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let boot_cfg = CheckpointBootstrapConfig {
-                providers: cfg.checkpoint_providers.clone(),
-                expected_checkpoint_root: expected,
-                chain_config: network.clone(),
-                connect_timeout: cc_chain::PROVIDER_CONNECT_TIMEOUT,
-                total_timeout: cc_chain::PROVIDER_TOTAL_TIMEOUT,
-                network_retries: cc_chain::NETWORK_RETRIES,
-                triple_attempts: cc_chain::TRIPLE_ATTEMPTS,
-            };
-            let (core, summary) = bootstrap_core_from_providers_with_epoch::<Mainnet>(
-                &boot_cfg,
-                head,
-                epoch,
-                events.event_sender(),
-                chain_metrics.clone(),
-                core_cfg,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("checkpoint_sync: {e}"))?;
-            tracing::info!(
-                provider = %summary.provider,
-                slot = summary.slot,
-                "checkpoint fallback complete"
-            );
-            install_core(
-                &svc,
-                &core_owner,
-                SeedInstall {
-                    core,
-                    head_root: summary.block_root,
-                    head_slot: summary.slot,
-                    matched_expected: true,
-                },
-            )?;
-            None
-        }
         None => {
             tracing::info!(
-                "empty store and no checkpoint_providers; core remains absent (NOT_BOOTSTRAPPED)"
+                "empty store and no anchor source; core remains absent (NOT_BOOTSTRAPPED)"
             );
             Some(core_cfg)
         }
@@ -632,6 +714,7 @@ pub async fn boot(cfg: BeaconCoreConfig) -> anyhow::Result<BootedNode> {
         })),
     };
 
+    let chain = svc.clone();
     let routes = Routes::default().add_service(ChainServiceServer::new(svc));
     let spec = cfg.service_spec();
     Ok(BootedNode {
@@ -641,7 +724,82 @@ pub async fn boot(cfg: BeaconCoreConfig) -> anyhow::Result<BootedNode> {
         options,
         core,
         storage,
+        chain,
     })
+}
+
+/// Checkpoint (injected double or operator URLs) or local genesis. One of them.
+fn anchor_source<P: Preset>(
+    cfg: &BeaconCoreConfig,
+    network: &NetworkChainConfig,
+) -> anyhow::Result<Option<AnchorSource<P>>> {
+    let checkpoint = cfg.checkpoint_provider.is_some() || !cfg.checkpoint_providers.is_empty();
+    if checkpoint && cfg.genesis_anchor.is_some() {
+        anyhow::bail!("checkpoint source and genesis anchor are mutually exclusive");
+    }
+    if let Some(genesis) = cfg.genesis_anchor.as_ref() {
+        let state = BeaconState::<P>::from_ssz_bytes_hydrated(ForkName::Fulu, &genesis.state_ssz)
+            .map_err(|e| anyhow::anyhow!("genesis state SSZ: {e:?}"))?;
+        let signed_block =
+            SignedBeaconBlock::<P>::from_ssz_bytes_with(ForkName::Fulu, &genesis.block_ssz)
+                .map_err(|e| anyhow::anyhow!("genesis block SSZ: {e:?}"))?;
+        return Ok(Some(AnchorSource::Genesis {
+            state: Box::new(state),
+            signed_block: Box::new(signed_block),
+            chain_config: network.clone(),
+            expected_block_root: genesis.expected_block_root,
+        }));
+    }
+    if !checkpoint {
+        return Ok(None);
+    }
+    // Fetch validates every base even when the bytes come from a double.
+    let providers = if cfg.checkpoint_providers.is_empty() {
+        vec!["http://127.0.0.1:9".to_owned()]
+    } else {
+        cfg.checkpoint_providers.clone()
+    };
+    let provider: Arc<dyn CheckpointProvider> = match cfg.checkpoint_provider.as_ref() {
+        Some(slot) => slot.provider(),
+        None => Arc::new(
+            CheckpointClient::new(
+                cc_chain::PROVIDER_CONNECT_TIMEOUT,
+                cc_chain::PROVIDER_TOTAL_TIMEOUT,
+            )
+            .map_err(|e| anyhow::anyhow!("checkpoint client: {e}"))?,
+        ),
+    };
+    let expected =
+        parse_optional_root(cfg.checkpoint_root.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Some(AnchorSource::Checkpoint {
+        config: CheckpointBootstrapConfig {
+            providers,
+            expected_checkpoint_root: expected,
+            chain_config: network.clone(),
+            connect_timeout: cc_chain::PROVIDER_CONNECT_TIMEOUT,
+            total_timeout: cc_chain::PROVIDER_TOTAL_TIMEOUT,
+            network_retries: cc_chain::NETWORK_RETRIES,
+            triple_attempts: cc_chain::TRIPLE_ATTEMPTS,
+        },
+        provider,
+    }))
+}
+
+fn durable_set_from_verified<P: Preset>(
+    verified: &VerifiedAnchor<P>,
+    network: &NetworkChainConfig,
+) -> cc_storage_core::DurableSet {
+    let epoch = Epoch::new(verified.slot / P::SLOTS_PER_EPOCH.max(1));
+    cc_storage_core::DurableSet {
+        state_ssz: verified.trusted.state_ssz.to_vec(),
+        anchor_block_ssz: verified.trusted.block_ssz.to_vec(),
+        anchor_block_root: verified.trusted.block_root,
+        anchor_block_fork: network.fork_name_at_epoch(epoch) as u32,
+        blocks: Vec::new(),
+        fork_choice_scalars_ssz: verified.trusted.scalars.to_vec(),
+        expected_head_root: verified.trusted.block_root,
+        expected_head_slot: verified.slot,
+    }
 }
 
 fn install_core(

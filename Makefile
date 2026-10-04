@@ -150,7 +150,7 @@ clippy: ## Clippy with -D warnings (CI: clippy job)
 	$(CARGO) clippy $(CLIPPY_FLAGS) -- -D warnings
 
 .PHONY: lint
-lint: fmt-check clippy check-dag check-env check-http check-inproc-grpc check-gha-pins check-ci-jobs check-compose-uris check-fork-schedule check-offhost-policy check-adr-resolver ## Local lint suite (fmt + clippy + guards)
+lint: fmt-check clippy check-dag check-env check-commit-anchor check-http check-inproc-grpc check-gha-pins check-ci-jobs check-compose-uris check-fork-schedule check-offhost-policy check-adr-resolver ## Local lint suite (fmt + clippy + guards)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Policy guards (scripts/ — wired into the matching CI job and `make ci`)
@@ -163,6 +163,10 @@ check-dag: ## Enforce crate dependency DAG (Architecture §2.2)
 .PHONY: check-env
 check-env: ## No std::env::var outside crates/config (CC-09/3)
 	bash $(SCRIPTS)/check-no-env-reads.sh
+
+.PHONY: check-commit-anchor
+check-commit-anchor: ## Exactly one non-test commit_anchor( call, under bin/beacon-core/src
+	bash $(SCRIPTS)/check-one-commit-anchor.sh
 
 .PHONY: check-http
 check-http: ## No HTTP client on the block-import path (CC-28/2)
