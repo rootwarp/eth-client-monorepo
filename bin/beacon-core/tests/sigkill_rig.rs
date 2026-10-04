@@ -23,7 +23,7 @@ use cc_proto::chain::chain_service_server::ChainService;
 use cc_proto::chain::{ImportBlockRequest, ImportBlockVerdict};
 use cc_proto::error_info_from_status;
 use cc_seam::ArchiveWrite;
-use cc_storage_core::{NodeIdExpectation, OpenOpts, open};
+use cc_storage_core::{NodeIdExpectation, OpenOpts, fingerprint_for_secret, open};
 use cc_types::config::ChainConfig;
 use cc_types::primitives::Epoch;
 use sigkill_rig::{RigConfig, SigkillRig, sibling_fake_el};
@@ -164,6 +164,8 @@ async fn wait_store_unlocked(
     node_key: &std::path::Path,
 ) {
     let node_id = NodeIdExpectation::from_configured_path(Some(node_key)).expect("node key");
+    let secret = node_id.legacy_root().expect("probe key");
+    let fingerprint = fingerprint_for_secret(&secret).expect("fingerprint");
     let opts = OpenOpts {
         durability: "immediate".to_owned(),
         check_invariants: true,
@@ -179,7 +181,10 @@ async fn wait_store_unlocked(
         match open(dir, opts.clone()) {
             Ok(pending) => {
                 // Dropping an unpaired pending store asserts in debug builds.
-                let opened = pending.pair(node_id).expect("probe pair");
+                // Production `boot` has already rewritten the id to the fingerprint.
+                let opened = pending
+                    .bind_node_id(secret, fingerprint)
+                    .expect("probe pair");
                 drop(opened);
                 return;
             }

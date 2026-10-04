@@ -216,8 +216,9 @@ pub fn uncompressed_pubkey(secret: &[u8; NODE_KEY_LEN]) -> Result<[u8; 65], Node
 
 /// D-22a fingerprint: `SHA256("cc-node-id-v1" ‖ uncompressed pubkey)`.
 ///
-/// Housed here for a later migration. The load/create path does not call it,
-/// and production hosts must not either until that migration.
+/// Composer hosts call this when they migrate or pair (ADR-R-10). `cc-store`
+/// does not. The digest does not yield `secret`. The load/create path does
+/// not call it.
 pub fn node_id_fingerprint(secret: &[u8; NODE_KEY_LEN]) -> Result<cc_types::Hash256, NodeKeyError> {
     let pubkey = uncompressed_pubkey(secret)?;
     let mut preimage = Vec::with_capacity(NODE_ID_FINGERPRINT_DOMAIN.len() + pubkey.len());

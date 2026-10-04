@@ -410,21 +410,22 @@ impl StorageConfig {
 
 /// Key this process loaded or created. Both values are redacted in [`Debug`].
 ///
-/// `legacy` is the raw 32-byte secret, which is still the pairing value.
-/// `fingerprint` is computed and not compared or written.
+/// `legacy` is the raw 32-byte secret. It is compared only while
+/// `meta.node_id_scheme` is absent. `fingerprint` is the paired value
+/// (ADR-R-10).
 pub struct LoadedNodeKey {
     legacy: Root,
     fingerprint: Root,
 }
 
 impl LoadedNodeKey {
-    /// Raw 32-byte secret as a root. This is what [`crate::PendingStore::pair`] compares.
+    /// Raw 32-byte secret. Compared only while `meta.node_id_scheme` is absent.
     #[must_use]
     pub fn legacy(&self) -> Root {
         self.legacy
     }
 
-    /// D-22a fingerprint. Not a pairing input.
+    /// D-22a fingerprint. [`crate::PendingStore::bind_node_id`] pairs this.
     #[must_use]
     pub fn fingerprint(&self) -> Root {
         self.fingerprint
@@ -443,7 +444,8 @@ impl fmt::Debug for LoadedNodeKey {
 /// Composer entry for the node-key leaf. Creates at mode `0600`.
 ///
 /// The secret does not leave this value except as [`LoadedNodeKey::legacy`],
-/// which the composer passes to [`NodeIdExpectation::Present`].
+/// which the composer passes to [`NodeIdExpectation::Present`] for the
+/// pre-migration compare. The paired value is [`LoadedNodeKey::fingerprint`].
 pub fn load_or_create_node_key(path: &Path) -> anyhow::Result<LoadedNodeKey> {
     let key = cc_node_key::load_or_create(path).map_err(|e| anyhow::anyhow!("node key: {e}"))?;
     let secret = key.to_bytes();
@@ -455,30 +457,65 @@ pub fn load_or_create_node_key(path: &Path) -> anyhow::Result<LoadedNodeKey> {
     })
 }
 
+/// Fingerprint of a raw 32-byte secret already in memory.
+///
+/// `open_store` uses this for a key file it did not create. The error does
+/// not include the secret bytes. An invalid scalar cannot be migrated.
+pub fn fingerprint_for_secret(secret: &Root) -> anyhow::Result<Root> {
+    let fingerprint = cc_node_key::node_id_fingerprint(secret.as_array()).map_err(|_| {
+        anyhow::anyhow!("node key fingerprint: secret is not a valid secp256k1 scalar")
+    })?;
+    Ok(Root::from_hash256(fingerprint))
+}
+
 /// Open the store under `data_dir` with durability + the configured network.
 ///
-/// The node id is the raw 32-byte file when that file exists. Mode and curve
-/// checks belong to [`load_or_create_node_key`], which the composer calls.
-/// This host still pairs a legacy 32-byte file, including one written at `0644`.
+/// The node id is the raw 32-byte file when that file exists. Mode checks
+/// belong to [`load_or_create_node_key`]. This host still accepts an existing
+/// 32-byte file, including one written at `0644`, and migrates it to the
+/// fingerprint (ADR-R-10). A store beacon-core already migrated pairs that
+/// fingerprint. An invalid scalar cannot be migrated and is refused.
 ///
 /// `chain` is the digest input. There is no fixture fallback.
+///
+/// An invalid scalar is refused before [`crate::open`]. That call would
+/// return a [`PendingStore`] and may stamp side keys; dropping the handle
+/// on the fingerprint error asserts in debug.
 fn open_store(cfg: &StorageConfig, chain: &ChainConfig) -> anyhow::Result<Store> {
     let node_id = NodeIdExpectation::from_configured_path(cfg.node_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?;
-    let mut pending = crate::open(
-        &cfg.data_dir,
-        crate::OpenOpts {
-            durability: cfg.durability.clone(),
-            check_invariants: cfg.check_invariants,
-            snapshot_ring: cfg.snapshot_ring.max(1),
-            max_open_scan_rows: cfg.max_open_scan_rows,
-            genesis_validators_root: cfg.genesis_validators_root.clone(),
-            node_id,
-            chain: Some(chain.clone()),
-        },
-    )?;
-    let _ = pending.peek_node_id()?;
-    Ok(pending.pair(node_id)?.into_store())
+    let opts = crate::OpenOpts {
+        durability: cfg.durability.clone(),
+        check_invariants: cfg.check_invariants,
+        snapshot_ring: cfg.snapshot_ring.max(1),
+        max_open_scan_rows: cfg.max_open_scan_rows,
+        genesis_validators_root: cfg.genesis_validators_root.clone(),
+        node_id,
+        chain: Some(chain.clone()),
+    };
+    let opened = if let Some(legacy) = node_id.legacy_root() {
+        let fingerprint = fingerprint_for_secret(&legacy)?;
+        let mut pending = crate::open(&cfg.data_dir, opts)?;
+        let _ = pending.peek_node_id()?;
+        pending.bind_node_id(legacy, fingerprint)?
+    } else {
+        let mut pending = crate::open(&cfg.data_dir, opts)?;
+        let _ = pending.peek_node_id()?;
+        pending.pair(node_id)?
+    };
+    Ok(opened.into_store())
+}
+
+/// Fingerprint the resume check compares, or `None` when no key file is loaded.
+///
+/// The raw secret is not the stored id after [`open_store`] migrates.
+fn expected_node_id_after_migration(path: Option<&Path>) -> anyhow::Result<Option<Root>> {
+    let expectation = NodeIdExpectation::from_configured_path(path)
+        .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?;
+    match expectation.legacy_root() {
+        Some(legacy) => Ok(Some(fingerprint_for_secret(&legacy)?)),
+        None => Ok(None),
+    }
 }
 
 /// Load the network the digest and the retention floor both require.
@@ -558,11 +595,9 @@ pub async fn run() -> anyhow::Result<()> {
                 );
                 // CC-45b: schema check + durable-set load. E4 push is gone.
                 let durable_ctx = durable_set::DurableSetContext {
-                    expected_node_id: NodeIdExpectation::from_configured_path(
+                    expected_node_id: expected_node_id_after_migration(
                         cfg.node_key_path.as_deref(),
-                    )
-                    .map_err(|e| anyhow::anyhow!("node_key_path: {e}"))?
-                    .legacy_root(),
+                    )?,
                     node_key_path: cfg.node_key_path.clone(),
                     enr_seq_path: None,
                     snapshot_ring: cfg.snapshot_ring.max(1),
@@ -1426,6 +1461,222 @@ mod config_tests {
         cfg.durability = "immediate".into();
         drop(open_store(&cfg, &hoodi_chain()).expect("legacy 32-byte key pairs"));
         open_store(&cfg, &hoodi_chain()).expect("same legacy key reopens");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compose `open_store` rewrites both rows to the real fingerprint.
+    /// A second open pairs that fingerprint. The secret is not the stored id.
+    #[test]
+    fn open_store_migrates_both_rows_to_the_fingerprint() {
+        use cc_store::engine::{Durability, EngineOptions};
+        use cc_store::meta::{
+            AnchorInfo, KEY_ANCHOR_INFO, KEY_NODE_ID, KEY_NODE_ID_SCHEME, TABLE_META,
+        };
+        use cc_store::{
+            ConfigDigestInput, SszDecode, SszEncode, Store, StoreOpenOptions, compute_config_digest,
+        };
+        use cc_types::Root;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let secret_bytes = [0x11u8; 32];
+        let secret = Root::from_array(secret_bytes);
+        let fingerprint =
+            Root::from_hash256(cc_node_key::node_id_fingerprint(&secret_bytes).unwrap());
+        assert_ne!(fingerprint, secret);
+        assert_eq!(fingerprint.as_slice().len(), secret.as_slice().len());
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-storage-open-fp-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let chain = hoodi_chain();
+        let digest = compute_config_digest(&ConfigDigestInput::with_mainnet_scalars(
+            chain.clone(),
+            Root::ZERO,
+        ))
+        .unwrap();
+        let store = Store::open(
+            &dir,
+            StoreOpenOptions::with_digest(
+                EngineOptions::default().with_durability(Durability::None),
+                digest,
+            )
+            .with_check_invariants(false),
+        )
+        .unwrap();
+        let engine = store.into_engine();
+        let anchor = AnchorInfo {
+            anchor_slot: cc_store::Slot::new(10),
+            anchor_root: Root::from_array([0x10; 32]),
+            anchor_state_root: Root::from_array([0x11; 32]),
+            node_id: secret,
+            oldest_block_slot: cc_store::Slot::new(10),
+            oldest_block_parent: Root::from_array([0x09; 32]),
+        };
+        let mut b = engine.batch();
+        b.put(TABLE_META, KEY_NODE_ID.as_bytes(), &secret.as_ssz_bytes());
+        b.put(
+            TABLE_META,
+            KEY_ANCHOR_INFO.as_bytes(),
+            &anchor.as_ssz_bytes(),
+        );
+        engine.commit(b).unwrap();
+        drop(engine);
+
+        let key_path = dir.join("node_key");
+        std::fs::write(&key_path, secret_bytes).unwrap();
+        let mut cfg = {
+            let path = storage_toml_path();
+            let _g = env_lock();
+            unsafe {
+                std::env::remove_var("CC_STORAGE_NODE_KEY_PATH");
+            }
+            cc_config::load_from::<StorageConfig>("storage", &path).unwrap()
+        };
+        cfg.data_dir = dir.clone();
+        cfg.node_key_path = Some(key_path);
+        cfg.check_invariants = true;
+        cfg.durability = "immediate".into();
+        drop(open_store(&cfg, &chain).expect("compose host migrates"));
+
+        let engine = cc_store::engine::Engine::open(&dir, EngineOptions::default()).unwrap();
+        let rt = engine.read().unwrap();
+        let meta =
+            Root::from_ssz_bytes(&rt.get(TABLE_META, KEY_NODE_ID.as_bytes()).unwrap().unwrap())
+                .unwrap();
+        let stored_anchor = AnchorInfo::from_ssz_bytes(
+            &rt.get(TABLE_META, KEY_ANCHOR_INFO.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let scheme = rt
+            .get(TABLE_META, KEY_NODE_ID_SCHEME.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta, fingerprint);
+        assert_eq!(stored_anchor.node_id, fingerprint);
+        assert_eq!(scheme.as_slice(), &[1u8]);
+        assert_ne!(meta, secret);
+        drop(rt);
+        drop(engine);
+
+        open_store(&cfg, &chain).expect("scheme 1 reopens on the fingerprint");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Resume compares the fingerprint. The raw secret is not that value.
+    /// An invalid scalar fails without the secret bytes.
+    #[test]
+    fn expected_node_id_after_migration_is_the_fingerprint() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        assert_eq!(expected_node_id_after_migration(None).unwrap(), None);
+
+        let secret_bytes = [0x11u8; 32];
+        let secret = Root::from_array(secret_bytes);
+        let fingerprint =
+            Root::from_hash256(cc_node_key::node_id_fingerprint(&secret_bytes).unwrap());
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-storage-fp-expect-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("node_key");
+        std::fs::write(&key, secret_bytes).unwrap();
+        assert_eq!(
+            expected_node_id_after_migration(Some(&key)).unwrap(),
+            Some(fingerprint)
+        );
+        assert_ne!(
+            expected_node_id_after_migration(Some(&key)).unwrap(),
+            Some(secret)
+        );
+
+        let bad = Root::from_array([0xff; 32]);
+        let err = fingerprint_for_secret(&bad).expect_err("invalid scalar");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("secp256k1"), "{msg}");
+        assert!(!msg.contains(&bad.to_string()), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An invalid scalar is refused before `open`. No pending store is
+    /// dropped, and an empty store with a GVR does not gain side keys.
+    #[test]
+    fn open_store_invalid_scalar_refuses_before_side_keys() {
+        use cc_store::engine::{Durability, EngineOptions};
+        use cc_store::meta::{KEY_CONFIG_DIGEST_V2, KEY_SCHEDULE_DIGEST, TABLE_META};
+        use cc_store::{Store, StoreOpenOptions, legacy_config_digest};
+        use cc_types::Root;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let bad_bytes = [0xffu8; 32];
+        let bad = Root::from_array(bad_bytes);
+        let hex = "ff".repeat(32);
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-storage-open-bad-scalar-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(
+            &dir,
+            StoreOpenOptions::with_digest(
+                EngineOptions::default().with_durability(Durability::None),
+                legacy_config_digest(),
+            )
+            .with_check_invariants(false),
+        )
+        .unwrap();
+        drop(store);
+
+        let key_path = dir.join("node_key");
+        std::fs::write(&key_path, bad_bytes).unwrap();
+        let mut cfg = {
+            let path = storage_toml_path();
+            let _g = env_lock();
+            unsafe {
+                std::env::remove_var("CC_STORAGE_NODE_KEY_PATH");
+            }
+            cc_config::load_from::<StorageConfig>("storage", &path).unwrap()
+        };
+        cfg.data_dir = dir.clone();
+        cfg.node_key_path = Some(key_path);
+        cfg.check_invariants = true;
+        cfg.durability = "immediate".into();
+        cfg.genesis_validators_root = Some(format!("0x{}", "ab".repeat(32)));
+
+        let err = open_store(&cfg, &hoodi_chain()).expect_err("invalid scalar must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("secp256k1"), "{msg}");
+        assert!(!msg.contains(&bad.to_string()), "{msg}");
+        assert!(!msg.contains(&hex), "{msg}");
+
+        let engine = cc_store::engine::Engine::open(&dir, EngineOptions::default()).unwrap();
+        let rt = engine.read().unwrap();
+        assert!(
+            rt.get(TABLE_META, KEY_CONFIG_DIGEST_V2.as_bytes())
+                .unwrap()
+                .is_none(),
+            "invalid scalar must not stamp config_digest_v2"
+        );
+        assert!(
+            rt.get(TABLE_META, KEY_SCHEDULE_DIGEST.as_bytes())
+                .unwrap()
+                .is_none(),
+            "invalid scalar must not stamp schedule_digest"
+        );
+        drop(rt);
+        drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -51,6 +51,12 @@ pub const KEY_PRUNE_MARKS: &str = "prune_marks";
 pub const KEY_BACKFILL_PROG: &str = "backfill_prog";
 /// Key for the I-node-id identity `Root` (S2-J-01). Not an `AnchorInfo` origin.
 pub const KEY_NODE_ID: &str = "node_id";
+/// Scheme of [`KEY_NODE_ID`] (ADR-R-10). Absent is the legacy raw key.
+///
+/// The value is the single byte `1` for the public-key fingerprint. Fourteen
+/// bytes, under the 16-byte cap. `cc-store` does not interpret it: pairing
+/// stays a compare of 32 opaque bytes. Unknown keys are not a schema bump.
+pub const KEY_NODE_ID_SCHEME: &str = "node_id_scheme";
 /// Key for [`SnapshotCompletion`]. One marker for the anchor and for chunked snapshots.
 pub const KEY_SNAPSHOT_COMPLETION: &str = "snap_complete";
 
@@ -69,6 +75,7 @@ pub const META_KEYS: &[&str] = &[
     KEY_PRUNE_MARKS,
     KEY_BACKFILL_PROG,
     KEY_NODE_ID,
+    KEY_NODE_ID_SCHEME,
     KEY_SNAPSHOT_COMPLETION,
 ];
 

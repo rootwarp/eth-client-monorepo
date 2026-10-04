@@ -90,9 +90,24 @@ file wins. Each container dest (`/app/data`, `/identity`) must appear
 
 ## (a) On-disk format is unchanged
 
+`SCHEMA_VERSION` stays `1`. Table names and codecs are unchanged.
+`meta.node_id_scheme` is a new meta key. An older binary does not read
+it. The paired node id is not unchanged: the first open by this binary
+rewrites `meta.node_id` and `AnchorInfo.node_id` from the raw secret to
+`SHA256("cc-node-id-v1" ‖ uncompressed pubkey)` in one batch and sets
+the scheme byte to `1`. Open does not convert that fingerprint back
+into the secret. A pre-migration binary compares the stored 32 bytes
+to the raw secret and refuses the rewritten store.
+
+past this commit, no rollback without a pre-migration backup.
+
+Take that backup before the first open that performs the rewrite. A
+store this binary has not opened is still the old scheme and still
+opens in the previous binary.
+
 A binary of either host — and a pre-`78a90e1` storage binary — can
-`Store::open` the same schema-1 directory. Open refuses; it does not
-convert.
+`Store::open` the same schema-1 directory when the node id has not been
+rewritten. Open refuses a digest or schema mismatch; it does not convert.
 
 | Surface | Live value | Rollback effect |
 |---|---|---|

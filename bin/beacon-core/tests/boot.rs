@@ -138,6 +138,84 @@ async fn boot_against_temp_dir_returns() {
     drop(node);
 }
 
+/// Production `boot` rewrites a legacy stamp to the fingerprint. `boot_in_process`
+/// still pairs the raw secret; this test is the production path.
+#[tokio::test]
+async fn production_boot_migrates_legacy_stamp_to_fingerprint() {
+    let dir = TempDir::new("beacon-core-fp-migrate");
+    let key = dir.path().join("node_key");
+    let secret = Root::from_array([0x11u8; 32]);
+    std::fs::write(&key, secret.as_slice()).unwrap();
+    let mut perms = std::fs::metadata(&key).unwrap().permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(&key, perms).unwrap();
+
+    let stamped = boot_in_process(
+        &boot_cfg(dir.path().to_path_buf(), Some(key)),
+        metrics(),
+        false,
+    )
+    .unwrap();
+    drop(stamped);
+
+    let node = boot(config_for_dir(dir.path()))
+        .await
+        .expect("production boot migrates a legacy stamp");
+    node.drain_and_shutdown().await.expect("drain");
+
+    let fingerprint = cc_storage_core::fingerprint_for_secret(&secret).unwrap();
+    assert_ne!(fingerprint, secret);
+    let mut pending = cc_storage_core::open(dir.path(), reopen_opts(secret)).unwrap();
+    assert_eq!(
+        pending.peek_node_id().unwrap(),
+        Some((fingerprint, cc_storage_core::NodeIdScheme::Fingerprint))
+    );
+    drop(pending.bind_node_id(secret, fingerprint).unwrap());
+}
+
+/// A fresh production boot stamps the fingerprint, not the raw secret.
+#[tokio::test]
+async fn production_boot_stamps_fingerprint_not_the_secret() {
+    let dir = TempDir::new("beacon-core-fp-fresh");
+    let node = boot(config_for_dir(dir.path()))
+        .await
+        .expect("fresh production boot");
+    node.drain_and_shutdown().await.expect("drain");
+
+    let bytes = std::fs::read(dir.path().join("node_key")).unwrap();
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(&bytes);
+    let secret = Root::from_array(raw);
+    let fingerprint = cc_storage_core::fingerprint_for_secret(&secret).unwrap();
+    assert_ne!(fingerprint, secret);
+    let mut pending = cc_storage_core::open(dir.path(), reopen_opts(secret)).unwrap();
+    assert_eq!(
+        pending.peek_node_id().unwrap(),
+        Some((fingerprint, cc_storage_core::NodeIdScheme::Fingerprint))
+    );
+    drop(pending.bind_node_id(secret, fingerprint).unwrap());
+}
+
+fn reopen_opts(secret: Root) -> cc_storage_core::OpenOpts {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/types/tests/fixtures/hoodi-config.yaml");
+    let chain = cc_types::config::ChainConfig::from_yaml_file(&fixture).unwrap_or_else(|_| {
+        cc_types::config::ChainConfig::from_yaml_str(include_str!(
+            "../../../crates/types/tests/fixtures/hoodi-config.yaml"
+        ))
+        .unwrap()
+    });
+    cc_storage_core::OpenOpts {
+        durability: "immediate".to_owned(),
+        check_invariants: true,
+        snapshot_ring: 4,
+        genesis_validators_root: None,
+        node_id: cc_storage_core::NodeIdExpectation::Present(secret),
+        chain: Some(chain),
+        ..cc_storage_core::OpenOpts::default()
+    }
+}
+
 /// A store stamped from a raw 32-byte key still opens. Pairing stays on those bytes.
 #[test]
 fn legacy_stamped_store_opens_again() {

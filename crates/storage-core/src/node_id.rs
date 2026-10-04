@@ -71,12 +71,14 @@ impl fmt::Debug for NodeIdExpectation {
     }
 }
 
-/// Scheme of a stored node id. No scheme row means the legacy raw key bytes.
-/// The fingerprint scheme is not written by this fold.
+/// Scheme of a stored node id. Discriminate by this, never by length:
+/// the legacy secret and the fingerprint are both 32 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeIdScheme {
-    /// Stored root is the raw 32 key bytes.
+    /// No `meta.node_id_scheme` row. The stored root is the raw 32 key bytes.
     Legacy,
+    /// `meta.node_id_scheme` is the byte `1`. The stored root is the fingerprint.
+    Fingerprint,
 }
 
 #[cfg(test)]
@@ -134,6 +136,7 @@ mod tests {
         assert_eq!(present.legacy_root(), Some(Root::from_array(bytes)));
         assert_eq!(format!("{present:?}"), "Present(<redacted>)");
         assert_eq!(format!("{:?}", NodeIdScheme::Legacy), "Legacy");
+        assert_eq!(format!("{:?}", NodeIdScheme::Fingerprint), "Fingerprint");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

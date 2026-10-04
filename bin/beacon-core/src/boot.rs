@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! load_or_create node key
-//!   → open → peek_node_id → pair
+//!   → open → peek_node_id → bind_node_id (fingerprint)
 //!   → classify
 //!        Incomplete → refuse, naming the DurableItem (no subsystem)
 //!        else → start_writer
@@ -648,10 +648,11 @@ async fn boot_with_preset<P: Preset + 'static>(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Key first, then open. Schema and digest gates run inside open.
-    // I-node-id runs at pair, before telemetry, the writer, or chain-core.
-    // Pairing stays on the legacy root. The fingerprint is not compared.
+    // I-node-id runs before telemetry, the writer, or chain-core.
+    // `open` still sees the raw secret so a foreign legacy id is refused
+    // before side keys. `bind_node_id` rewrites a matching legacy id to the
+    // fingerprint in one batch, or pairs scheme 1 (ADR-R-10).
     let loaded = load_or_create_node_key(&cfg.node_key_path)?;
-    let _fingerprint = loaded.fingerprint();
     let node_id = NodeIdExpectation::Present(loaded.legacy());
     let mut pending = open(
         &cfg.data_dir,
@@ -666,7 +667,7 @@ async fn boot_with_preset<P: Preset + 'static>(
         },
     )?;
     let _peek = pending.peek_node_id()?;
-    let opened = pending.pair(node_id)?;
+    let opened = pending.bind_node_id(loaded.legacy(), loaded.fingerprint())?;
     clear_composer_steps();
     // Incomplete refuses before telemetry, the writer, or chain-core.
     let arm = match classify(opened.engine()).map_err(|e| anyhow::anyhow!("classify: {e}"))? {

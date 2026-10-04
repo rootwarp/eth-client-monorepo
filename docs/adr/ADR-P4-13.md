@@ -1,14 +1,22 @@
 # ADR-P4-13 — `I-node-id`: a mismatched node key refuses `open`
 
-- **Status:** accepted · superseded-by: — · **Date:** 2026-08-16 (reconstructed)
+- **Status:** superseded-by ADR-R-10 · **Date:** 2026-08-16 (reconstructed)
 - **Phase:** 4
 - **Issues:** S1-B-10, CC-20b, P1-A/27
 - **Citations:** 4 sites — `crates/store/src/invariants.rs:129`; `services/storage/src/main.rs:181`; `docker-compose.yml:134,228` (also `docs/running.md:569,656`)
 - **Provenance:** re-derived from code (2026-08-16)
 
-This record is **load-bearing.** `[ARCH]` §4.2's boot policy **is**
-`open()`'s fail-closed gates plus this check. They run before anything
-binds a port. After S2 they run before any subsystem starts.
+ADR-R-10 supersedes this record, including the stale citation of
+`services/storage/src/main.rs` (in the header and at the struck
+`main.rs:1285-1292` / `main.rs:443` sites). That file is a shim over
+`cc_storage_core::run()` and does not name `node_id`. The decision below
+is the historical rule: the stored value was the raw key. It is not the
+paired value after ADR-R-10.
+
+This record is **load-bearing** as history. `[ARCH]` §4.2's boot policy
+**is** `open()`'s fail-closed gates plus the pairing check. They run
+before anything binds a port. After S2 they run before any subsystem
+starts. The paired bytes are the fingerprint in ADR-R-10.
 
 ## Context
 

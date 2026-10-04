@@ -43,7 +43,7 @@ mod writer;
 
 pub use archive_write::{ArchiveWriter, ServedCanonicalBlock};
 #[cfg(feature = "grpc")]
-pub use boot::{LoadedNodeKey, load_or_create_node_key, run};
+pub use boot::{LoadedNodeKey, fingerprint_for_secret, load_or_create_node_key, run};
 pub use durable_set::{DurableBlock, DurableDaStatus, DurableItem, ItemAssessment};
 pub use metrics::StorageMetrics;
 pub use node_id::{NodeIdExpectation, NodeIdScheme};

@@ -1,9 +1,12 @@
 //! Public store open + durable-set load ([ARCH] §4.2 / S2-J-01).
 //!
 //! `bin/beacon-core` calls [`open`] **before** any subsystem starts. Schema and
-//! config-digest gates run here. A [`NodeIdExpectation::Present`] mismatch is
-//! refused here, before side-key writes. [`PendingStore::pair`] stamps a legacy
-//! id that was absent or already equal.
+//! config-digest gates run here. A legacy [`NodeIdExpectation::Present`] mismatch
+//! is refused here, before side-key writes, when `meta.node_id_scheme` is absent.
+//! [`PendingStore::bind_node_id`] then rewrites a matching legacy id to the
+//! fingerprint in one batch, or pairs scheme 1 by ordinary equality.
+//! [`PendingStore::pair`] still stamps the root it is given. Production hosts
+//! pass the fingerprint through [`PendingStore::bind_node_id`], not the secret.
 
 use std::fmt;
 use std::path::Path;
@@ -35,6 +38,28 @@ use crate::metrics::StorageMetrics;
 use crate::node_id::{NodeIdExpectation, NodeIdScheme};
 use crate::resume::{self, ResumeError};
 use crate::writer::{WriterBounds, WriterFaults, WriterHandle, WriterStop, spawn_writer};
+
+// Test-only: `rewrite_node_id_fingerprint` returns before `commit`.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NODE_ID_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_node_id_commit_for_test(fail: bool) {
+    FAIL_NODE_ID_COMMIT.with(|cell| cell.set(fail));
+}
+
+fn node_id_commit_blocked() -> bool {
+    #[cfg(test)]
+    {
+        FAIL_NODE_ID_COMMIT.with(|cell| cell.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
 
 /// Test stall inside [`StorageRuntime::resume`]'s blocking load.
 ///
@@ -105,7 +130,9 @@ impl Default for OpenOpts {
 
 /// One opened redb handle. The composer starts subsystems only after this exists.
 ///
-/// [`Debug`] is hand-written: `expected_node_id` is the raw node key.
+/// [`Debug`] is hand-written: `expected_node_id` is redacted. After
+/// [`PendingStore::bind_node_id`] it is the fingerprint. [`PendingStore::pair`]
+/// keeps the root it was given.
 pub struct OpenedStore {
     store: Store,
     snapshot_ring: u64,
@@ -266,14 +293,22 @@ impl fmt::Debug for PendingStore {
 
 impl PendingStore {
     /// Read-only identity. `None` is an unstamped store. No scheme row means
-    /// [`NodeIdScheme::Legacy`]. Does not write.
+    /// [`NodeIdScheme::Legacy`]. A scheme byte of `1` is
+    /// [`NodeIdScheme::Fingerprint`]. Does not write. Does not compare lengths.
     pub fn peek_node_id(&mut self) -> anyhow::Result<Option<(Root, NodeIdScheme)>> {
         let Some(inner) = self.inner.as_ref() else {
             self.paired = true;
             anyhow::bail!("pending store already consumed");
         };
+        let scheme = match read_node_id_scheme(inner.store.engine()) {
+            Ok(scheme) => scheme,
+            Err(e) => {
+                self.paired = true;
+                return Err(e);
+            }
+        };
         match read_stored_node_id(inner.store.engine()) {
-            Ok(Some(root)) => Ok(Some((root, NodeIdScheme::Legacy))),
+            Ok(Some(root)) => Ok(Some((root, scheme))),
             Ok(None) => Ok(None),
             Err(e) => {
                 // A read error must not become a drop assertion on `?`.
@@ -281,6 +316,63 @@ impl PendingStore {
                 Err(e)
             }
         }
+    }
+
+    /// ADR-R-10 migration, then [`Self::pair`] on `fingerprint`.
+    ///
+    /// `legacy` is the raw 32-byte secret. `fingerprint` is the paired value.
+    /// Neither is logged. Scheme absent and the stored id equal to `legacy`,
+    /// or no stored id at all, rewrites `meta.node_id` and `AnchorInfo.node_id`
+    /// (when that row exists) and sets `meta.node_id_scheme` to `1` in one
+    /// commit. Scheme absent and any other stored id refuses. Scheme `1` is
+    /// ordinary equality against `fingerprint`. An unstamped store is not a
+    /// foreign secret: there are no stored bytes to leak, so it takes the
+    /// fingerprint directly.
+    pub fn bind_node_id(mut self, legacy: Root, fingerprint: Root) -> anyhow::Result<OpenedStore> {
+        let prepared = (|| -> anyhow::Result<()> {
+            let inner = self
+                .inner
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("pending store already consumed"))?;
+            let engine = inner.store.engine();
+            let scheme = read_node_id_scheme(engine)?;
+            let stored = read_stored_node_id(engine)?;
+            match scheme {
+                NodeIdScheme::Legacy => match stored {
+                    Some(found) if found == legacy => {
+                        rewrite_node_id_fingerprint(engine, fingerprint)?;
+                    }
+                    None => {
+                        rewrite_node_id_fingerprint(engine, fingerprint)?;
+                    }
+                    Some(_) => {
+                        anyhow::bail!(
+                            "I-node-id (ADR-R-10): node_id_scheme absent and stored node_id \
+                             <redacted> does not match the configured node key"
+                        );
+                    }
+                },
+                NodeIdScheme::Fingerprint => {
+                    if let Some(found) = stored
+                        && found != fingerprint
+                    {
+                        anyhow::bail!(
+                            "I-node-id (ADR-R-10): stored node_id <redacted> does not match \
+                             the configured node key"
+                        );
+                    }
+                    if stored.is_none() {
+                        rewrite_node_id_fingerprint(engine, fingerprint)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = prepared {
+            self.paired = true;
+            return Err(err);
+        }
+        self.pair(NodeIdExpectation::Present(fingerprint))
     }
 
     /// Run `I-node-id` against the legacy root and, on [`NodeIdExpectation::Present`],
@@ -737,6 +829,11 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Pendin
 
 /// `Present` versus the stored legacy id. Absent, or equal, is not a refusal.
 /// Not gated on `check_invariants`. Does not write.
+///
+/// Scheme `1` is not this compare: the stored root is the fingerprint, which
+/// is not the secret. Equality against the fingerprint is [`PendingStore::bind_node_id`].
+/// An unknown scheme byte refuses here, before side-key writes. Length is not
+/// a scheme.
 fn refuse_legacy_node_id_mismatch(
     engine: &Engine,
     expected: NodeIdExpectation,
@@ -744,6 +841,10 @@ fn refuse_legacy_node_id_mismatch(
     let Some(want) = expected.legacy_root() else {
         return Ok(());
     };
+    match read_node_id_scheme(engine)? {
+        NodeIdScheme::Fingerprint => return Ok(()),
+        NodeIdScheme::Legacy => {}
+    }
     if let Some(found) = read_stored_node_id(engine)?
         && found != want
     {
@@ -752,6 +853,69 @@ fn refuse_legacy_node_id_mismatch(
              stored node_id <redacted> does not match the configured node key"
         );
     }
+    Ok(())
+}
+
+/// `meta.node_id_scheme`. Absent is legacy. The byte `1` is the fingerprint.
+/// Any other value refuses. This does not read `node_id` and does not branch
+/// on that value's length.
+fn read_node_id_scheme(engine: &Engine) -> anyhow::Result<NodeIdScheme> {
+    use cc_store::meta::{KEY_NODE_ID_SCHEME, TABLE_META};
+    let rt = engine
+        .read()
+        .map_err(|e| anyhow::anyhow!("read identity: {e}"))?;
+    match rt
+        .get(TABLE_META, KEY_NODE_ID_SCHEME.as_bytes())
+        .map_err(|e| anyhow::anyhow!("read node_id_scheme: {e}"))?
+    {
+        None => Ok(NodeIdScheme::Legacy),
+        Some(bytes) if bytes.as_slice() == [1] => Ok(NodeIdScheme::Fingerprint),
+        Some(_) => anyhow::bail!("I-node-id (ADR-R-10): node_id_scheme is not a known value"),
+    }
+}
+
+/// One commit: `meta.node_id`, `AnchorInfo.node_id` when the row exists, and
+/// scheme byte `1`. A failure before [`Engine::commit`] leaves the previous
+/// scheme. Dropping the batch is the uncommitted state.
+fn rewrite_node_id_fingerprint(engine: &Engine, fingerprint: Root) -> anyhow::Result<()> {
+    use cc_store::SszDecode;
+    use cc_store::SszEncode;
+    use cc_store::meta::{
+        AnchorInfo, KEY_ANCHOR_INFO, KEY_NODE_ID, KEY_NODE_ID_SCHEME, TABLE_META,
+    };
+    let anchor = {
+        let rt = engine
+            .read()
+            .map_err(|e| anyhow::anyhow!("read identity: {e}"))?;
+        rt.get(TABLE_META, KEY_ANCHOR_INFO.as_bytes())
+            .map_err(|e| anyhow::anyhow!("read AnchorInfo: {e}"))?
+            .map(|bytes| {
+                AnchorInfo::from_ssz_bytes(&bytes)
+                    .map_err(|e| anyhow::anyhow!("AnchorInfo decode: {e:?}"))
+            })
+            .transpose()?
+    };
+    if node_id_commit_blocked() {
+        anyhow::bail!("I-node-id (ADR-R-10): node_id migration was not committed");
+    }
+    let mut batch = engine.batch();
+    batch.put(
+        TABLE_META,
+        KEY_NODE_ID.as_bytes(),
+        &fingerprint.as_ssz_bytes(),
+    );
+    if let Some(mut anchor) = anchor {
+        anchor.node_id = fingerprint;
+        batch.put(
+            TABLE_META,
+            KEY_ANCHOR_INFO.as_bytes(),
+            &anchor.as_ssz_bytes(),
+        );
+    }
+    batch.put(TABLE_META, KEY_NODE_ID_SCHEME.as_bytes(), &[1u8]);
+    engine
+        .commit(batch)
+        .map_err(|e| anyhow::anyhow!("persist node_id: {e}"))?;
     Ok(())
 }
 
@@ -3095,6 +3259,199 @@ mod tests {
                 !writer_prod.contains(name),
                 "writer.rs reintroduced write-behind algebra {name}"
             );
+        }
+    }
+
+    /// ADR-R-10. Scheme, not length: both ids are 32 bytes. One commit moves
+    /// `meta.node_id` and `AnchorInfo.node_id` together and sets scheme 1.
+    /// A failed commit leaves the legacy scheme. A foreign stored id is refused
+    /// without either value. The fingerprint does not equal the secret.
+    #[test]
+    fn fingerprint_migration_is_one_scheme_and_not_by_length() {
+        use cc_store::SszDecode;
+        use cc_store::SszEncode;
+        use cc_store::engine::{Engine, EngineOptions};
+        use cc_store::meta::{AnchorInfo, KEY_ANCHOR_INFO, KEY_NODE_ID, TABLE_META};
+
+        let secret = Root::from_array([0x11; 32]);
+        let fingerprint = Root::from_array([0x5A; 32]);
+        let foreign = Root::from_array([0x22; 32]);
+        assert_eq!(secret.as_slice().len(), 32);
+        assert_eq!(fingerprint.as_slice().len(), 32);
+        assert_eq!(foreign.as_slice().len(), 32);
+        assert_ne!(secret, fingerprint);
+
+        let dir = unique_temp_dir("node-id-migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = open(&dir, test_opts(NodeIdExpectation::Present(secret))).unwrap();
+        drop(opened);
+        write_anchor(&dir, secret);
+
+        let mut pending = super::open(&dir, test_opts(NodeIdExpectation::Present(secret))).unwrap();
+        assert_eq!(
+            pending.peek_node_id().unwrap(),
+            Some((secret, NodeIdScheme::Legacy))
+        );
+        super::fail_node_id_commit_for_test(true);
+        let blocked = pending.bind_node_id(secret, fingerprint);
+        super::fail_node_id_commit_for_test(false);
+        let err = blocked.expect_err("commit must not land");
+        assert!(err.to_string().contains("node_id"), "{err}");
+        assert!(scheme_absent(&dir));
+        assert_eq!(stored_meta_node_id(&dir), Some(secret));
+        assert_eq!(stored_anchor_node_id(&dir), Some(secret));
+
+        let pending = super::open(&dir, test_opts(NodeIdExpectation::Present(secret))).unwrap();
+        let opened = pending.bind_node_id(secret, fingerprint).unwrap();
+        assert_eq!(opened.configured_node_id(), Some(fingerprint));
+        drop(opened);
+        assert_eq!(stored_meta_node_id(&dir), Some(fingerprint));
+        assert_eq!(stored_anchor_node_id(&dir), Some(fingerprint));
+        assert_eq!(scheme_byte(&dir), Some(1));
+        assert_ne!(stored_meta_node_id(&dir), Some(secret));
+
+        let mut pending = super::open(&dir, test_opts(NodeIdExpectation::Present(secret))).unwrap();
+        assert_eq!(
+            pending.peek_node_id().unwrap(),
+            Some((fingerprint, NodeIdScheme::Fingerprint))
+        );
+        let opened = pending.bind_node_id(secret, fingerprint).unwrap();
+        drop(opened);
+
+        let pending = super::open(&dir, test_opts(NodeIdExpectation::Present(foreign))).unwrap();
+        let err = pending
+            .bind_node_id(foreign, Root::from_array([0x6B; 32]))
+            .expect_err("scheme 1 is ordinary equality");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("node_id"), "{chain}");
+        assert!(!chain.contains(&fingerprint.to_string()), "{chain}");
+        assert!(!chain.contains(&foreign.to_string()), "{chain}");
+        assert!(!chain.contains(&secret.to_string()), "{chain}");
+        assert_eq!(stored_meta_node_id(&dir), Some(fingerprint));
+        assert_eq!(scheme_byte(&dir), Some(1));
+
+        let foreign_dir = unique_temp_dir("node-id-foreign");
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let opened = open(&foreign_dir, test_opts(NodeIdExpectation::Present(foreign))).unwrap();
+        drop(opened);
+        write_anchor(&foreign_dir, foreign);
+        let pending = super::open(&foreign_dir, test_opts(NodeIdExpectation::Unset)).unwrap();
+        let err = pending
+            .bind_node_id(secret, fingerprint)
+            .expect_err("absent scheme and a different stored id must refuse");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("node_id_scheme") && chain.contains("node_id"),
+            "{chain}"
+        );
+        assert!(!chain.contains(&secret.to_string()), "{chain}");
+        assert!(!chain.contains(&foreign.to_string()), "{chain}");
+        assert!(!chain.contains(&fingerprint.to_string()), "{chain}");
+        assert!(scheme_absent(&foreign_dir));
+        assert_eq!(stored_meta_node_id(&foreign_dir), Some(foreign));
+        assert_eq!(stored_anchor_node_id(&foreign_dir), Some(foreign));
+
+        let fresh = unique_temp_dir("node-id-fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let mut pending =
+            super::open(&fresh, test_opts(NodeIdExpectation::Present(secret))).unwrap();
+        assert_eq!(pending.peek_node_id().unwrap(), None);
+        let opened = pending.bind_node_id(secret, fingerprint).unwrap();
+        assert_eq!(opened.configured_node_id(), Some(fingerprint));
+        drop(opened);
+        assert_eq!(stored_meta_node_id(&fresh), Some(fingerprint));
+        assert_eq!(stored_anchor_node_id(&fresh), None);
+        assert_eq!(scheme_byte(&fresh), Some(1));
+        assert_ne!(stored_meta_node_id(&fresh), Some(secret));
+
+        // Anchor-only legacy row: `stored_node_id` falls back to the anchor,
+        // so the same commit must rewrite that row and create `meta.node_id`.
+        let anchor_only = unique_temp_dir("node-id-anchor-only");
+        std::fs::create_dir_all(&anchor_only).unwrap();
+        drop(open(&anchor_only, test_opts(NodeIdExpectation::Unset)).unwrap());
+        write_anchor(&anchor_only, secret);
+        assert_eq!(stored_meta_node_id(&anchor_only), None);
+        assert_eq!(stored_anchor_node_id(&anchor_only), Some(secret));
+        let pending =
+            super::open(&anchor_only, test_opts(NodeIdExpectation::Present(secret))).unwrap();
+        drop(pending.bind_node_id(secret, fingerprint).unwrap());
+        assert_eq!(stored_meta_node_id(&anchor_only), Some(fingerprint));
+        assert_eq!(stored_anchor_node_id(&anchor_only), Some(fingerprint));
+        assert_eq!(scheme_byte(&anchor_only), Some(1));
+        assert_ne!(stored_anchor_node_id(&anchor_only), Some(secret));
+
+        put_scheme(&dir, 2);
+        let err = super::open(&dir, test_opts(NodeIdExpectation::Present(secret)))
+            .expect_err("unknown scheme byte");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("node_id_scheme") && chain.contains("known"),
+            "{chain}"
+        );
+        assert!(!chain.contains(&fingerprint.to_string()), "{chain}");
+        assert!(!chain.contains(&secret.to_string()), "{chain}");
+        assert_eq!(scheme_byte(&dir), Some(2));
+        assert_eq!(stored_meta_node_id(&dir), Some(fingerprint));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&fresh);
+        let _ = std::fs::remove_dir_all(&foreign_dir);
+        let _ = std::fs::remove_dir_all(&anchor_only);
+
+        fn write_anchor(dir: &Path, node_id: Root) {
+            let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+            let anchor = AnchorInfo {
+                anchor_slot: cc_store::Slot::new(3),
+                anchor_root: Root::from_array([0x10; 32]),
+                anchor_state_root: Root::from_array([0x11; 32]),
+                node_id,
+                oldest_block_slot: cc_store::Slot::new(3),
+                oldest_block_parent: Root::from_array([0x09; 32]),
+            };
+            let mut batch = engine.batch();
+            batch.put(
+                TABLE_META,
+                KEY_ANCHOR_INFO.as_bytes(),
+                &anchor.as_ssz_bytes(),
+            );
+            engine.commit(batch).unwrap();
+        }
+
+        fn stored_meta_node_id(dir: &Path) -> Option<Root> {
+            let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+            let rt = engine.read().unwrap();
+            rt.get(TABLE_META, KEY_NODE_ID.as_bytes())
+                .unwrap()
+                .map(|bytes| Root::from_ssz_bytes(&bytes).unwrap())
+        }
+
+        fn stored_anchor_node_id(dir: &Path) -> Option<Root> {
+            let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+            let rt = engine.read().unwrap();
+            rt.get(TABLE_META, KEY_ANCHOR_INFO.as_bytes())
+                .unwrap()
+                .map(|bytes| AnchorInfo::from_ssz_bytes(&bytes).unwrap().node_id)
+        }
+
+        fn scheme_byte(dir: &Path) -> Option<u8> {
+            let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+            let rt = engine.read().unwrap();
+            rt.get(TABLE_META, b"node_id_scheme")
+                .unwrap()
+                .map(|bytes| bytes[0])
+        }
+
+        fn put_scheme(dir: &Path, byte: u8) {
+            let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+            let mut batch = engine.batch();
+            batch.put(TABLE_META, b"node_id_scheme", &[byte]);
+            engine.commit(batch).unwrap();
+        }
+
+        fn scheme_absent(dir: &Path) -> bool {
+            let engine = Engine::open(dir, EngineOptions::default()).unwrap();
+            let rt = engine.read().unwrap();
+            rt.get(TABLE_META, b"node_id_scheme").unwrap().is_none()
         }
     }
 }
