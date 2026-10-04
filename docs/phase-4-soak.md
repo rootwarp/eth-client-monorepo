@@ -315,6 +315,25 @@ session left them unchecked.
 |---|---|---|---|---|---|---|---|---|---|
 | — | — | — | — | — | — | — | — | — | **NOT_RUN** |
 
+### Key rotation (serve-window event; not a restart row)
+
+A node-key rotation is a **serve-window event**, not a free action and not
+one of the restart trials above. A new discv5 `NodeId` is a new custodied
+column set, so the truth of `earliest_available_slot` changes. `S3b-W-05`
+carries the row below beside those restart timings so a later clause-1
+acceptance is not read against a silently changed custody set. Procedure:
+`docs/key-rotation.md`. **Not reversible.** No automation. No rotation was
+performed for this record.
+
+The columns are the clause-1 / soak observation shape: the header that
+includes advertised `earliest_available_slot` (the peer table near the top
+of this file). The trial is **`NOT_RUN`**. Date, multiaddr, head slot, and
+pass/fail are not filled.
+
+| Date | Implementation (`agent_version`) | Multiaddr | Advertised `earliest_available_slot` | Head slot | Blocks just above eas | Columns just above eas | Positive pass | Negative pass | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| — | — | — | — | — | — | — | — | — | **NOT_RUN** — key rotation; see `docs/key-rotation.md` |
+
 ### Durability p50 / p99 (empty until measured)
 
 | Durability | n | p50 wall (s) | p99 wall (s) | max wall (s) |
