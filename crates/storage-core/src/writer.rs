@@ -206,6 +206,9 @@ pub(crate) struct WriterHandle {
     p0: mpsc::Sender<CommitUnit>,
     p1: mpsc::Sender<MetaUpdate>,
     p2: mpsc::Sender<BackgroundChunk>,
+    metrics: StorageMetrics,
+    process_fatal: bool,
+    on_fatal: ProcessExit,
 }
 
 impl WriterHandle {
@@ -312,6 +315,22 @@ impl WriterHandle {
         // plumbing; depth is updated by the writer task itself.
         0
     }
+
+    /// Metrics registered with this writer (commit-wait histogram included).
+    #[must_use]
+    pub(crate) fn metrics(&self) -> &StorageMetrics {
+        &self.metrics
+    }
+
+    /// Existing fail-closed exit. Production calls [`std::process::exit`].
+    ///
+    /// `process_fatal == false` returns so a test can observe the join.
+    /// The named `reason` is what the operator and the conformance hook see.
+    pub(crate) fn invoke_process_fatal(&self, reason: &'static str) {
+        if self.process_fatal {
+            self.on_fatal.run(1, reason);
+        }
+    }
 }
 
 /// Channel bounds used when opening the mailbox.
@@ -340,20 +359,31 @@ pub(crate) struct WriterFaults {
     pub fail_next_commit: Arc<std::sync::atomic::AtomicBool>,
     /// When true, the writer panics on the next job (process-fatal test).
     pub panic_next: Arc<std::sync::atomic::AtomicBool>,
+    /// When true, the next P0 unit is held unanswered.
+    ///
+    /// The caller's commit deadline is what ends the wait. Dropping `done`
+    /// here would look like shutdown, not a stall.
+    pub stall_commit: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Named process-fatal reason when `commit_import` waits longer than 2 slots.
+///
+/// Aborting is not backpressure (ADR-R-08). Callers cite that consequence;
+/// they do not re-decide it.
+pub(crate) const COMMIT_DEADLINE_REASON: &str = "commit_deadline";
 
 /// How the writer process-fatal guard terminates the process.
 ///
 /// Production uses [`ProcessExit::Os`] (`std::process::exit`). Tests inject
 /// [`ProcessExit::Hook`] so the harness can assert the fatal path without
-/// killing the test process.
+/// killing the test process. The hook receives the exit code and a named reason.
 #[derive(Clone, Default)]
 pub(crate) enum ProcessExit {
     /// Call `std::process::exit(code)` (production).
     #[default]
     Os,
     /// Invoke a test hook instead of exiting the OS process.
-    Hook(Arc<dyn Fn(i32) + Send + Sync>),
+    Hook(Arc<dyn Fn(i32, &'static str) + Send + Sync>),
 }
 
 impl std::fmt::Debug for ProcessExit {
@@ -366,10 +396,10 @@ impl std::fmt::Debug for ProcessExit {
 }
 
 impl ProcessExit {
-    fn run(&self, code: i32) {
+    fn run(&self, code: i32, reason: &'static str) {
         match self {
             Self::Os => std::process::exit(code),
-            Self::Hook(h) => h(code),
+            Self::Hook(h) => h(code, reason),
         }
     }
 }
@@ -418,6 +448,9 @@ pub(crate) fn spawn_writer_with_exit(
         p0: p0_tx,
         p1: p1_tx,
         p2: p2_tx,
+        metrics: metrics.clone(),
+        process_fatal,
+        on_fatal: on_fatal.clone(),
     };
 
     let engine_task = Arc::clone(&engine);
@@ -445,7 +478,7 @@ pub(crate) fn spawn_writer_with_exit(
                     "writer task panicked — process-fatal (voids the run)"
                 );
                 if process_fatal {
-                    on_fatal.run(1);
+                    on_fatal.run(1, "writer_task_panic");
                 }
             }
             Err(e) => {
@@ -501,6 +534,17 @@ async fn run_writer(
             // P0 first (strict priority).
             unit = p0.recv(), if true => {
                 let Some(mut unit) = unit else { break; };
+                if faults
+                    .stall_commit
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    // Hold the reply. The submitter's 2-slot deadline aborts;
+                    // dropping `done` would be shutdown, not a stall.
+                    let done = unit.done.take();
+                    let _ = shutdown.changed().await;
+                    drop(done);
+                    break;
+                }
                 if faults.panic_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     // Intentional: process-fatal panic policy (§1.5); guarded by JoinHandle.
                     #[allow(clippy::panic)]
@@ -1067,6 +1111,7 @@ mod tests {
         let faults = WriterFaults {
             fail_next_commit: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             panic_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ..WriterFaults::default()
         };
         let handle = spawn_writer(
             Arc::clone(&engine),
@@ -1191,6 +1236,9 @@ mod tests {
             p0: p0_tx,
             p1: p1_tx,
             p2: p2_tx,
+            metrics: m.clone(),
+            process_fatal: false,
+            on_fatal: ProcessExit::Os,
         };
         let chunk = BackgroundChunk {
             class: StorageClass::Blocks,
@@ -1220,6 +1268,7 @@ mod tests {
         let faults = WriterFaults {
             fail_next_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panic_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..WriterFaults::default()
         };
         let handle = spawn_writer_with_exit(
             Arc::clone(&engine),
@@ -1228,7 +1277,7 @@ mod tests {
             faults,
             shutdown_rx,
             true,
-            ProcessExit::Hook(Arc::new(move |code| {
+            ProcessExit::Hook(Arc::new(move |code, _reason| {
                 exited2.store(code, std::sync::atomic::Ordering::SeqCst);
             })),
         );
@@ -1266,6 +1315,7 @@ mod tests {
         let faults = WriterFaults {
             fail_next_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panic_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..WriterFaults::default()
         };
         // process_fatal = false so the test process survives.
         let _handle = spawn_writer(

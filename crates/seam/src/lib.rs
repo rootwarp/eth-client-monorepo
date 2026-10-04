@@ -497,6 +497,15 @@ pub trait ArchiveWrite: Send + Sync + 'static {
     /// `state_roots[slot]`, `da_status`, scalars, and the cursor. The
     /// canonical table changes only when that head rule holds. There is no
     /// `update_canonical` field.
+    ///
+    /// Production `ArchiveWriter::commit_import` waits at most
+    /// `2 * seconds_per_slot` on the P0 writer. The deadline is on this
+    /// async call only. The core thread still persists through the
+    /// blocking path with no deadline. Probe coverage of an archive stall
+    /// starts when that thread blocks in `commit_import` (S2R-A-05). Past
+    /// the deadline the process aborts with a named reason. Aborting is
+    /// not backpressure (ADR-R-08). This default still performs no store
+    /// write.
     async fn commit_import(&self, import: DurableImport) -> Result<(), SeamError> {
         let _ = import;
         Ok(())

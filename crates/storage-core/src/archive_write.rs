@@ -14,6 +14,7 @@
 //! not durable, and only on an uninitialized store, once.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cc_seam::{
@@ -34,16 +35,34 @@ use crate::writer::{
     WriterHandle, block_present, load_write_cursor, store_is_uninitialized,
 };
 
+pub(crate) use crate::writer::COMMIT_DEADLINE_REASON;
+
 /// Typed ingest adapter. Holds the live writer handle — no second mailbox.
 #[derive(Debug, Clone)]
 pub struct ArchiveWriter {
     writer: WriterHandle,
     engine: Arc<Engine>,
+    /// Running chain `seconds_per_slot`. The commit deadline is twice this.
+    seconds_per_slot: u64,
 }
 
 impl ArchiveWriter {
     pub(crate) fn new(writer: WriterHandle, engine: Arc<Engine>) -> Self {
-        Self { writer, engine }
+        Self {
+            writer,
+            engine,
+            // Caller has not supplied a network. The existing mainnet-shaped
+            // slot length is the stand-in; the deadline is still twice that,
+            // not a fixed 24 s. `with_seconds_per_slot` replaces it.
+            seconds_per_slot: crate::prune::DEFAULT_SECONDS_PER_SLOT.max(1),
+        }
+    }
+
+    /// Slot length from the running chain config. `0` is not a slot.
+    #[must_use]
+    pub(crate) fn with_seconds_per_slot(mut self, seconds_per_slot: u64) -> Self {
+        self.seconds_per_slot = seconds_per_slot.max(1);
+        self
     }
 
     /// Seed a genesis write cursor when the store has none (S2-A-14).
@@ -228,6 +247,37 @@ impl ArchiveWriter {
             .blocking_submit_p0_committed(unit)
             .map_err(map_writer_err)
     }
+
+    /// Async `commit_import` waits `2 * seconds_per_slot` on the P0 writer.
+    ///
+    /// The deadline is on this async call only. The core thread still
+    /// persists through the blocking path with no deadline. Probe coverage
+    /// of an archive stall starts when that thread blocks in `commit_import`
+    /// (S2R-A-05). Past this wait the existing process-fatal path aborts
+    /// with [`COMMIT_DEADLINE_REASON`]. Aborting is not backpressure; this
+    /// cites that consequence and does not re-decide it.
+    async fn submit_commit_import(&self, unit: CommitUnit) -> Result<(), SeamError> {
+        let deadline = Duration::from_secs(self.seconds_per_slot.max(1).saturating_mul(2));
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(deadline, self.writer.submit_p0_committed(unit)).await;
+        self.writer
+            .metrics()
+            .commit_wait_seconds
+            .observe(started.elapsed().as_secs_f64());
+        match outcome {
+            Ok(result) => result.map_err(map_writer_err),
+            Err(_elapsed) => {
+                tracing::error!(
+                    target: "cc_storage::writer",
+                    reason = COMMIT_DEADLINE_REASON,
+                    seconds_per_slot = self.seconds_per_slot,
+                    "commit deadline exceeded; aborting is not backpressure (ADR-R-08)"
+                );
+                self.writer.invoke_process_fatal(COMMIT_DEADLINE_REASON);
+                Err(SeamError::Unavailable(COMMIT_DEADLINE_REASON.to_owned()))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -262,10 +312,7 @@ impl ArchiveWrite for ArchiveWriter {
 
     async fn commit_import(&self, import: DurableImport) -> Result<(), SeamError> {
         let unit = bind_durable_import(&self.engine, import)?;
-        self.writer
-            .submit_p0_committed(unit)
-            .await
-            .map_err(map_writer_err)
+        self.submit_commit_import(unit).await
     }
 
     async fn set_head(&self, head: HeadChange, scalars: Bytes) -> Result<(), SeamError> {
@@ -1672,6 +1719,7 @@ mod tests {
         let faults = WriterFaults {
             fail_next_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             panic_next: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ..WriterFaults::default()
         };
         let handle = spawn_writer(
             std::sync::Arc::clone(&engine),
@@ -2329,6 +2377,7 @@ mod tests {
         let faults = WriterFaults {
             fail_next_commit: Arc::clone(&flag),
             panic_next: Arc::new(AtomicBool::new(false)),
+            ..WriterFaults::default()
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = spawn_writer(
@@ -2831,5 +2880,128 @@ mod tests {
         assert_eq!(load_write_cursor(&engine).unwrap().unwrap().seq, 1);
         assert_eq!(measure_class_stats(&engine).unwrap().blocks_rows, 2);
         let _ = std::fs::remove_dir_all(&collision_dir);
+    }
+
+    /// Conformance case 14. A stalled P0 writer must not park `commit_import`
+    /// and must not surface [`SeamError::Backpressure`]. Past `2 * seconds_per_slot`
+    /// the existing process-fatal path aborts with [`COMMIT_DEADLINE_REASON`].
+    /// Aborting is not backpressure (ADR-R-08); this test cites that consequence.
+    #[tokio::test(start_paused = true)]
+    async fn commit_deadline_is_fail_closed_not_backpressure() {
+        use crate::writer::{ProcessExit, spawn_writer_with_exit};
+        use prometheus_client::encoding::text::encode;
+        use std::sync::{Mutex, atomic::AtomicBool};
+        use std::time::Duration;
+
+        // Not 12: the deadline is `2 * seconds_per_slot` from the running config.
+        let seconds_per_slot = 3u64;
+        let deadline = Duration::from_secs(seconds_per_slot.saturating_mul(2));
+        let mut registry = Registry::default();
+        let metrics = StorageMetrics::register(&mut registry);
+        let (dir, engine) = eng("commit-deadline");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let aborted = Arc::new(Mutex::new(None));
+        let aborted_hook = Arc::clone(&aborted);
+        let faults = WriterFaults {
+            fail_next_commit: Arc::new(AtomicBool::new(false)),
+            panic_next: Arc::new(AtomicBool::new(false)),
+            stall_commit: Arc::new(AtomicBool::new(true)),
+        };
+        let handle = spawn_writer_with_exit(
+            Arc::clone(&engine),
+            metrics,
+            WriterBounds::default(),
+            faults,
+            shutdown_rx,
+            true,
+            ProcessExit::Hook(Arc::new(move |code, reason| {
+                *aborted_hook.lock().expect("abort record") = Some((code, reason));
+            })),
+        );
+        ArchiveWriter::ensure_write_cursor(&engine).unwrap();
+        let parent = Root::from_array([0x21; 32]);
+        let child = Root::from_array([0x22; 32]);
+        let state = Root::from_array([0xF4; 32]);
+        {
+            let ssz = synth_block(0, &Root::ZERO, &state);
+            let rt = engine.read().unwrap();
+            let mut batch = engine.batch();
+            put_block(
+                &rt,
+                &mut batch,
+                Slot::new(0),
+                &parent,
+                &ssz,
+                BlockRegion::Hot,
+                false,
+            )
+            .unwrap();
+            drop(rt);
+            engine.commit(batch).unwrap();
+        }
+        let archive =
+            ArchiveWriter::new(handle, Arc::clone(&engine)).with_seconds_per_slot(seconds_per_slot);
+
+        let started = tokio::time::Instant::now();
+        let err = archive
+            .commit_import(durable_import(
+                1,
+                &parent,
+                &child,
+                &state,
+                DaVerdict::Available,
+                b"scalars-deadline",
+                true,
+            ))
+            .await
+            .expect_err("a stalled writer must not report a durable commit");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= deadline,
+            "must wait 2 slots ({deadline:?}), elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < deadline + deadline,
+            "must not park past the deadline, elapsed {elapsed:?}"
+        );
+        assert!(
+            !matches!(err, SeamError::Backpressure { .. }),
+            "aborting is not backpressure (ADR-R-08), got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(COMMIT_DEADLINE_REASON),
+            "named reason {COMMIT_DEADLINE_REASON}, got {err}"
+        );
+        let (code, reason) = aborted
+            .lock()
+            .expect("abort record")
+            .expect("process-fatal hook must run");
+        assert_eq!(code, 1);
+        assert_eq!(reason, COMMIT_DEADLINE_REASON);
+
+        let mut buf = String::new();
+        encode(&mut buf, &registry).unwrap();
+        let sum = commit_wait_sum(&buf);
+        assert!(
+            sum > 0.0,
+            "cc_storage_commit_wait_seconds must be non-empty under the stall:\n{buf}"
+        );
+        assert!(
+            buf.contains("cc_storage_commit_wait_seconds"),
+            "histogram must be emitted:\n{buf}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn commit_wait_sum(exposition: &str) -> f64 {
+        exposition
+            .lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix("cc_storage_commit_wait_seconds_sum ")?;
+                rest.trim().parse().ok()
+            })
+            .unwrap_or(0.0)
     }
 }

@@ -426,6 +426,8 @@ pub struct StorageMetrics {
     pub(crate) shard_dropped: Family<ClassLabels, Counter>,
     // Write path
     pub(crate) commit_seconds: Family<ClassLabels, Histogram>,
+    /// Wall time `commit_import` waits on the P0 writer, including a stall.
+    pub(crate) commit_wait_seconds: Histogram,
     pub(crate) written_bytes: Family<ClassLabels, Counter>,
     pub(crate) write_behind_lag_slots: Histogram,
     pub(crate) stream_reconnect: Family<ReasonLabels, Counter>,
@@ -486,6 +488,7 @@ impl StorageMetrics {
         let commit_seconds = Family::<ClassLabels, Histogram>::new_with_constructor(|| {
             Histogram::new(buckets::COMMIT_SECONDS.iter().copied())
         });
+        let commit_wait_seconds = Histogram::new(buckets::COMMIT_WAIT_SECONDS.iter().copied());
         let written_bytes = Family::<ClassLabels, Counter>::default();
         let write_behind_lag_slots =
             Histogram::new(buckets::WRITE_BEHIND_LAG_SLOTS.iter().copied());
@@ -593,6 +596,12 @@ impl StorageMetrics {
             "Wall time of a store commit (class; boundary at 0.5 s)",
             Unit::Seconds,
             commit_seconds.clone(),
+        );
+        registry.register_with_unit(
+            "cc_storage_commit_wait",
+            "Wall time commit_import waits on the P0 writer. Expiry at 2 slots is a fail-closed abort, not backpressure (ADR-R-08)",
+            Unit::Seconds,
+            commit_wait_seconds.clone(),
         );
         registry.register(
             "cc_storage_written_bytes",
@@ -748,6 +757,7 @@ impl StorageMetrics {
             prune_deadline_exceeded,
             shard_dropped,
             commit_seconds,
+            commit_wait_seconds,
             written_bytes,
             write_behind_lag_slots,
             stream_reconnect,
@@ -799,6 +809,7 @@ impl StorageMetrics {
             self.backfill_oldest_slot.get_or_create(&labels).set(0);
             let _ = self.backfill_bytes.get_or_create(&labels).get();
         }
+        self.commit_wait_seconds.observe(0.0);
 
         // Writer mailbox depth / drops by priority class (R-10: p0 must stay 0).
         for pri in WriterPriority::ALL {
@@ -990,6 +1001,7 @@ mod tests {
         "cc_storage_shard_dropped",
         // Write path
         "cc_storage_commit_seconds",
+        "cc_storage_commit_wait_seconds",
         "cc_storage_written_bytes",
         "cc_storage_write_behind_lag_slots",
         "cc_storage_stream_reconnect",
@@ -1093,7 +1105,7 @@ mod tests {
             help_as_str.difference(&expected).collect::<Vec<_>>(),
         );
         // Family count for commit description.
-        assert_eq!(EXPECTED_FAMILIES.len(), 37);
+        assert_eq!(EXPECTED_FAMILIES.len(), 38);
     }
 
     #[test]

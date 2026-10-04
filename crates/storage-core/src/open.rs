@@ -97,6 +97,14 @@ pub struct OpenedStore {
     identity_digest: Option<Root>,
     /// Schedule digest of [`OpenOpts::chain`], when a network was supplied.
     schedule_digest: Option<Root>,
+    /// Slot length of [`OpenOpts::chain`], else the mainnet-shaped default.
+    ///
+    /// When a chain is supplied the commit deadline is `2 * seconds_per_slot`.
+    /// `None` uses [`crate::prune::DEFAULT_SECONDS_PER_SLOT`] (12). That
+    /// matches Hoodi and mainnet and is wrong for any other slot duration
+    /// until the loaded network is passed into [`open`]. Beacon-core still
+    /// opens with `chain: None`; this change does not pass `ChainConfig`.
+    seconds_per_slot: u64,
 }
 
 impl fmt::Debug for OpenedStore {
@@ -112,6 +120,7 @@ impl fmt::Debug for OpenedStore {
             )
             .field("identity_digest", &self.identity_digest)
             .field("schedule_digest", &self.schedule_digest)
+            .field("seconds_per_slot", &self.seconds_per_slot)
             .finish()
     }
 }
@@ -320,6 +329,11 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
         }
         None => (None, None),
     };
+    let seconds_per_slot = opts
+        .chain
+        .as_ref()
+        .map(|chain| chain.seconds_per_slot.max(1))
+        .unwrap_or(crate::prune::DEFAULT_SECONDS_PER_SLOT.max(1));
     Ok(OpenedStore {
         store,
         node_key_path: opts.node_key_path,
@@ -328,6 +342,7 @@ pub fn open(data_dir: impl AsRef<Path>, opts: OpenOpts) -> anyhow::Result<Opened
         expected_node_id,
         identity_digest,
         schedule_digest,
+        seconds_per_slot,
     })
 }
 
@@ -367,7 +382,13 @@ pub fn start_writer(
     metrics: StorageMetrics,
     process_fatal: bool,
 ) -> StorageRuntime {
-    start_writer_on_engine(Arc::new(db.into_engine()), metrics, process_fatal)
+    let seconds_per_slot = db.seconds_per_slot;
+    start_writer_on_engine(
+        Arc::new(db.into_engine()),
+        metrics,
+        process_fatal,
+        seconds_per_slot,
+    )
 }
 
 /// Start the writer on an already-opened [`cc_store::Store`] (A-13 → A-14).
@@ -376,13 +397,19 @@ pub fn start_writer_from_store(
     metrics: StorageMetrics,
     process_fatal: bool,
 ) -> StorageRuntime {
-    start_writer_on_engine(Arc::new(store.into_engine()), metrics, process_fatal)
+    start_writer_on_engine(
+        Arc::new(store.into_engine()),
+        metrics,
+        process_fatal,
+        crate::prune::DEFAULT_SECONDS_PER_SLOT.max(1),
+    )
 }
 
 fn start_writer_on_engine(
     engine: Arc<Engine>,
     metrics: StorageMetrics,
     process_fatal: bool,
+    seconds_per_slot: u64,
 ) -> StorageRuntime {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     if let Err(e) = ArchiveWriter::ensure_write_cursor(&engine) {
@@ -396,7 +423,8 @@ fn start_writer_on_engine(
         shutdown_rx,
         process_fatal,
     );
-    let archive = ArchiveWriter::new(writer.clone(), Arc::clone(&engine));
+    let archive = ArchiveWriter::new(writer.clone(), Arc::clone(&engine))
+        .with_seconds_per_slot(seconds_per_slot);
     StorageRuntime {
         engine,
         _writer: writer,

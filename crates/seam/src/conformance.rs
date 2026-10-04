@@ -22,6 +22,11 @@
 //! | 10 | `events::slow_subscriber_is_terminated_not_stalled` | Policy B (`services/chain/tests/events.rs`) |
 //! | 11 | `core::slot_tick_is_never_shed` | Policy D (`services/chain/src/core.rs`, `S0-A-14`) |
 //!
+//! Case 14 is not one of these eleven. `commit_deadline_is_fail_closed_not_backpressure`
+//! lives in `cc-storage-core` (`archive_write` tests). A stalled P0 writer
+//! aborts after `2 * seconds_per_slot`. Aborting is not backpressure
+//! (ADR-R-08).
+//!
 //! Case 9 helpers (do not collapse these):
 //!
 //! - [`column_admits_when_import_full`] — InProcess 4096 ring still

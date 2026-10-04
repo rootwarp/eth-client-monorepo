@@ -130,8 +130,11 @@ them `start_paused = true` (virtual time).
 - Case 9's header says `Ipc` column admit never returns `Backpressure`. The code can return
   `Backpressure{1024}`: `Ipc::submit_column_sidecar` uses the gossip 2 s send timeout
   (`crates/seam/src/ipc.rs:1177-1196`). This is latent because no production caller submits columns.
-- `ArchiveWrite` has no conformance case. The trait documents Backpressure; the implementation
-  blocks without a deadline. A conformance case is the mechanism that would have caught this.
+- `commit_import`'s conformance case is `commit_deadline_is_fail_closed_not_backpressure`
+  in `cc-storage-core` (`crates/storage-core/src/archive_write.rs`). A stalled P0 writer
+  aborts after `2 * seconds_per_slot`. Aborting is not backpressure
+  ([ADR-R-08](../adr/ADR-R-08.md)). `ingest_columns` is still the unbounded P0 block.
+  The eleven-case suite in `conformance.rs` does not include case 14.
 - InProcess Policy A uses cc-seam's own copies of the import scheduler lane depth and timeout
   (`crates/seam/src/in_process.rs:24-28`), so the suite cannot catch drift in the scheduler's
   constants.

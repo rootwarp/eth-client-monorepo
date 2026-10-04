@@ -553,7 +553,8 @@ pub async fn run() -> anyhow::Result<()> {
                 // S2-A-05: typed ingest over the live P0 mailbox. J-01 injects
                 // this handle into chain-core. Until then the chain path
                 // fail-closes (no AlreadyKnown after a drop).
-                let _archive = ArchiveWriter::new(writer.clone(), Arc::clone(&engine));
+                let _archive = ArchiveWriter::new(writer.clone(), Arc::clone(&engine))
+                    .with_seconds_per_slot(chain.seconds_per_slot);
                 // CC-41: split lock + migrator (FINALIZED_CHECKPOINT cadence).
                 let split = Arc::new(SplitLock::load(&engine).unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "split load failed; defaulting to zero");

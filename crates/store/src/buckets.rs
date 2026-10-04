@@ -27,6 +27,14 @@ pub const WRITE_BEHIND_LAG_SLOTS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 16.0,
 /// `cc_storage_serve_admission_wait_seconds` — exact boundary at **2.0** (timeout).
 pub const SERVE_ADMISSION_WAIT_SECONDS: &[f64] = &[0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0];
 
+/// `cc_storage_commit_wait_seconds` — `commit_import` wait.
+///
+/// Not a §10.2 ladder. Boundaries span a sub-second commit through several
+/// mainnet slots so a soak can see a 2-slot deadline without a fixed 24 s
+/// wait in the caller. The deadline itself is `2 * seconds_per_slot`.
+pub const COMMIT_WAIT_SECONDS: &[f64] =
+    &[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 12.0, 24.0, 48.0, 120.0];
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -55,6 +63,7 @@ mod tests {
         assert_strictly_ascending("SNAPSHOT_SECONDS", SNAPSHOT_SECONDS);
         assert_strictly_ascending("WRITE_BEHIND_LAG_SLOTS", WRITE_BEHIND_LAG_SLOTS);
         assert_strictly_ascending("SERVE_ADMISSION_WAIT_SECONDS", SERVE_ADMISSION_WAIT_SECONDS);
+        assert_strictly_ascending("COMMIT_WAIT_SECONDS", COMMIT_WAIT_SECONDS);
     }
 
     #[test]

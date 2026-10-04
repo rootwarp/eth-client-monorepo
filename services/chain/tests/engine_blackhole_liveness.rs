@@ -11,6 +11,13 @@
 //! deadline / interval / N=3 and a hang `> 8 s × N`. The compressed-sampler
 //! test is a smoke, not the demonstration. Live compose with production 8 s
 //! caps stays SERVING on one RPC — do not paste CI `eprintln` as a scrape.
+//!
+//! The commit deadline is on async `commit_import` only (ARCH §4.5.6).
+//! The core thread still persists through the blocking path with no
+//! deadline. Probe coverage of an archive stall starts when that thread
+//! blocks in `commit_import` (S2R-A-05). Aborting is not backpressure
+//! (ADR-R-08). No live archive-stall probe was run; this sentence is not
+//! a soak result.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
