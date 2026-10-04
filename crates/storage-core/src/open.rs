@@ -8,13 +8,15 @@
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cc_store::blocks::{get_block_by_root, get_state_root};
 use cc_store::canonical::get_canonical;
 use cc_store::columns::{DaStatus, get_da_status};
 use cc_store::engine::{Durability, Engine, EngineOptions};
 use cc_store::meta::{
-    ForkChoiceScalars, KEY_FC_SCALARS, KEY_WRITE_CURSOR, TABLE_META, WriteCursor,
+    ForkChoiceScalars, KEY_FC_SCALARS, KEY_WRITE_CURSOR, Split, TABLE_META, WriteCursor,
 };
 use cc_store::snapshots::newest_snapshot;
 use cc_store::{
@@ -32,7 +34,14 @@ use crate::durable_set::{
 use crate::metrics::StorageMetrics;
 use crate::node_id::{NodeIdExpectation, NodeIdScheme};
 use crate::resume::{self, ResumeError};
-use crate::writer::{WriterBounds, WriterFaults, WriterHandle, spawn_writer};
+use crate::writer::{WriterBounds, WriterFaults, WriterHandle, WriterStop, spawn_writer};
+
+/// Test stall inside [`StorageRuntime::resume`]'s blocking load.
+///
+/// A non-zero value sleeps on the blocking pool so a current-thread probe can
+/// prove the runtime worker is not occupied. Production stays at zero.
+#[cfg(test)]
+static RESUME_BLOCKING_STALL_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Options for [`open`]. Fail-closed gates match the storage host.
 ///
@@ -331,13 +340,24 @@ pub struct DurableSet {
     pub expected_head_slot: u64,
 }
 
+/// Replay payload [`StorageRuntime::resume`] returns.
+///
+/// Same value as [`DurableSet`]. The runtime owns this load. Callers that
+/// only have an [`OpenedStore`] still use [`durable_set`].
+pub type DurableSeed = DurableSet;
+
 /// One writer started from an [`OpenedStore`]. Exactly one per process.
+///
+/// `finalize`, `migrate`, and `prune` are deferred past S2R and are not
+/// implemented on this type. The split rule that is implemented is the
+/// precondition only: the open unit is flushed before a split row is written.
 #[derive(Debug)]
 pub struct StorageRuntime {
     engine: Arc<Engine>,
-    _writer: WriterHandle,
+    writer: WriterHandle,
     archive: ArchiveWriter,
     shutdown_tx: watch::Sender<bool>,
+    durable_ctx: DurableSetContext,
 }
 
 impl StorageRuntime {
@@ -360,8 +380,102 @@ impl StorageRuntime {
     }
 
     /// Signal writer shutdown (tests / pre-drain).
+    ///
+    /// Does not wait, and does not drain the mailbox. [`Self::drain_and_shutdown`]
+    /// is the path that commits the open unit and fsyncs before returning.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Classify, build the durable plan, and load the replay set.
+    ///
+    /// The load runs on `spawn_blocking`, same shape as the snapshot reload in
+    /// `replay`: a multi-second decode must not occupy a runtime worker.
+    /// `None` is uninitialized (checkpoint). `Incomplete` is an error naming
+    /// the `DurableItem`, never an empty store.
+    ///
+    /// `finalize`, `migrate`, and `prune` are deferred past S2R and are not
+    /// run here.
+    pub async fn resume(&self, chain: &ChainConfig) -> anyhow::Result<Option<DurableSeed>> {
+        let engine = Arc::clone(&self.engine);
+        let chain = chain.clone();
+        let ctx = self.durable_ctx.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            block_resume_for_test();
+            load_durable_seed_sync(&engine, &ctx, &chain)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("resume join: {e}"))??;
+        Ok(loaded)
+    }
+
+    /// Stop admitting, drain the mailbox, and return only after that drain
+    /// has finished and the receivers are dropped.
+    ///
+    /// `Ok` means every drained unit committed. A commit failure, an abort
+    /// ([`Self::shutdown`] or a task that already left without draining), and
+    /// a writer that disappears before a terminal state are errors.
+    /// [`Self::shutdown`] only raises the abort flag and does not wait. After
+    /// this method has signaled drain, the writer prefers that drain over the
+    /// abort flag.
+    ///
+    /// `finalize`, `migrate`, and `prune` are deferred past S2R and are not
+    /// run here.
+    pub async fn drain_and_shutdown(&self) -> anyhow::Result<()> {
+        // `close_and_wait` blocks on a condvar. Run it off the runtime so an
+        // in-flight submit can still finish and drop its admit guard.
+        let writer = self.writer.clone();
+        tokio::task::spawn_blocking(move || writer.close_admitting())
+            .await
+            .map_err(|e| anyhow::anyhow!("drain admit: {e}"))?;
+        self.writer.signal_drain();
+        let mut done = self.writer.writer_done();
+        loop {
+            let stop = *done.borrow_and_update();
+            match stop {
+                WriterStop::Drained => return Ok(()),
+                WriterStop::Aborted => {
+                    anyhow::bail!("writer aborted before the mailbox was drained");
+                }
+                WriterStop::CommitFailed => {
+                    anyhow::bail!("drained unit commit failed");
+                }
+                WriterStop::Running => {
+                    done.changed()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("writer exited before drain finished"))?;
+                }
+            }
+        }
+    }
+
+    /// Commit and fsync the open unit, then write `new_split`.
+    ///
+    /// A hot unit already queued is committed before the split row. A hot
+    /// unit at or below `new_split.slot` that is still in flight, including
+    /// one blocked on the submit lock, is rejected until this returns. The
+    /// same exclusion covers every split-writing P1, not only this method.
+    /// This is the precondition only.
+    ///
+    /// `finalize`, `migrate`, and `prune` are deferred past S2R and are not
+    /// implemented here. Hot rows are not re-keyed and nothing is pruned.
+    /// In-process, the import call is the delivery; the deleted write-behind
+    /// cursor algebra is not restored.
+    pub async fn flush_before_split(&self, new_split: Split) -> anyhow::Result<()> {
+        self.writer
+            .flush_split(new_split)
+            .await
+            .map_err(|e| anyhow::anyhow!("flush before split: {e}"))
+    }
+}
+
+fn block_resume_for_test() {
+    #[cfg(test)]
+    {
+        let ms = RESUME_BLOCKING_STALL_MS.load(Ordering::SeqCst);
+        if ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
     }
 }
 
@@ -626,8 +740,28 @@ fn read_stored_node_id(engine: &Engine) -> anyhow::Result<Option<Root>> {
 /// Load the durable set from an already-opened store. `None` = uninitialized (checkpoint).
 ///
 /// `Incomplete` is an error naming the `DurableItem`. It is not `None`.
+/// [`StorageRuntime::resume`] is this load once the writer exists.
 pub fn durable_set(db: &OpenedStore, chain: &ChainConfig) -> anyhow::Result<Option<DurableSet>> {
-    let engine = db.store.engine();
+    load_durable_seed_sync(db.store.engine(), &durable_ctx_from_opened(db), chain)
+}
+
+fn durable_ctx_from_opened(db: &OpenedStore) -> DurableSetContext {
+    DurableSetContext {
+        expected_node_id: db.expected_node_id,
+        // Missing-key refusal already ran in `open`. The path is not retained.
+        node_key_path: None,
+        enr_seq_path: None,
+        snapshot_ring: db.snapshot_ring,
+        max_open_scan_rows: db.max_open_scan_rows,
+        da_status_roots: Vec::new(),
+    }
+}
+
+fn load_durable_seed_sync(
+    engine: &Engine,
+    ctx: &DurableSetContext,
+    chain: &ChainConfig,
+) -> anyhow::Result<Option<DurableSet>> {
     match resume::classify(engine).map_err(|e| anyhow::anyhow!("{e}"))? {
         resume::RestartState::Uninitialized => return Ok(None),
         resume::RestartState::Incomplete(assessment) => {
@@ -640,16 +774,7 @@ pub fn durable_set(db: &OpenedStore, chain: &ChainConfig) -> anyhow::Result<Opti
         }
         resume::RestartState::Complete => {}
     }
-    let ctx = DurableSetContext {
-        expected_node_id: db.expected_node_id,
-        // Missing-key refusal already ran in `open`. The path is not retained.
-        node_key_path: None,
-        enr_seq_path: None,
-        snapshot_ring: db.snapshot_ring,
-        max_open_scan_rows: db.max_open_scan_rows,
-        da_status_roots: Vec::new(),
-    };
-    let plan = resume::build_durable_plan(engine, &ctx, chain).map_err(map_resume)?;
+    let plan = resume::build_durable_plan(engine, ctx, chain).map_err(map_resume)?;
     if plan.empty {
         return Ok(None);
     }
@@ -671,12 +796,24 @@ pub fn start_writer(
     metrics: StorageMetrics,
     process_fatal: bool,
 ) -> StorageRuntime {
+    start_writer_with_faults(db, metrics, process_fatal, WriterFaults::default())
+}
+
+fn start_writer_with_faults(
+    db: OpenedStore,
+    metrics: StorageMetrics,
+    process_fatal: bool,
+    faults: WriterFaults,
+) -> StorageRuntime {
     let seconds_per_slot = db.seconds_per_slot;
+    let durable_ctx = durable_ctx_from_opened(&db);
     start_writer_on_engine(
         Arc::new(db.into_engine()),
         metrics,
         process_fatal,
         seconds_per_slot,
+        durable_ctx,
+        faults,
     )
 }
 
@@ -691,6 +828,8 @@ pub fn start_writer_from_store(
         metrics,
         process_fatal,
         crate::prune::DEFAULT_SECONDS_PER_SLOT.max(1),
+        DurableSetContext::new(),
+        WriterFaults::default(),
     )
 }
 
@@ -699,6 +838,8 @@ fn start_writer_on_engine(
     metrics: StorageMetrics,
     process_fatal: bool,
     seconds_per_slot: u64,
+    durable_ctx: DurableSetContext,
+    faults: WriterFaults,
 ) -> StorageRuntime {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     if let Err(e) = ArchiveWriter::ensure_write_cursor(&engine) {
@@ -708,7 +849,7 @@ fn start_writer_on_engine(
         Arc::clone(&engine),
         metrics,
         WriterBounds::default(),
-        WriterFaults::default(),
+        faults,
         shutdown_rx,
         process_fatal,
     );
@@ -716,9 +857,10 @@ fn start_writer_on_engine(
         .with_seconds_per_slot(seconds_per_slot);
     StorageRuntime {
         engine,
-        _writer: writer,
+        writer,
         archive,
         shutdown_tx,
+        durable_ctx,
     }
 }
 
@@ -2056,6 +2198,846 @@ mod tests {
                     self.0.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
+        }
+    }
+
+    struct ResumeStallGuard;
+
+    impl ResumeStallGuard {
+        fn set(ms: u64) -> Self {
+            RESUME_BLOCKING_STALL_MS.store(ms, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for ResumeStallGuard {
+        fn drop(&mut self) {
+            RESUME_BLOCKING_STALL_MS.store(0, Ordering::SeqCst);
+        }
+    }
+
+    struct Running {
+        dir: PathBuf,
+        rt: StorageRuntime,
+        _registry: Registry,
+    }
+
+    fn start_runtime(label: &str, faults: WriterFaults) -> Running {
+        let dir = unique_temp_dir(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = open(&dir, test_opts(NodeIdExpectation::Unset)).unwrap();
+        let mut registry = Registry::default();
+        let metrics = StorageMetrics::register(&mut registry);
+        let rt = start_writer_with_faults(opened, metrics, false, faults);
+        Running {
+            dir,
+            rt,
+            _registry: registry,
+        }
+    }
+
+    fn synth_block(slot: u64, parent: &Root, state: &Root) -> Vec<u8> {
+        use cc_store::blocks::{
+            MIN_BLOCK_SSZ_LEN, PARENT_ROOT_SSZ_OFFSET, SLOT_SSZ_OFFSET, STATE_ROOT_SSZ_OFFSET,
+        };
+        let mut body = vec![0u8; MIN_BLOCK_SSZ_LEN];
+        body[0..4].copy_from_slice(&100u32.to_le_bytes());
+        body[SLOT_SSZ_OFFSET..SLOT_SSZ_OFFSET + 8].copy_from_slice(&slot.to_le_bytes());
+        body[PARENT_ROOT_SSZ_OFFSET..PARENT_ROOT_SSZ_OFFSET + 32]
+            .copy_from_slice(parent.as_slice());
+        body[STATE_ROOT_SSZ_OFFSET..STATE_ROOT_SSZ_OFFSET + 32].copy_from_slice(state.as_slice());
+        body
+    }
+
+    fn hot_unit(slot: u64, root: Root, ssz: Vec<u8>, seq: u64) -> crate::writer::CommitUnit {
+        use crate::writer::{CommitUnit, StagedBlock};
+        CommitUnit {
+            blocks: vec![StagedBlock {
+                slot: Slot::new(slot),
+                root,
+                ssz,
+                update_canonical: true,
+                write_state_root: false,
+                da_status: Some(DaStatus::Available),
+            }],
+            columns: Vec::new(),
+            fork_choice: None,
+            canonical_from: None,
+            anchor: None,
+            cursor: WriteCursor {
+                session_id: 1,
+                seq,
+                slot: Slot::new(slot),
+                root,
+            },
+            done: None,
+        }
+    }
+
+    fn stored_body(engine: &Engine, root: &Root) -> Option<Vec<u8>> {
+        let read = engine.read().unwrap();
+        get_block_by_root(&read, root).unwrap()
+    }
+
+    /// `resume` is the runtime's durable load. The blocking classify/plan
+    /// must not occupy the runtime worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_returns_durable_seed_while_runtime_stays_responsive() {
+        let _stall = ResumeStallGuard::set(250);
+        let running = start_runtime("resume-responsive", WriterFaults::default());
+        let chain = fixture_chain("hoodi-config.yaml");
+        {
+            let load = running.rt.resume(&chain);
+            tokio::pin!(load);
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_millis(80),
+                tokio::time::sleep(std::time::Duration::from_millis(10)),
+            );
+            let probe_won = tokio::select! {
+                biased;
+                _ = &mut load => false,
+                result = probe => result.is_ok(),
+            };
+            assert!(
+                probe_won,
+                "runtime timer did not fire during resume (blocking load on a runtime worker)"
+            );
+            let seed: Option<DurableSeed> = load.await.unwrap();
+            assert!(seed.is_none(), "an empty store resumes as uninitialized");
+        }
+        running.rt.drain_and_shutdown().await.unwrap();
+    }
+
+    /// A committed anchor is `Complete`: `resume` returns that seed.
+    #[tokio::test]
+    async fn resume_on_a_complete_store_returns_the_durable_seed() {
+        use cc_seam::{ArchiveWrite, Bytes, DaVerdict, TrustedAnchor};
+        use cc_store::SszEncode;
+        use cc_types::{Checkpoint, Epoch};
+
+        let running = start_runtime("resume-complete", WriterFaults::default());
+        let parent = Root::from_array([0x11; 32]);
+        let root = Root::from_array([0x42; 32]);
+        let state = Root::from_array([0xF0; 32]);
+        let slot = 64u64;
+        let block = synth_block(slot, &parent, &state);
+        let state_ssz = b"anchor-state-ssz".to_vec();
+        let checkpoint = Checkpoint {
+            epoch: Epoch::new(slot / 32),
+            root,
+        };
+        let scalars = ForkChoiceScalars {
+            time: slot,
+            proposer_boost_root: Root::ZERO,
+            justified: checkpoint,
+            finalized: checkpoint,
+            unrealized_justified: checkpoint,
+            unrealized_finalized: checkpoint,
+            head_root: root,
+            head_slot: Slot::new(slot),
+        }
+        .as_ssz_bytes();
+        running
+            .rt
+            .archive()
+            .commit_anchor(TrustedAnchor {
+                block_root: root.into_array(),
+                parent_root: parent.into_array(),
+                slot,
+                state_root: state.into_array(),
+                block_ssz: Bytes::from(block.clone()),
+                state_ssz: Bytes::from(state_ssz.clone()),
+                scalars: Bytes::from(scalars),
+                da: DaVerdict::Available,
+            })
+            .await
+            .unwrap();
+
+        let chain = fixture_chain("hoodi-config.yaml");
+        let seed = running
+            .rt
+            .resume(&chain)
+            .await
+            .unwrap()
+            .expect("complete seed");
+        assert_eq!(seed.state_ssz, state_ssz);
+        assert_eq!(seed.anchor_block_ssz, block);
+        assert_eq!(seed.anchor_block_root, root.into_array());
+        assert_eq!(seed.expected_head_slot, slot);
+        running.rt.drain_and_shutdown().await.unwrap();
+    }
+
+    /// Bodies without an anchor are `Incomplete`, including through `resume`.
+    #[tokio::test]
+    async fn resume_on_an_incomplete_store_names_the_item() {
+        let dir = unique_temp_dir("resume-incomplete");
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = open(&dir, test_opts(NodeIdExpectation::Unset)).unwrap();
+        put_canonical_slot(&opened, 3, 0xAB);
+        let mut registry = Registry::default();
+        let metrics = StorageMetrics::register(&mut registry);
+        let rt = start_writer(opened, metrics, false);
+        let chain = fixture_chain("hoodi-config.yaml");
+        let err = rt.resume(&chain).await.unwrap_err();
+        assert!(
+            err.to_string().contains("anchor"),
+            "incomplete resume must name the item, not return None: {err}"
+        );
+        rt.drain_and_shutdown().await.unwrap();
+        drop(rt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drain returns only after the open unit is committed and fsynced.
+    #[tokio::test]
+    async fn drain_and_shutdown_fsyncs_the_last_submitted_body() {
+        let running = start_runtime("drain-fsync", WriterFaults::default());
+        let root = Root::from_array([0x33; 32]);
+        let ssz = synth_block(3, &Root::ZERO, &Root::from_array([0xF0; 32]));
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        writer.hold_commits();
+        writer
+            .submit_p0(hot_unit(3, root, ssz.clone(), 1))
+            .await
+            .unwrap();
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if writer.commit_entered() >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            entered.is_ok(),
+            "writer did not reach the held commit before drain"
+        );
+
+        {
+            let drain = running.rt.drain_and_shutdown();
+            tokio::pin!(drain);
+            let still_open = tokio::select! {
+                biased;
+                result = &mut drain => {
+                    let _ = result;
+                    false
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => true,
+            };
+            assert!(
+                still_open,
+                "drain_and_shutdown returned before the held commit was released"
+            );
+            assert!(
+                stored_body(&engine, &root).is_none(),
+                "body must stay absent until drain finishes the commit"
+            );
+            let rejected = writer
+                .submit_p0(hot_unit(4, Root::from_array([0x44; 32]), ssz.clone(), 2))
+                .await;
+            assert!(
+                matches!(rejected, Err(crate::writer::WriterError::ShutDown)),
+                "drain must stop admitting, got {rejected:?}"
+            );
+
+            writer.release_commits();
+            let finished =
+                tokio::time::timeout(std::time::Duration::from_secs(2), &mut drain).await;
+            assert!(finished.is_ok(), "drain did not return after the commit");
+            finished.unwrap().unwrap();
+            assert_eq!(stored_body(&engine, &root).as_deref(), Some(ssz.as_slice()));
+        }
+
+        let dir = running.dir.clone();
+        drop(engine);
+        drop(writer);
+        drop(running);
+        let frontier = reopen_durable_frontier(&dir, &[3]).unwrap();
+        assert_eq!(frontier.bodies[0].as_deref(), Some(ssz.as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Queued hot data is committed before the split row. The hot row is not
+    /// migrated: `finalize`, `migrate`, and `prune` stay deferred.
+    #[tokio::test]
+    async fn no_uncommitted_hot_row_lands_after_split() {
+        let running = start_runtime(
+            "split-precondition",
+            WriterFaults {
+                start_paused: true,
+                ..WriterFaults::default()
+            },
+        );
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        writer.enable_commit_trace();
+        let root = Root::from_array([0x55; 32]);
+        let ssz = synth_block(5, &Root::ZERO, &Root::from_array([0xF1; 32]));
+        writer
+            .submit_p0(hot_unit(5, root, ssz.clone(), 1))
+            .await
+            .unwrap();
+        writer.prefer_split_over_hot_once();
+
+        let split = Split {
+            slot: Slot::new(8),
+            state_root: Root::ZERO,
+            block_root: Root::ZERO,
+        };
+        {
+            let flush = running.rt.flush_before_split(split);
+            tokio::pin!(flush);
+            let mut wait_reason: &str = "split was not queued while the writer stayed paused";
+            for _ in 0..200 {
+                tokio::select! {
+                    biased;
+                    result = &mut flush => {
+                        let _ = result;
+                        wait_reason = "flush finished while the writer was paused";
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if writer.split_is_queued() {
+                            wait_reason = "";
+                            break;
+                        }
+                    }
+                }
+            }
+            assert!(wait_reason.is_empty(), "{wait_reason}");
+            assert!(
+                stored_body(&engine, &root).is_none(),
+                "hot body must still be uncommitted when the split is only queued"
+            );
+            let read = engine.read().unwrap();
+            assert!(
+                cc_store::split::load_split(&read).unwrap().is_none(),
+                "split row must not land before the queued hot unit"
+            );
+            drop(read);
+
+            writer.unpause_loop();
+            let finished =
+                tokio::time::timeout(std::time::Duration::from_secs(2), &mut flush).await;
+            assert!(finished.is_ok(), "flush_before_split did not finish");
+            finished.unwrap().unwrap();
+        }
+        assert_eq!(
+            running.rt.writer.commit_order(),
+            ["hot", "split"],
+            "a queued hot unit must commit before the split row"
+        );
+        assert_eq!(
+            stored_body(running.rt.engine(), &root).as_deref(),
+            Some(ssz.as_slice())
+        );
+        let read = running.rt.engine().read().unwrap();
+        let (slot, region) = cc_store::blocks::slot_by_root(&read, &root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(slot, Slot::new(5));
+        assert_eq!(
+            region,
+            cc_store::BlockRegion::Hot,
+            "the precondition does not migrate the hot row"
+        );
+        let stored = cc_store::split::load_split(&read).unwrap().unwrap();
+        assert_eq!(stored.slot, Slot::new(8));
+        drop(read);
+
+        running.rt.drain_and_shutdown().await.unwrap();
+    }
+
+    fn split_update(slot: u64) -> crate::writer::MetaUpdate {
+        use cc_store::SszEncode;
+        let split = Split {
+            slot: Slot::new(slot),
+            state_root: Root::ZERO,
+            block_root: Root::ZERO,
+        };
+        crate::writer::MetaUpdate {
+            puts: vec![(
+                TABLE_META.to_owned(),
+                cc_store::meta::KEY_SPLIT.as_bytes().to_vec(),
+                split.as_ssz_bytes(),
+            )],
+            deletes: Vec::new(),
+            done: None,
+        }
+    }
+
+    fn paused_runtime(label: &str) -> Running {
+        start_runtime(
+            label,
+            WriterFaults {
+                start_paused: true,
+                ..WriterFaults::default()
+            },
+        )
+    }
+
+    async fn wait_split_queued(writer: &crate::writer::WriterHandle) {
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !writer.split_is_queued() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            finished.is_ok(),
+            "split was not queued while the writer stayed paused"
+        );
+    }
+
+    async fn wait_writer(writer: &crate::writer::WriterHandle, want: WriterStop) {
+        let mut done = writer.writer_done();
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if *done.borrow_and_update() == want {
+                    return;
+                }
+                if done.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(finished.is_ok(), "writer did not reach {want:?}");
+        assert_eq!(*writer.writer_done().borrow(), want);
+    }
+
+    /// Hot slot ≤ the in-flight split is refused before the writer runs.
+    /// Returns the refused root so the caller can show it stays absent.
+    async fn refuse_hot_at_split(
+        writer: &crate::writer::WriterHandle,
+        engine: &Engine,
+        split_slot: u64,
+    ) -> Root {
+        let root = Root::from_array([0x66; 32]);
+        let ssz = synth_block(split_slot, &Root::ZERO, &Root::from_array([0xF2; 32]));
+        let rejected = writer.submit_p0(hot_unit(split_slot, root, ssz, 2)).await;
+        assert!(
+            matches!(rejected, Err(crate::writer::WriterError::HotAtOrBelowSplit)),
+            "hot slot {split_slot} must be refused while the split oneshot is outstanding, got {rejected:?}"
+        );
+        assert!(
+            stored_body(engine, &root).is_none(),
+            "a refused hot body must not be queued"
+        );
+        root
+    }
+
+    fn assert_split_stored_and_hot_absent(engine: &Engine, split_slot: u64, root: &Root) {
+        assert!(stored_body(engine, root).is_none());
+        let read = engine.read().unwrap();
+        let stored = cc_store::split::load_split(&read).unwrap().unwrap();
+        assert_eq!(stored.slot, Slot::new(split_slot));
+    }
+
+    /// The paused queue-before-flush test is not this window: the hot submit
+    /// runs only after the split is armed and before its oneshot completes.
+    #[tokio::test]
+    async fn hot_submit_while_flush_split_is_outstanding_is_refused() {
+        let running = paused_runtime("split-flush-window");
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        let split_slot = 8u64;
+        let flush = running.rt.flush_before_split(Split {
+            slot: Slot::new(split_slot),
+            state_root: Root::ZERO,
+            block_root: Root::ZERO,
+        });
+        tokio::pin!(flush);
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut flush => {
+                        let _ = result;
+                        return false;
+                    }
+                    _ = tokio::task::yield_now() => {
+                        if writer.split_is_queued() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(queued, Ok(true)),
+            "split was not queued while the writer stayed paused"
+        );
+        let refused = refuse_hot_at_split(&writer, &engine, split_slot).await;
+        let above = Root::from_array([0x67; 32]);
+        let above_ssz = synth_block(split_slot + 1, &Root::ZERO, &Root::from_array([0xF3; 32]));
+        writer
+            .submit_p0(hot_unit(split_slot + 1, above, above_ssz.clone(), 3))
+            .await
+            .unwrap();
+        writer.unpause_loop();
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), &mut flush).await;
+        assert!(finished.is_ok(), "flush_before_split did not finish");
+        finished.unwrap().unwrap();
+        assert_split_stored_and_hot_absent(&engine, split_slot, &refused);
+        assert_eq!(
+            stored_body(&engine, &above).as_deref(),
+            Some(above_ssz.as_slice())
+        );
+
+        let late = Root::from_array([0x68; 32]);
+        let late_ssz = synth_block(split_slot, &Root::ZERO, &Root::from_array([0xF4; 32]));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let mut late_unit = hot_unit(split_slot, late, late_ssz, 4);
+        late_unit.done = Some(done_tx);
+        writer.submit_p0(late_unit).await.unwrap();
+        let late_err = done_rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(late_err, crate::writer::WriterError::HotAtOrBelowSplit),
+            "a new hot put at the stored split must fail the commit, got {late_err:?}"
+        );
+        assert!(stored_body(&engine, &late).is_none());
+        running.rt.drain_and_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hot_submit_while_submit_p1_split_is_outstanding_is_refused() {
+        let running = paused_runtime("split-submit-p1-window");
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        let split_slot = 8u64;
+        let submitter = writer.clone();
+        let submitted =
+            tokio::spawn(async move { submitter.submit_p1(split_update(split_slot)).await });
+        wait_split_queued(&writer).await;
+        let refused = refuse_hot_at_split(&writer, &engine, split_slot).await;
+        writer.unpause_loop();
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), submitted).await;
+        assert!(finished.is_ok(), "submit_p1 split did not finish");
+        finished.unwrap().unwrap().unwrap();
+        assert_split_stored_and_hot_absent(&engine, split_slot, &refused);
+        running.rt.drain_and_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hot_submit_while_blocking_split_commit_is_outstanding_is_refused() {
+        let running = paused_runtime("split-blocking-window");
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        let split_slot = 8u64;
+        let submitter = writer.clone();
+        let submitted = tokio::task::spawn_blocking(move || {
+            submitter.blocking_submit_p1_committed(split_update(split_slot))
+        });
+        wait_split_queued(&writer).await;
+        let refused = refuse_hot_at_split(&writer, &engine, split_slot).await;
+        writer.unpause_loop();
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), submitted).await;
+        assert!(finished.is_ok(), "blocking split commit did not finish");
+        finished.unwrap().unwrap().unwrap();
+        assert_split_stored_and_hot_absent(&engine, split_slot, &refused);
+        running.rt.drain_and_shutdown().await.unwrap();
+    }
+
+    /// A hot unit drained ahead of the split fails closed: the split row stays absent.
+    #[tokio::test]
+    async fn failed_drained_hot_commit_does_not_fsync_the_split() {
+        let running = start_runtime(
+            "split-hot-fail",
+            WriterFaults {
+                start_paused: true,
+                fail_next_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                ..WriterFaults::default()
+            },
+        );
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        let root = Root::from_array([0x69; 32]);
+        let ssz = synth_block(4, &Root::ZERO, &Root::from_array([0xF5; 32]));
+        writer.submit_p0(hot_unit(4, root, ssz, 1)).await.unwrap();
+        writer.prefer_split_over_hot_once();
+        let flush = running.rt.flush_before_split(Split {
+            slot: Slot::new(8),
+            state_root: Root::ZERO,
+            block_root: Root::ZERO,
+        });
+        tokio::pin!(flush);
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut flush => {
+                        let _ = result;
+                        return false;
+                    }
+                    _ = tokio::task::yield_now() => {
+                        if writer.split_is_queued() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(queued, Ok(true)),
+            "split was not queued while the writer stayed paused"
+        );
+        writer.unpause_loop();
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), &mut flush).await;
+        assert!(
+            finished.is_ok(),
+            "flush did not finish after the hot commit failed"
+        );
+        let err = finished.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("injected"),
+            "split must surface the drained hot failure, got {err}"
+        );
+        assert!(stored_body(&engine, &root).is_none());
+        let read = engine.read().unwrap();
+        assert!(cc_store::split::load_split(&read).unwrap().is_none());
+        drop(read);
+        running.rt.drain_and_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_and_shutdown_after_abort_is_an_error() {
+        let running = paused_runtime("drain-after-abort");
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        let root = Root::from_array([0x70; 32]);
+        let ssz = synth_block(3, &Root::ZERO, &Root::from_array([0xF6; 32]));
+        writer.submit_p0(hot_unit(3, root, ssz, 1)).await.unwrap();
+        running.rt.shutdown();
+        writer.unpause_loop();
+        wait_writer(&writer, WriterStop::Aborted).await;
+        let err = running.rt.drain_and_shutdown().await.unwrap_err();
+        assert!(
+            err.to_string().contains("aborted"),
+            "an abort exit must not be Ok, got {err}"
+        );
+        assert!(stored_body(&engine, &root).is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_and_shutdown_errors_when_the_writer_already_aborted() {
+        let running = start_runtime("drain-already-gone", WriterFaults::default());
+        running.rt.shutdown();
+        wait_writer(&running.rt.writer, WriterStop::Aborted).await;
+        let err = running.rt.drain_and_shutdown().await.unwrap_err();
+        assert!(
+            err.to_string().contains("aborted"),
+            "a writer that already left without draining must not be Ok, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_and_shutdown_prefers_drain_after_shutdown() {
+        let running = start_runtime("drain-over-shutdown", WriterFaults::default());
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        let root = Root::from_array([0x71; 32]);
+        let ssz = synth_block(6, &Root::ZERO, &Root::from_array([0xF7; 32]));
+        writer.hold_commits();
+        writer
+            .submit_p0(hot_unit(6, root, ssz.clone(), 1))
+            .await
+            .unwrap();
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while writer.commit_entered() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(entered.is_ok(), "writer did not reach the held commit");
+        {
+            let drain = running.rt.drain_and_shutdown();
+            tokio::pin!(drain);
+            let signaled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut drain => {
+                            let _ = result;
+                            return false;
+                        }
+                        _ = tokio::task::yield_now() => {
+                            if writer.drain_requested() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(
+                matches!(signaled, Ok(true)),
+                "drain finished or was not signaled before shutdown"
+            );
+            running.rt.shutdown();
+            writer.release_commits();
+            let finished =
+                tokio::time::timeout(std::time::Duration::from_secs(2), &mut drain).await;
+            assert!(
+                finished.is_ok(),
+                "drain did not finish after the commit was released"
+            );
+            finished.unwrap().unwrap();
+        }
+        assert_eq!(stored_body(&engine, &root).as_deref(), Some(ssz.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn drain_and_shutdown_fails_when_the_drained_commit_fails() {
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let running = start_runtime(
+            "drain-commit-fails",
+            WriterFaults {
+                start_paused: true,
+                fail_next_commit: std::sync::Arc::clone(&fail),
+                ..WriterFaults::default()
+            },
+        );
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        let root = Root::from_array([0x72; 32]);
+        let ssz = synth_block(7, &Root::ZERO, &Root::from_array([0xF8; 32]));
+        writer.submit_p0(hot_unit(7, root, ssz, 1)).await.unwrap();
+        {
+            let drain = running.rt.drain_and_shutdown();
+            tokio::pin!(drain);
+            let signaled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut drain => {
+                            let _ = result;
+                            return false;
+                        }
+                        _ = tokio::task::yield_now() => {
+                            if writer.drain_requested() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(
+                matches!(signaled, Ok(true)),
+                "drain finished before the paused writer was released"
+            );
+            writer.unpause_loop();
+            let finished =
+                tokio::time::timeout(std::time::Duration::from_secs(2), &mut drain).await;
+            assert!(finished.is_ok(), "drain did not finish");
+            let err = finished.unwrap().unwrap_err();
+            assert!(
+                err.to_string().contains("drained unit commit failed"),
+                "a failed drained commit must fail drain_and_shutdown, got {err}"
+            );
+        }
+        assert!(stored_body(&engine, &root).is_none());
+    }
+
+    #[tokio::test]
+    async fn p2_try_send_holds_the_admit_guard() {
+        use crate::metrics::StorageClass;
+        use crate::writer::BackgroundChunk;
+
+        let running = paused_runtime("p2-admit");
+        let writer = running.rt.writer.clone();
+        let engine = Arc::clone(&running.rt.engine);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let chunk = BackgroundChunk {
+            class: StorageClass::Meta,
+            puts: vec![(
+                TABLE_META.to_owned(),
+                b"p2-probe".to_vec(),
+                b"committed".to_vec(),
+            )],
+            deletes: Vec::new(),
+            done: Some(done_tx),
+        };
+        assert!(writer.try_submit_p2(chunk, writer.metrics()));
+        {
+            let drain = running.rt.drain_and_shutdown();
+            tokio::pin!(drain);
+            let signaled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut drain => {
+                            let _ = result;
+                            return false;
+                        }
+                        _ = tokio::task::yield_now() => {
+                            if writer.drain_requested() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(
+                matches!(signaled, Ok(true)),
+                "drain was not signaled while paused"
+            );
+            let late = BackgroundChunk {
+                class: StorageClass::Meta,
+                puts: vec![(TABLE_META.to_owned(), b"p2-late".to_vec(), b"nope".to_vec())],
+                deletes: Vec::new(),
+                done: None,
+            };
+            assert!(
+                !writer.try_submit_p2(late, writer.metrics()),
+                "try_submit_p2 after close must be refused"
+            );
+            writer.unpause_loop();
+            let finished =
+                tokio::time::timeout(std::time::Duration::from_secs(2), &mut drain).await;
+            assert!(finished.is_ok(), "drain did not finish");
+            finished.unwrap().unwrap();
+        }
+        done_rx.await.unwrap().unwrap();
+        let read = engine.read().unwrap();
+        let stored = read.get(TABLE_META, b"p2-probe").unwrap().unwrap();
+        assert_eq!(stored, b"committed");
+        assert!(read.get(TABLE_META, b"p2-late").unwrap().is_none());
+    }
+
+    #[test]
+    fn deferred_finalize_is_documented_and_write_behind_algebra_stays_gone() {
+        let open_prod = include_str!("open.rs").split("mod tests").next().unwrap();
+        assert!(
+            open_prod.contains("deferred past S2R"),
+            "finalize, migrate, and prune deferral must be documented on the runtime"
+        );
+        for name in ["fn finalize", "fn migrate", "fn prune"] {
+            assert!(
+                !open_prod.contains(name),
+                "{name} must stay unimplemented on the runtime"
+            );
+        }
+        let writer_prod = include_str!("writer.rs").split("mod tests").next().unwrap();
+        for name in [
+            "PendingRetry",
+            "resume_after_panic",
+            "predecessor_resume_cursor",
+        ] {
+            assert!(
+                !open_prod.contains(name),
+                "open.rs reintroduced write-behind algebra {name}"
+            );
+            assert!(
+                !writer_prod.contains(name),
+                "writer.rs reintroduced write-behind algebra {name}"
+            );
         }
     }
 }

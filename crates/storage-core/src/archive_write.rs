@@ -185,6 +185,9 @@ fn map_writer_err(err: WriterError) -> SeamError {
         }
         WriterError::Store(e) => SeamError::Unavailable(e.to_string()),
         WriterError::InjectedFailure => SeamError::Unavailable("injected commit failure".into()),
+        WriterError::HotAtOrBelowSplit => {
+            SeamError::InvalidArgument("hot block slot is at or below the split".into())
+        }
         WriterError::NotUninitialized => SeamError::FailedPrecondition {
             reason: FailedPreconditionReason::StoreNotUninitialized,
         },
@@ -3077,6 +3080,7 @@ mod tests {
             fail_next_commit: Arc::new(AtomicBool::new(false)),
             panic_next: Arc::new(AtomicBool::new(false)),
             stall_commit: Arc::new(AtomicBool::new(true)),
+            start_paused: false,
         };
         let handle = spawn_writer_with_exit(
             Arc::clone(&engine),

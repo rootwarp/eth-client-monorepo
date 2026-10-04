@@ -48,8 +48,8 @@ pub use durable_set::{DurableBlock, DurableDaStatus};
 pub use metrics::StorageMetrics;
 pub use node_id::{NodeIdExpectation, NodeIdScheme};
 pub use open::{
-    CursorSnap, DurableFrontier, DurableSet, OpenOpts, OpenedStore, PendingStore, StorageRuntime,
-    durable_frontier, durable_set, open, reopen_durable_frontier, start_writer,
+    CursorSnap, DurableFrontier, DurableSeed, DurableSet, OpenOpts, OpenedStore, PendingStore,
+    StorageRuntime, durable_frontier, durable_set, open, reopen_durable_frontier, start_writer,
     start_writer_from_store,
 };
 

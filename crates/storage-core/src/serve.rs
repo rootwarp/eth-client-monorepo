@@ -1262,6 +1262,9 @@ fn writer_status(err: WriterError) -> Status {
         WriterError::InjectedFailure => Status::aborted("injected commit failure"),
         WriterError::ShutDown => Status::unavailable("writer shut down"),
         WriterError::NotUninitialized => Status::failed_precondition("STORE_NOT_UNINITIALIZED"),
+        WriterError::HotAtOrBelowSplit => {
+            Status::failed_precondition("hot block slot is at or below the split")
+        }
         WriterError::Store(e) => store_status(e),
     }
 }

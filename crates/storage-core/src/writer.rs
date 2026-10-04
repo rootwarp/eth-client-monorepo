@@ -27,18 +27,19 @@
 //! **Panic policy:** the writer is process-fatal on panic. A dead writer that
 //! continues to serve is strictly worse than a compose restart.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use cc_store::blocks::{stage_state_root, state_root_at_offset};
 use cc_store::engine::{Engine, ReadTxn};
 use cc_store::keys::BlockRegion;
-use cc_store::meta::{KEY_FC_SCALARS, KEY_WRITE_CURSOR, TABLE_META, WriteCursor};
+use cc_store::meta::{KEY_FC_SCALARS, KEY_SPLIT, KEY_WRITE_CURSOR, Split, TABLE_META, WriteCursor};
 use cc_store::{
     DaStatus, PutBlockOutcome, PutColumnOutcome, StoreError, get_block_by_root, put_block,
     put_block_and_update_head, put_column, put_da_status, rewrite_from_head,
 };
-use cc_store::{Root, Slot, SszEncode};
+use cc_store::{Root, Slot, SszDecode, SszEncode};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
@@ -196,6 +197,26 @@ pub(crate) enum WriterError {
     /// `commit_anchor` saw a store that is no longer uninitialized.
     #[error("store is not uninitialized")]
     NotUninitialized,
+    /// A new hot body at or below the split slot would break `I-split-fin`.
+    #[error("hot block slot is at or below the split")]
+    HotAtOrBelowSplit,
+}
+
+/// How the writer task stopped.
+///
+/// [`WriterStop::Drained`] is sent only after the mailbox drain has finished
+/// and the receivers are dropped. Drop of the task sends [`WriterStop::Aborted`]
+/// when that drain did not finish, including `shutdown()` and a panic unwind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriterStop {
+    /// Task is still in `run_writer`.
+    Running,
+    /// Mailbox drained, receivers dropped, commits that ran succeeded.
+    Drained,
+    /// Left the loop without draining. Not a successful `drain_and_shutdown`.
+    Aborted,
+    /// Drain ran and at least one unit's commit failed.
+    CommitFailed,
 }
 
 // ── mailbox ─────────────────────────────────────────────────────────────────
@@ -209,33 +230,214 @@ pub(crate) struct WriterHandle {
     metrics: StorageMetrics,
     process_fatal: bool,
     on_fatal: ProcessExit,
+    admit: Arc<AdmitGate>,
+    /// Split exclusion. Held while arming, checking, or clearing — not across
+    /// the split oneshot, and not by the writer task. The slot stays set
+    /// until that oneshot finishes.
+    submit_lock: Arc<tokio::sync::Mutex<SplitBarrier>>,
+    drain_tx: watch::Sender<bool>,
+    done: watch::Receiver<WriterStop>,
+    /// True parks the task before `select` (tests).
+    loop_pause: watch::Sender<bool>,
+    /// True parks a P0 commit before `engine.commit` (tests).
+    commit_gate: watch::Sender<bool>,
+    commit_entered: Arc<AtomicUsize>,
+    /// When set, the next loop dequeues P1 ahead of P0 once.
+    prefer_p1_once: Arc<AtomicBool>,
+    trace_enabled: Arc<AtomicBool>,
+    commit_order: Arc<Mutex<Vec<&'static str>>>,
+    /// Set once a split meta update is in the P1 mailbox, before its commit.
+    split_queued: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct AdmitState {
+    admitting: bool,
+    inflight: usize,
+}
+
+#[derive(Debug)]
+struct AdmitGate {
+    inner: Mutex<AdmitState>,
+    cv: Condvar,
+}
+
+impl AdmitGate {
+    fn open() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(AdmitState {
+                admitting: true,
+                inflight: 0,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn enter(self: &Arc<Self>) -> Result<AdmitGuard, WriterError> {
+        let mut guard = lock_mutex(&self.inner);
+        if !guard.admitting {
+            return Err(WriterError::ShutDown);
+        }
+        guard.inflight = guard.inflight.saturating_add(1);
+        Ok(AdmitGuard {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn close_and_wait(&self) {
+        let mut guard = lock_mutex(&self.inner);
+        guard.admitting = false;
+        while guard.inflight > 0 {
+            guard = self.cv.wait(guard).unwrap_or_else(|err| err.into_inner());
+        }
+    }
+}
+
+struct AdmitGuard {
+    gate: Arc<AdmitGate>,
+}
+
+impl Drop for AdmitGuard {
+    fn drop(&mut self) {
+        let mut guard = lock_mutex(&self.gate.inner);
+        guard.inflight = guard.inflight.saturating_sub(1);
+        self.gate.cv.notify_all();
+    }
+}
+
+fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+/// In-flight split commits. `slot` is the most exclusive slot still outstanding.
+/// `u64::MAX` means the split bytes did not decode, so every hot slot is excluded.
+#[derive(Debug, Default)]
+struct SplitBarrier {
+    inflight: u32,
+    slot: u64,
+}
+
+impl SplitBarrier {
+    fn arm(&mut self, slot: u64) {
+        if self.inflight == 0 || slot == u64::MAX || slot > self.slot {
+            self.slot = slot;
+        }
+        self.inflight = self.inflight.saturating_add(1);
+    }
+
+    fn disarm(&mut self) {
+        self.inflight = self.inflight.saturating_sub(1);
+        if self.inflight == 0 {
+            self.slot = 0;
+        }
+    }
+
+    /// Hot bodies only. Cursor-only units and anchor (cold) units stay eligible.
+    fn excludes_hot(&self, unit: &CommitUnit) -> bool {
+        if self.inflight == 0 || unit.anchor.is_some() {
+            return false;
+        }
+        unit.blocks
+            .iter()
+            .any(|block| block.slot.as_u64() <= self.slot)
+    }
 }
 
 impl WriterHandle {
     /// Submit a P0 commit unit. **Blocks** when the 32-slot queue is full (never drop).
     pub(crate) async fn submit_p0(&self, unit: CommitUnit) -> Result<(), WriterError> {
+        let _admit = self.admit.enter()?;
+        let _submit = self.submit_lock.lock().await;
+        if _submit.excludes_hot(&unit) {
+            return Err(WriterError::HotAtOrBelowSplit);
+        }
         self.p0.send(unit).await.map_err(|_| WriterError::ShutDown)
     }
 
     /// Blocking submit for non-async producers (tests).
     pub(crate) fn blocking_submit_p0(&self, unit: CommitUnit) -> Result<(), WriterError> {
+        let _admit = self.admit.enter()?;
+        let _submit = self.submit_lock.blocking_lock();
+        if _submit.excludes_hot(&unit) {
+            return Err(WriterError::HotAtOrBelowSplit);
+        }
         self.p0
             .blocking_send(unit)
             .map_err(|_| WriterError::ShutDown)
     }
 
     /// Submit a P1 meta update. **Blocks** when full.
+    ///
+    /// A split put arms the hot exclusion before the send and holds it until
+    /// that unit's oneshot completes. The submit lock is not held across the wait,
+    /// so a P0 already past `admit.enter` observes the barrier instead of queueing.
     pub(crate) async fn submit_p1(&self, update: MetaUpdate) -> Result<(), WriterError> {
-        self.p1
-            .send(update)
-            .await
-            .map_err(|_| WriterError::ShutDown)
+        if let Some(slot) = split_exclusion_slot(&update) {
+            return self.submit_split_p1(update, slot).await;
+        }
+        let _admit = self.admit.enter()?;
+        let _submit = self.submit_lock.lock().await;
+        self.send_p1(update).await
     }
 
     /// Blocking P1 submit (non-async producers / tests).
     pub(crate) fn blocking_submit_p1(&self, update: MetaUpdate) -> Result<(), WriterError> {
+        if let Some(slot) = split_exclusion_slot(&update) {
+            return self.blocking_submit_split_p1(update, slot);
+        }
+        let _admit = self.admit.enter()?;
+        let _submit = self.submit_lock.blocking_lock();
         self.p1
             .blocking_send(update)
+            .map_err(|_| WriterError::ShutDown)
+    }
+
+    async fn submit_split_p1(&self, mut update: MetaUpdate, slot: u64) -> Result<(), WriterError> {
+        let caller_done = update.done.take();
+        let (done_tx, done_rx) = oneshot::channel();
+        update.done = Some(done_tx);
+        self.submit_lock.lock().await.arm(slot);
+        let sent = {
+            let _admit = self.admit.enter()?;
+            self.send_p1(update).await
+        };
+        if let Err(err) = sent {
+            self.submit_lock.lock().await.disarm();
+            return finish_split_reply(caller_done, Err(err));
+        }
+        self.split_queued.store(true, Ordering::SeqCst);
+        let committed = done_rx.await.map_err(|_| WriterError::ShutDown);
+        self.submit_lock.lock().await.disarm();
+        finish_split_reply(caller_done, committed?)
+    }
+
+    fn blocking_submit_split_p1(
+        &self,
+        mut update: MetaUpdate,
+        slot: u64,
+    ) -> Result<(), WriterError> {
+        let caller_done = update.done.take();
+        let (done_tx, done_rx) = oneshot::channel();
+        update.done = Some(done_tx);
+        self.submit_lock.blocking_lock().arm(slot);
+        let sent = {
+            let _admit = self.admit.enter()?;
+            self.p1.blocking_send(update)
+        };
+        if sent.is_err() {
+            self.submit_lock.blocking_lock().disarm();
+            return finish_split_reply(caller_done, Err(WriterError::ShutDown));
+        }
+        self.split_queued.store(true, Ordering::SeqCst);
+        let committed = done_rx.blocking_recv().map_err(|_| WriterError::ShutDown);
+        self.submit_lock.blocking_lock().disarm();
+        finish_split_reply(caller_done, committed?)
+    }
+
+    async fn send_p1(&self, update: MetaUpdate) -> Result<(), WriterError> {
+        self.p1
+            .send(update)
+            .await
             .map_err(|_| WriterError::ShutDown)
     }
 
@@ -268,6 +470,12 @@ impl WriterHandle {
     /// Returns `Ok(true)` if enqueued, `Ok(false)` if dropped.
     /// Drop metric uses the priority label `class="p2"` (R-10), not the storage class.
     pub(crate) fn try_submit_p2(&self, chunk: BackgroundChunk, metrics: &StorageMetrics) -> bool {
+        // Hold the guard across the send so `close_and_wait` cannot finish
+        // until this chunk is in the mailbox or has been refused.
+        let _admit = match self.admit.enter() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
         match self.p2.try_send(chunk) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_chunk)) => {
@@ -322,6 +530,94 @@ impl WriterHandle {
         &self.metrics
     }
 
+    /// Reject new submits and wait until every in-flight send has landed.
+    pub(crate) fn close_admitting(&self) {
+        self.admit.close_and_wait();
+    }
+
+    /// Ask the writer to commit queued units and then stop.
+    pub(crate) fn signal_drain(&self) {
+        let _ = self.drain_tx.send(true);
+    }
+
+    /// Terminal state of the writer task. [`WriterStop::Running`] until it stops.
+    pub(crate) fn writer_done(&self) -> watch::Receiver<WriterStop> {
+        self.done.clone()
+    }
+
+    /// Commit `split` after queued P0 units.
+    ///
+    /// Hot units at or below `split.slot` are rejected until this oneshot
+    /// finishes. The same exclusion covers every other split-writing P1.
+    pub(crate) async fn flush_split(&self, split: Split) -> Result<(), WriterError> {
+        self.send_split_committed(split).await
+    }
+
+    /// Queue `split` and wait until that P1 unit has committed.
+    ///
+    /// The writer commits any P0 unit already queued before it fsyncs this
+    /// row. A hot submit that arrives while the oneshot is outstanding is
+    /// rejected, including one blocked on the submit lock.
+    pub(crate) async fn send_split_committed(&self, split: Split) -> Result<(), WriterError> {
+        self.submit_p1(split_meta_update(&split)).await
+    }
+
+    /// True once [`Self::signal_drain`] has been sent.
+    #[cfg(test)]
+    pub(crate) fn drain_requested(&self) -> bool {
+        *self.drain_tx.borrow()
+    }
+
+    /// Park the writer before it takes another mailbox job.
+    #[cfg(test)]
+    pub(crate) fn pause_loop(&self) {
+        let _ = self.loop_pause.send(true);
+    }
+
+    /// Let a parked writer take mailbox jobs again.
+    #[cfg(test)]
+    pub(crate) fn unpause_loop(&self) {
+        let _ = self.loop_pause.send(false);
+    }
+
+    /// Park the next P0 commit before fsync.
+    #[cfg(test)]
+    pub(crate) fn hold_commits(&self) {
+        let _ = self.commit_gate.send(true);
+    }
+
+    /// Release [`Self::hold_commits`].
+    #[cfg(test)]
+    pub(crate) fn release_commits(&self) {
+        let _ = self.commit_gate.send(false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_entered(&self) -> usize {
+        self.commit_entered.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn split_is_queued(&self) -> bool {
+        self.split_queued.load(Ordering::SeqCst)
+    }
+
+    /// Record commit labels (`"hot"`, `"split"`) for ordering tests.
+    #[cfg(test)]
+    pub(crate) fn enable_commit_trace(&self) {
+        self.trace_enabled.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_order(&self) -> Vec<&'static str> {
+        lock_mutex(&self.commit_order).clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefer_split_over_hot_once(&self) {
+        self.prefer_p1_once.store(true, Ordering::SeqCst);
+    }
+
     /// Existing fail-closed exit. Production calls [`std::process::exit`].
     ///
     /// `process_fatal == false` returns so a test can observe the join.
@@ -363,7 +659,12 @@ pub(crate) struct WriterFaults {
     ///
     /// The caller's commit deadline is what ends the wait. Dropping `done`
     /// here would look like shutdown, not a stall.
-    pub stall_commit: Arc<std::sync::atomic::AtomicBool>,
+    pub stall_commit: Arc<AtomicBool>,
+    /// Test-only: the writer parks before `select` until this is cleared.
+    ///
+    /// Production [`spawn_writer`] leaves it false. A parked writer keeps
+    /// queued units uncommitted so a test can show they flush before a split.
+    pub start_paused: bool,
 }
 
 /// Named process-fatal reason when `commit_import` waits longer than 2 slots.
@@ -443,6 +744,16 @@ pub(crate) fn spawn_writer_with_exit(
     let (p0_tx, p0_rx) = mpsc::channel(bounds.p0.max(1));
     let (p1_tx, p1_rx) = mpsc::channel(bounds.p1.max(1));
     let (p2_tx, p2_rx) = mpsc::channel(bounds.p2.max(1));
+    let (drain_tx, drain_rx) = watch::channel(false);
+    let (done_tx, done_rx) = watch::channel(WriterStop::Running);
+    let (loop_tx, loop_rx) = watch::channel(faults.start_paused);
+    let (commit_gate_tx, commit_gate_rx) = watch::channel(false);
+    let commit_entered = Arc::new(AtomicUsize::new(0));
+    let prefer_p1_once = Arc::new(AtomicBool::new(false));
+    let trace_enabled = Arc::new(AtomicBool::new(false));
+    let commit_order = Arc::new(Mutex::new(Vec::new()));
+    let split_queued = Arc::new(AtomicBool::new(false));
+    let admit = AdmitGate::open();
 
     let handle = WriterHandle {
         p0: p0_tx,
@@ -451,10 +762,31 @@ pub(crate) fn spawn_writer_with_exit(
         metrics: metrics.clone(),
         process_fatal,
         on_fatal: on_fatal.clone(),
+        admit,
+        submit_lock: Arc::new(tokio::sync::Mutex::new(SplitBarrier::default())),
+        drain_tx,
+        done: done_rx,
+        loop_pause: loop_tx,
+        commit_gate: commit_gate_tx,
+        commit_entered: Arc::clone(&commit_entered),
+        prefer_p1_once: Arc::clone(&prefer_p1_once),
+        trace_enabled: Arc::clone(&trace_enabled),
+        commit_order: Arc::clone(&commit_order),
+        split_queued,
     };
 
     let engine_task = Arc::clone(&engine);
-    let metrics_task = metrics.clone();
+    let metrics_task = metrics;
+    let ctrl = WriterCtrl {
+        drain: drain_rx,
+        done: done_tx,
+        loop_pause: loop_rx,
+        commit_gate: commit_gate_rx,
+        commit_entered,
+        prefer_p1_once,
+        trace_enabled,
+        commit_order,
+    };
     let join = tokio::spawn(async move {
         run_writer(
             engine_task,
@@ -464,6 +796,7 @@ pub(crate) fn spawn_writer_with_exit(
             p2_rx,
             faults,
             &mut shutdown,
+            ctrl,
         )
         .await;
     });
@@ -490,6 +823,53 @@ pub(crate) fn spawn_writer_with_exit(
     handle
 }
 
+struct WriterCtrl {
+    drain: watch::Receiver<bool>,
+    done: watch::Sender<WriterStop>,
+    loop_pause: watch::Receiver<bool>,
+    commit_gate: watch::Receiver<bool>,
+    commit_entered: Arc<AtomicUsize>,
+    prefer_p1_once: Arc<AtomicBool>,
+    trace_enabled: Arc<AtomicBool>,
+    commit_order: Arc<Mutex<Vec<&'static str>>>,
+}
+
+/// Sends [`WriterStop::Aborted`] on unwind unless [`Self::finish`] already ran.
+struct ExitSignal {
+    done: watch::Sender<WriterStop>,
+    finished: bool,
+}
+
+impl ExitSignal {
+    fn new(done: watch::Sender<WriterStop>) -> Self {
+        Self {
+            done,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, stop: WriterStop) {
+        self.finished = true;
+        let _ = self.done.send(stop);
+    }
+}
+
+impl Drop for ExitSignal {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.done.send(WriterStop::Aborted);
+        }
+    }
+}
+
+enum LoopEnd {
+    /// `shutdown()` or a closed mailbox. Receivers are dropped after the abort signal.
+    Abort,
+    /// Drain flag won. Receivers are drained and dropped before the done signal.
+    Drain,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_writer(
     engine: Arc<Engine>,
     metrics: StorageMetrics,
@@ -498,11 +878,23 @@ async fn run_writer(
     mut p2: mpsc::Receiver<BackgroundChunk>,
     faults: WriterFaults,
     shutdown: &mut watch::Receiver<bool>,
+    mut ctrl: WriterCtrl,
 ) {
+    let mut exit = ExitSignal::new(ctrl.done.clone());
     info!(target: "cc_storage::writer", "writer task started (sole Engine write owner)");
-    loop {
+    // Drain wins over abort once `drain_and_shutdown` has signaled. `shutdown()`
+    // itself stays the non-waiting abort and does not set the drain flag.
+    let end = loop {
+        if *ctrl.drain.borrow() {
+            break LoopEnd::Drain;
+        }
         if *shutdown.borrow() {
-            break;
+            break LoopEnd::Abort;
+        }
+        while *ctrl.loop_pause.borrow() {
+            if ctrl.loop_pause.changed().await.is_err() {
+                break;
+            }
         }
         // Update queue-depth gauges (R-10 early warning: p0 should stay 0).
         metrics
@@ -524,76 +916,313 @@ async fn run_writer(
             })
             .set(p2.len() as i64);
 
+        // One-shot inversion so a test can prove a split update cannot pass
+        // a hot unit that is already in the mailbox.
+        if ctrl.prefer_p1_once.swap(false, Ordering::SeqCst)
+            && !p1.is_empty()
+            && let Ok(update) = p1.try_recv()
+        {
+            let _ = handle_p1(&engine, &metrics, &mut p0, &faults, &mut ctrl, update).await;
+            tokio::task::yield_now().await;
+            continue;
+        }
+
         tokio::select! {
             biased;
-            // A dropped sender can never raise the flag, and a closed watch
-            // stays ready. Leaving this arm would spin and hold the file lock.
+            // Drain before shutdown. A closed drain watch with the flag set,
+            // or a flag that rose during `select`, still drains.
+            result = ctrl.drain.changed() => {
+                if result.is_err() || *ctrl.drain.borrow() {
+                    break LoopEnd::Drain;
+                }
+            }
+            // A dropped shutdown sender can never raise the flag, and a closed
+            // watch stays ready. Leaving this arm would spin and hold the file lock.
+            // Once drain has been requested, that arm wins even here.
             result = shutdown.changed() => {
+                if *ctrl.drain.borrow() {
+                    break LoopEnd::Drain;
+                }
                 if result.is_err() || *shutdown.borrow() {
-                    break;
+                    break LoopEnd::Abort;
                 }
             }
             // P0 first (strict priority).
             unit = p0.recv(), if true => {
-                let Some(mut unit) = unit else { break; };
-                if faults
-                    .stall_commit
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
+                let Some(mut unit) = unit else { break LoopEnd::Abort; };
+                if faults.stall_commit.load(Ordering::SeqCst) {
                     // Hold the reply. The submitter's 2-slot deadline aborts;
                     // dropping `done` would be shutdown, not a stall.
                     let done = unit.done.take();
                     let _ = shutdown.changed().await;
                     drop(done);
-                    break;
+                    break LoopEnd::Abort;
                 }
-                if faults.panic_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    // Intentional: process-fatal panic policy (§1.5); guarded by JoinHandle.
-                    #[allow(clippy::panic)]
-                    {
-                        panic!("injected writer panic (CC-44b process-fatal test)");
-                    }
-                }
-                let done = unit.done.take();
-                let result = commit_p0(&engine, &metrics, &unit, &faults);
-                if let Some(done) = done {
-                    let _ = done.send(result);
-                } else if let Err(e) = result {
-                    error!(target: "cc_storage::writer", error = %e, "P0 commit failed");
-                }
+                let _ = handle_p0(&engine, &metrics, &faults, &mut ctrl, unit).await;
                 tokio::task::yield_now().await;
             }
             update = p1.recv() => {
                 let Some(update) = update else { continue; };
-                if faults.panic_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    #[allow(clippy::panic)]
-                    {
-                        panic!("injected writer panic (CC-44b process-fatal test)");
-                    }
-                }
-                let result = commit_meta(&engine, &metrics, &update);
-                if let Some(done) = update.done {
-                    let _ = done.send(result);
-                }
+                let _ = handle_p1(&engine, &metrics, &mut p0, &faults, &mut ctrl, update).await;
                 tokio::task::yield_now().await;
             }
             chunk = p2.recv() => {
                 let Some(chunk) = chunk else { continue; };
-                if faults.panic_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    #[allow(clippy::panic)]
-                    {
-                        panic!("injected writer panic (CC-44b process-fatal test)");
-                    }
-                }
-                let result = commit_p2(&engine, &metrics, &chunk);
-                if let Some(done) = chunk.done {
-                    let _ = done.send(result);
-                }
+                let _ = handle_p2(&engine, &metrics, &faults, chunk).await;
                 tokio::task::yield_now().await;
             }
         }
+    };
+    if let LoopEnd::Drain = end {
+        // Drop the receivers only after the drain, and signal only after that drop.
+        // `ExitSignal`'s drop must not be what reports success.
+        let stop = complete_drain(&engine, &metrics, p0, p1, p2, &faults, &mut ctrl).await;
+        exit.finish(stop);
     }
     info!(target: "cc_storage::writer", "writer task stopped");
+}
+
+async fn complete_drain(
+    engine: &Engine,
+    metrics: &StorageMetrics,
+    mut p0: mpsc::Receiver<CommitUnit>,
+    mut p1: mpsc::Receiver<MetaUpdate>,
+    mut p2: mpsc::Receiver<BackgroundChunk>,
+    faults: &WriterFaults,
+    ctrl: &mut WriterCtrl,
+) -> WriterStop {
+    let outcome = drain_mailbox(engine, metrics, &mut p0, &mut p1, &mut p2, faults, ctrl).await;
+    drop(p0);
+    drop(p1);
+    drop(p2);
+    match outcome {
+        Ok(()) => WriterStop::Drained,
+        Err(err) => {
+            error!(target: "cc_storage::writer", error = %err, "drained commit failed");
+            WriterStop::CommitFailed
+        }
+    }
+}
+
+async fn drain_mailbox(
+    engine: &Engine,
+    metrics: &StorageMetrics,
+    p0: &mut mpsc::Receiver<CommitUnit>,
+    p1: &mut mpsc::Receiver<MetaUpdate>,
+    p2: &mut mpsc::Receiver<BackgroundChunk>,
+    faults: &WriterFaults,
+    ctrl: &mut WriterCtrl,
+) -> Result<(), WriterError> {
+    // P0 before P1 before P2, and again, so a hot unit queued ahead of a
+    // split is committed and fsynced first. P0, P1, and P2 submits hold the
+    // admit guard across their send, so `close_and_wait` returning means a
+    // later `try_send` was refused rather than racing this loop.
+    let mut first_err: Option<WriterError> = None;
+    loop {
+        if let Ok(unit) = p0.try_recv() {
+            if let Err(err) = handle_p0(engine, metrics, faults, ctrl, unit).await
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+            continue;
+        }
+        if let Ok(update) = p1.try_recv() {
+            if let Err(err) = handle_p1(engine, metrics, p0, faults, ctrl, update).await
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+            continue;
+        }
+        if let Ok(chunk) = p2.try_recv() {
+            if let Err(err) = handle_p2(engine, metrics, faults, chunk).await
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+            continue;
+        }
+        break;
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+async fn handle_p0(
+    engine: &Engine,
+    metrics: &StorageMetrics,
+    faults: &WriterFaults,
+    ctrl: &mut WriterCtrl,
+    mut unit: CommitUnit,
+) -> Result<(), WriterError> {
+    ctrl.commit_entered.fetch_add(1, Ordering::SeqCst);
+    while *ctrl.commit_gate.borrow() {
+        if ctrl.commit_gate.changed().await.is_err() {
+            break;
+        }
+    }
+    if faults.panic_next.swap(false, Ordering::SeqCst) {
+        // Intentional: process-fatal panic policy (§1.5); guarded by JoinHandle.
+        #[allow(clippy::panic)]
+        {
+            panic!("injected writer panic (CC-44b process-fatal test)");
+        }
+    }
+    let has_block = !unit.blocks.is_empty();
+    let done = unit.done.take();
+    let result = commit_p0(engine, metrics, &unit, faults);
+    if result.is_ok() && has_block {
+        note_commit(ctrl, "hot");
+    }
+    reply_commit(done, result, "P0 commit failed")
+}
+
+async fn handle_p1(
+    engine: &Engine,
+    metrics: &StorageMetrics,
+    p0: &mut mpsc::Receiver<CommitUnit>,
+    faults: &WriterFaults,
+    ctrl: &mut WriterCtrl,
+    update: MetaUpdate,
+) -> Result<(), WriterError> {
+    if faults.panic_next.swap(false, Ordering::SeqCst) {
+        #[allow(clippy::panic)]
+        {
+            panic!("injected writer panic (CC-44b process-fatal test)");
+        }
+    }
+    // I-split-fin precondition only. finalize / migrate / prune stay deferred
+    // past S2R: this does not re-key hot rows or delete them.
+    let writes_split = update_writes_split(&update);
+    if writes_split {
+        let mut drained_err: Option<WriterError> = None;
+        while let Ok(unit) = p0.try_recv() {
+            if let Err(err) = handle_p0(engine, metrics, faults, ctrl, unit).await
+                && drained_err.is_none()
+            {
+                drained_err = Some(err);
+            }
+        }
+        if let Some(err) = drained_err {
+            // The hot commit did not land. Leave the split row unfsynced.
+            return reply_commit(
+                update.done,
+                Err(err),
+                "split skipped after hot commit failed",
+            );
+        }
+    }
+    let result = commit_meta(engine, metrics, &update);
+    if result.is_ok() && writes_split {
+        note_commit(ctrl, "split");
+    }
+    reply_commit(update.done, result, "P1 commit failed")
+}
+
+async fn handle_p2(
+    engine: &Engine,
+    metrics: &StorageMetrics,
+    faults: &WriterFaults,
+    chunk: BackgroundChunk,
+) -> Result<(), WriterError> {
+    if faults.panic_next.swap(false, Ordering::SeqCst) {
+        #[allow(clippy::panic)]
+        {
+            panic!("injected writer panic (CC-44b process-fatal test)");
+        }
+    }
+    let result = commit_p2(engine, metrics, &chunk);
+    reply_commit(chunk.done, result, "P2 commit failed")
+}
+
+fn reply_commit(
+    done: Option<oneshot::Sender<Result<(), WriterError>>>,
+    result: Result<(), WriterError>,
+    quiet: &'static str,
+) -> Result<(), WriterError> {
+    let reported = match &result {
+        Ok(()) => None,
+        Err(err) => Some(clone_writer_error(err)),
+    };
+    if let Some(done) = done {
+        let _ = done.send(result);
+    } else if let Some(err) = &reported {
+        error!(target: "cc_storage::writer", error = %err, "{quiet}");
+    }
+    match reported {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn finish_split_reply(
+    caller_done: Option<oneshot::Sender<Result<(), WriterError>>>,
+    result: Result<(), WriterError>,
+) -> Result<(), WriterError> {
+    reply_commit(caller_done, result, "split submit failed")
+}
+
+fn clone_writer_error(err: &WriterError) -> WriterError {
+    match err {
+        WriterError::Store(inner) => WriterError::Store(StoreError::Codec(inner.to_string())),
+        WriterError::ShutDown => WriterError::ShutDown,
+        WriterError::InjectedFailure => WriterError::InjectedFailure,
+        WriterError::NotUninitialized => WriterError::NotUninitialized,
+        WriterError::HotAtOrBelowSplit => WriterError::HotAtOrBelowSplit,
+    }
+}
+
+fn note_commit(ctrl: &WriterCtrl, label: &'static str) {
+    if ctrl.trace_enabled.load(Ordering::SeqCst) {
+        lock_mutex(&ctrl.commit_order).push(label);
+    }
+}
+
+fn refuse_new_hot_at_split(
+    region: BlockRegion,
+    slot: Slot,
+    stored_split_slot: Option<u64>,
+) -> Result<(), WriterError> {
+    if region == BlockRegion::Hot && stored_split_slot.is_some_and(|limit| slot.as_u64() <= limit) {
+        return Err(WriterError::HotAtOrBelowSplit);
+    }
+    Ok(())
+}
+
+/// `Some(slot)` when `update` writes `meta.split`. Decode failure excludes every hot slot.
+fn split_exclusion_slot(update: &MetaUpdate) -> Option<u64> {
+    let mut found: Option<u64> = None;
+    for (table, key, value) in &update.puts {
+        if table == TABLE_META && key.as_slice() == KEY_SPLIT.as_bytes() {
+            let slot = Split::from_ssz_bytes(value)
+                .map(|split| split.slot.as_u64())
+                .unwrap_or(u64::MAX);
+            found = Some(found.map_or(slot, |prev| prev.max(slot)));
+        }
+    }
+    found
+}
+
+fn update_writes_split(update: &MetaUpdate) -> bool {
+    update
+        .puts
+        .iter()
+        .any(|(table, key, _)| table == TABLE_META && key.as_slice() == KEY_SPLIT.as_bytes())
+}
+
+fn split_meta_update(split: &Split) -> MetaUpdate {
+    MetaUpdate {
+        puts: vec![(
+            TABLE_META.to_owned(),
+            KEY_SPLIT.as_bytes().to_vec(),
+            split.as_ssz_bytes(),
+        )],
+        deletes: Vec::new(),
+        done: None,
+    }
 }
 
 /// Apply a P0 commit unit: data + cursor in **one** batch (§4.4 same-transaction rule).
@@ -632,6 +1261,10 @@ fn commit_p0(
         } else {
             BlockRegion::Hot
         };
+        // Units already queued are committed before `commit_meta` while the
+        // stored split is still the old one. This check is only the backstop
+        // for a hot put that enqueues after that row is durable.
+        let stored_split_slot = cc_store::split::load_split(&rt)?.map(|split| split.slot.as_u64());
         // Blocks (+ optional canonical walk).
         for b in &unit.blocks {
             // State root is staged after the body put so an idempotent upgrade
@@ -657,11 +1290,17 @@ fn commit_p0(
                     };
                     return fatal_key_collision(metrics, &table, &b.ssz);
                 }
-                None if b.update_canonical => put_block_and_update_head(
-                    &rt, &mut batch, b.slot, &b.root, &b.ssz, region, false,
-                )
-                .map(|(o, _)| o),
-                None => put_block(&rt, &mut batch, b.slot, &b.root, &b.ssz, region, false),
+                None if b.update_canonical => {
+                    refuse_new_hot_at_split(region, b.slot, stored_split_slot)?;
+                    put_block_and_update_head(
+                        &rt, &mut batch, b.slot, &b.root, &b.ssz, region, false,
+                    )
+                    .map(|(o, _)| o)
+                }
+                None => {
+                    refuse_new_hot_at_split(region, b.slot, stored_split_slot)?;
+                    put_block(&rt, &mut batch, b.slot, &b.root, &b.ssz, region, false)
+                }
             };
             let outcome = match put_result {
                 Ok(o) => o,
@@ -1234,6 +1873,10 @@ mod tests {
         let (p0_tx, _p0_rx) = mpsc::channel(1);
         let (p1_tx, _p1_rx) = mpsc::channel(1);
         let (p2_tx, _p2_rx) = mpsc::channel::<BackgroundChunk>(1);
+        let (drain_tx, _drain_rx) = watch::channel(false);
+        let (_done_tx, done_rx) = watch::channel(WriterStop::Running);
+        let (loop_tx, _loop_rx) = watch::channel(false);
+        let (gate_tx, _gate_rx) = watch::channel(false);
         let h = WriterHandle {
             p0: p0_tx,
             p1: p1_tx,
@@ -1241,6 +1884,17 @@ mod tests {
             metrics: m.clone(),
             process_fatal: false,
             on_fatal: ProcessExit::Os,
+            admit: AdmitGate::open(),
+            submit_lock: Arc::new(tokio::sync::Mutex::new(SplitBarrier::default())),
+            drain_tx,
+            done: done_rx,
+            loop_pause: loop_tx,
+            commit_gate: gate_tx,
+            commit_entered: Arc::new(AtomicUsize::new(0)),
+            prefer_p1_once: Arc::new(AtomicBool::new(false)),
+            trace_enabled: Arc::new(AtomicBool::new(false)),
+            commit_order: Arc::new(Mutex::new(Vec::new())),
+            split_queued: Arc::new(AtomicBool::new(false)),
         };
         let chunk = BackgroundChunk {
             class: StorageClass::Blocks,
